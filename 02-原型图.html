@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>一生足迹 · iOS 交互原型（深色版）</title>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"/>
+<style>
+  :root{
+    --accent:#FF3B4E; --accent-soft:rgba(255,59,78,.18);
+    --bg:#0D1017; --card:rgba(255,255,255,.055); --card-border:rgba(255,255,255,.10);
+    --text:#ECEFF4; --text2:#8B93A3; --line:rgba(255,255,255,.08);
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{
+    background:linear-gradient(180deg,#0F1219,#0A0D13);
+    font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","PingFang SC","Helvetica Neue",sans-serif;
+    color:var(--text); padding:40px 20px 60px; -webkit-font-smoothing:antialiased;
+  }
+  .page-head{text-align:center;margin-bottom:40px}
+  .page-head h1{font-size:24px;font-weight:800;letter-spacing:-.3px;margin-bottom:8px}
+  .page-head h1 em{font-style:normal;color:var(--accent)}
+  .page-head p{font-size:13px;color:var(--text2)}
+
+  .frames{display:flex;flex-wrap:wrap;gap:40px;justify-content:center;align-items:flex-start}
+  .fwrap{width:300px}
+  .flabel{display:flex;align-items:center;justify-content:center;gap:8px;font-size:13px;font-weight:700;color:#C9CFDA;margin-bottom:12px}
+  .fnum{width:22px;height:22px;border-radius:50%;background:var(--accent);color:#fff;font-size:12px;display:flex;align-items:center;justify-content:center;flex:none}
+  .fdesc{text-align:center;font-size:12px;color:var(--text2);margin-top:12px;line-height:1.6}
+
+  /* ── 手机外框 ── */
+  .phone{
+    width:300px;height:648px;background:#0A0D13;border-radius:48px;border:10px solid #06070B;
+    position:relative;overflow:hidden;box-shadow:0 24px 70px rgba(0,0,0,.6),0 2px 10px rgba(0,0,0,.4);
+  }
+  .screen{position:absolute;inset:0;display:flex;flex-direction:column;background:var(--bg)}
+  .island{position:absolute;top:9px;left:50%;transform:translateX(-50%);width:92px;height:26px;background:#000;border-radius:13px;z-index:60}
+  .statusbar{position:relative;z-index:55;height:44px;flex:none;display:flex;align-items:center;justify-content:space-between;padding:0 22px}
+  .statusbar .time{font-size:15px;font-weight:700;letter-spacing:.2px;color:#F2F4F8}
+  .statusbar .icons{display:flex;align-items:center;gap:5px}
+  .homebar{position:absolute;bottom:5px;left:50%;transform:translateX(-50%);width:118px;height:4px;border-radius:2px;background:#E8EAEF;opacity:.9;z-index:70}
+  .toast{
+    position:absolute;left:50%;bottom:76px;transform:translate(-50%,8px);z-index:90;
+    background:rgba(20,24,32,.92);border:1px solid var(--card-border);color:#fff;font-size:12px;padding:9px 16px;border-radius:20px;
+    opacity:0;pointer-events:none;transition:all .25s;white-space:nowrap;max-width:90%;backdrop-filter:blur(14px);
+  }
+  .toast.show{opacity:1;transform:translate(-50%,0)}
+
+  /* ── 玻璃拟态 ── */
+  .glass{background:rgba(12,16,24,.55);border:1px solid var(--card-border);backdrop-filter:blur(18px) saturate(1.4);-webkit-backdrop-filter:blur(18px) saturate(1.4)}
+
+  /* ── ① 授权页 ── */
+  .ob{flex:1;display:flex;flex-direction:column;align-items:center;padding:0 28px;background:radial-gradient(120% 90% at 50% 0%,#151B2A 0%,#0B0E15 55%)}
+  .logo{width:96px;height:96px;border-radius:26px;background:linear-gradient(160deg,#FF5A6A,#E02A44);display:flex;align-items:center;justify-content:center;margin-top:70px;box-shadow:0 14px 40px rgba(255,59,78,.35);color:#fff}
+  .logo svg{width:46px;height:46px}
+  .ob h2{font-size:27px;font-weight:800;letter-spacing:2px;margin:28px 0 10px}
+  .ob .sub{font-size:14px;color:var(--text2);text-align:center;line-height:1.6}
+  .spacer{flex:1}
+  .btn-p{
+    width:100%;height:50px;border-radius:14px;background:linear-gradient(160deg,#FF5A6A,#E02A44);color:#fff;font-size:16px;font-weight:700;
+    border:none;display:flex;align-items:center;justify-content:center;gap:8px;cursor:pointer;transition:.2s;
+    box-shadow:0 8px 24px rgba(255,59,78,.35);
+  }
+  .btn-p:active{transform:scale(.98)}
+  .btn-p.done{background:linear-gradient(160deg,#34C759,#28A745);box-shadow:0 8px 24px rgba(52,199,89,.3)}
+  .spin{width:14px;height:14px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;animation:rot .7s linear infinite;display:inline-block}
+  @keyframes rot{to{transform:rotate(360deg)}}
+  .btn-s{background:none;border:none;color:var(--accent);font-size:14px;font-weight:600;margin-top:16px;cursor:pointer}
+  .foot-note{font-size:11px;color:#6E7686;margin:24px 0 30px}
+
+  /* ── ② 足迹地图（全屏深色） ── */
+  .map{flex:1;position:relative;background:#0B0F16;overflow:hidden}
+  .mlmap{position:absolute;inset:0}
+  .map-fallback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;color:var(--text2);font-size:12px;line-height:1.8;padding:0 40px}
+  #mapTint{position:absolute;inset:0;pointer-events:none;z-index:2;mix-blend-mode:color}
+  .map-top{position:absolute;top:52px;left:12px;right:12px;z-index:10;display:flex;align-items:center;gap:8px}
+  .mt-btn{width:34px;height:34px;border-radius:17px;display:flex;align-items:center;justify-content:center;color:#EDF0F6;cursor:pointer;flex:none;-webkit-user-select:none}
+  .mt-btn svg{width:16px;height:16px}
+  .mt-btn:active{transform:scale(.92)}
+  .mt-title{flex:1;text-align:center;font-size:13px;font-weight:700;letter-spacing:.3px;color:#F2F4F8;padding:7px 10px;border-radius:15px}
+  .mt-actions{display:flex;gap:8px}
+  .tdot{width:14px;height:14px;border-radius:50%;border:1.5px solid rgba(255,255,255,.3);flex:none}
+  .map-right{position:absolute;top:104px;right:12px;z-index:10;display:flex;flex-direction:column;gap:10px}
+  .map-right .mt-btn{box-shadow:0 6px 18px rgba(0,0,0,.45)}
+  .map-attrib{position:absolute;left:12px;bottom:150px;z-index:8;font-size:9px;color:rgba(255,255,255,.35);padding:4px 8px;border-radius:10px}
+  .glass-pop{
+    position:absolute;top:100px;right:12px;z-index:30;width:158px;border-radius:16px;padding:6px 0;display:none;
+    box-shadow:0 18px 44px rgba(0,0,0,.55);
+  }
+  .glass-pop.show{display:block}
+  .tp-row{display:flex;align-items:center;gap:9px;padding:9px 13px;font-size:12px;color:var(--text);cursor:pointer;-webkit-user-select:none}
+  .tp-row.active{color:var(--accent);font-weight:700}
+  .tp-row + .tp-row{border-top:1px solid var(--line)}
+  .map-bottom{position:absolute;left:10px;right:10px;bottom:8px;z-index:10;border-radius:20px;padding:13px 15px 12px}
+  .mstats{display:flex;justify-content:space-between;margin-bottom:9px}
+  .mstats .mv{font-size:16px;font-weight:800;letter-spacing:-.3px;font-variant-numeric:tabular-nums;color:#F2F4F8}
+  .mstats .ml{font-size:9px;color:var(--text2);margin-top:1px;letter-spacing:.5px}
+  .tline{display:flex;align-items:center;gap:10px;margin-bottom:9px}
+  .tline label{font-size:11px;font-weight:700;color:#F2F4F8;flex:none;width:72px;font-variant-numeric:tabular-nums}
+  input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:26px;background:transparent;cursor:pointer}
+  input[type=range]::-webkit-slider-runnable-track{height:3px;border-radius:2px;background:rgba(255,255,255,.16)}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;background:var(--accent);border:2px solid #fff;margin-top:-6.5px;box-shadow:0 0 14px rgba(255,59,78,.5)}
+  input[type=range]:focus{outline:none}
+  .chips{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+  .chip{font-size:11px;font-weight:600;padding:5px 11px;border-radius:999px;background:rgba(255,255,255,.08);color:#B9C0CC;cursor:pointer;transition:.15s;-webkit-user-select:none}
+  .chip.on{background:var(--accent);color:#fff}
+  .sep{width:1px;height:15px;background:var(--line);margin:0 2px}
+
+  /* ── ③ 统计页 ── */
+  .content{flex:1;overflow:hidden;padding-top:6px}
+  .page-title{font-size:28px;font-weight:800;letter-spacing:-.5px;padding:6px 20px 16px}
+  .stat-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 16px;margin-bottom:14px}
+  .stat-card{background:var(--card);border:1px solid var(--card-border);border-radius:16px;padding:14px 16px}
+  .stat-card .l{font-size:12px;color:var(--text2)}
+  .stat-card .v{font-size:26px;font-weight:800;letter-spacing:-.5px;margin:4px 0 2px;font-variant-numeric:tabular-nums}
+  .stat-card .d{font-size:11px;color:var(--accent);font-weight:600}
+  .card{background:var(--card);border:1px solid var(--card-border);border-radius:16px;margin:0 16px 14px;padding:14px 16px}
+  .card h3{font-size:15px;font-weight:700}
+  .card .cap{font-size:12px;color:var(--text2);margin:2px 0 12px}
+  .bcol{flex:1;display:flex;flex-direction:column;align-items:center;gap:5px}
+  .bar{width:100%;border-radius:5px 5px 3px 3px;background:rgba(255,255,255,.10);cursor:pointer;transition:.2s}
+  .bar.on{background:var(--accent);box-shadow:0 0 12px rgba(255,59,78,.4)}
+  .bcol .y{font-size:9px;color:var(--text2);font-variant-numeric:tabular-nums}
+  .row{display:flex;align-items:center;gap:10px;padding:11px 0;border-bottom:.5px solid var(--line)}
+  .row:last-child{border-bottom:none;padding-bottom:2px}
+  .row .rk{width:18px;font-size:12px;color:var(--text2);font-weight:700}
+  .row .nm{font-size:14px;font-weight:600;flex:1}
+  .row .ct{font-size:13px;color:var(--text2);font-variant-numeric:tabular-nums}
+
+  /* ── ④ 设置页 ── */
+  .sec-label{font-size:11px;color:var(--text2);margin:18px 20px 7px;font-weight:700;letter-spacing:.6px}
+  .set-card{background:var(--card);border:1px solid var(--card-border);border-radius:16px;margin:0 16px;overflow:hidden}
+  .set-row{display:flex;align-items:center;gap:12px;padding:12px 16px;cursor:pointer;position:relative}
+  .set-row + .set-row::before{content:"";position:absolute;top:0;left:58px;right:0;height:.5px;background:var(--line)}
+  .set-row .ic{width:30px;height:30px;border-radius:8px;display:flex;align-items:center;justify-content:center;flex:none}
+  .set-row .ic svg{width:17px;height:17px}
+  .ic.blue{background:rgba(90,160,255,.14);color:#7FB0FF}
+  .ic.cyan{background:rgba(80,200,220,.13);color:#63C9DC}
+  .ic.green{background:rgba(70,200,140,.13);color:#6FDCA8}
+  .ic.gray{background:rgba(255,255,255,.08);color:#9AA3B2}
+  .set-row .t{font-size:14px;font-weight:600}
+  .set-row .s{font-size:11px;color:var(--text2);margin-top:1px}
+  .set-row .v{margin-left:auto;font-size:13px;color:var(--text2);font-variant-numeric:tabular-nums}
+  .set-row .chev{color:#4A5263;font-size:15px;margin-left:2px}
+  .danger-row{background:var(--card);border:1px solid rgba(255,69,58,.25);border-radius:16px;margin:14px 16px 0;padding:14px;text-align:center;color:#FF453A;font-size:14px;font-weight:600;cursor:pointer}
+  .footver{text-align:center;font-size:11px;color:#4A5263;margin-top:18px}
+  footer.page-note{margin-top:52px;text-align:center;font-size:12px;color:var(--text2);line-height:1.8}
+</style>
+</head>
+<body>
+
+<div class="page-head">
+  <h1>一生足迹 <em>·</em> 深色地图原型</h1>
+  <p>This is not a map of the city. This is a map of me.<br>地图页面为真实深色瓦片（需联网）· 可拖动时间轴、切换主题</p>
+</div>
+
+<main class="frames">
+
+  <!-- ══ ① 授权页 ══ -->
+  <section class="fwrap">
+    <div class="flabel"><span class="fnum">1</span>首次启动 · 相册授权</div>
+    <div class="phone" id="p-auth">
+      <div class="island"></div>
+      <div class="statusbar">
+        <span class="time">9:41</span>
+        <span class="icons">
+          <svg width="17" height="11" viewBox="0 0 17 11"><rect x="0" y="7" width="3" height="4" rx="0.6" fill="#F2F4F8"/><rect x="4.5" y="5" width="3" height="6" rx="0.6" fill="#F2F4F8"/><rect x="9" y="2.5" width="3" height="8.5" rx="0.6" fill="#F2F4F8"/><rect x="13.5" y="0" width="3" height="11" rx="0.6" fill="#F2F4F8"/></svg>
+          <svg width="16" height="11" viewBox="0 0 16 11"><path d="M8 9.6c.9 0 1.7.35 2.3.9l-.9 1c-.35-.3-.85-.5-1.4-.5s-1.05.2-1.4.5l-.9-1c.6-.55 1.4-.9 2.3-.9z" fill="#F2F4F8"/><path d="M4.8 8.9c.8-.7 1.9-1.2 3.2-1.2s2.4.5 3.2 1.2l-1.1 1.1c-.5-.4-1.3-.7-2.1-.7s-1.6.3-2.1.7L4.8 8.9z" fill="#F2F4F8"/><path d="M2 6.2C4.2 4 6 3 8 3s3.8 1 6 3.2l-1.2 1.2C11.1 5.6 9.6 4.8 8 4.8S4.9 5.6 3.2 7.4L2 6.2z" fill="#F2F4F8"/></svg>
+          <svg width="25" height="12" viewBox="0 0 25 12"><rect x="0.5" y="0.5" width="21" height="11" rx="3" stroke="#F2F4F8" opacity=".35" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1.5" fill="#F2F4F8"/><path d="M23 4v4c1-.3 1.5-.9 1.5-2S24 4.3 23 4z" fill="#F2F4F8" opacity=".35"/></svg>
+        </span>
+      </div>
+      <div class="screen">
+        <div class="ob">
+          <div class="logo">
+            <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C7.6 2 4 5.6 4 10c0 5.2 7 11.6 7.3 11.9.4.4 1 .4 1.4 0C13 21.6 20 15.2 20 10c0-4.4-3.6-8-8-8zm0 10.5A2.5 2.5 0 1 1 12 7a2.5 2.5 0 0 1 0 5.5z"/></svg>
+          </div>
+          <h2>一生足迹</h2>
+          <p class="sub">这不是城市的地图<br>这是你的地图</p>
+          <div class="spacer"></div>
+          <button class="btn-p" id="authBtn">授权访问相册</button>
+          <button class="btn-s" id="csvLater">之后再说 · 从 CSV 导入</button>
+          <p class="foot-note">数据仅保存在本机 · 无上传 · 无广告</p>
+        </div>
+      </div>
+      <div class="toast"></div>
+      <div class="homebar"></div>
+    </div>
+    <div class="fdesc">授权 → 扫描照片位置 → 生成你的足迹地图</div>
+  </section>
+
+  <!-- ══ ② 足迹地图 ══ -->
+  <section class="fwrap">
+    <div class="flabel"><span class="fnum">2</span>足迹地图 · 全屏</div>
+    <div class="phone" id="p-map">
+      <div class="island"></div>
+      <div class="statusbar">
+        <span class="time">9:41</span>
+        <span class="icons">
+          <svg width="17" height="11" viewBox="0 0 17 11"><rect x="0" y="7" width="3" height="4" rx="0.6" fill="#F2F4F8"/><rect x="4.5" y="5" width="3" height="6" rx="0.6" fill="#F2F4F8"/><rect x="9" y="2.5" width="3" height="8.5" rx="0.6" fill="#F2F4F8"/><rect x="13.5" y="0" width="3" height="11" rx="0.6" fill="#F2F4F8"/></svg>
+          <svg width="16" height="11" viewBox="0 0 16 11"><path d="M8 9.6c.9 0 1.7.35 2.3.9l-.9 1c-.35-.3-.85-.5-1.4-.5s-1.05.2-1.4.5l-.9-1c.6-.55 1.4-.9 2.3-.9z" fill="#F2F4F8"/><path d="M4.8 8.9c.8-.7 1.9-1.2 3.2-1.2s2.4.5 3.2 1.2l-1.1 1.1c-.5-.4-1.3-.7-2.1-.7s-1.6.3-2.1.7L4.8 8.9z" fill="#F2F4F8"/><path d="M2 6.2C4.2 4 6 3 8 3s3.8 1 6 3.2l-1.2 1.2C11.1 5.6 9.6 4.8 8 4.8S4.9 5.6 3.2 7.4L2 6.2z" fill="#F2F4F8"/></svg>
+          <svg width="25" height="12" viewBox="0 0 25 12"><rect x="0.5" y="0.5" width="21" height="11" rx="3" stroke="#F2F4F8" opacity=".35" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1.5" fill="#F2F4F8"/><path d="M23 4v4c1-.3 1.5-.9 1.5-2S24 4.3 23 4z" fill="#F2F4F8" opacity=".35"/></svg>
+        </span>
+      </div>
+      <div class="screen">
+        <div class="map">
+          <div id="mlmap" class="mlmap"></div>
+          <div id="mapTint"></div>
+          <div class="map-fallback" id="mapFallback" style="display:none">
+            无法加载深色地图瓦片（需要联网）<br>原型其他页面不受影响
+          </div>
+
+          <div class="map-top">
+            <div class="mt-btn glass" id="backBtn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 5l-7 7 7 7"/></svg></div>
+            <div class="mt-title glass" id="mapDate">2026 年 8 月</div>
+            <div class="mt-actions">
+              <div class="mt-btn glass" id="themeBtn"><span class="tdot" id="themeDot" style="background:#FF3B4E"></span></div>
+              <div class="mt-btn glass" id="mapSettings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h9M17 7h3M4 17h3M11 17h9"/><circle cx="15" cy="7" r="2"/><circle cx="9" cy="17" r="2"/></svg></div>
+            </div>
+          </div>
+
+          <div class="map-right">
+            <div class="mt-btn glass" id="zoomIn"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></div>
+            <div class="mt-btn glass" id="zoomOut"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M5 12h14"/></svg></div>
+            <div class="mt-btn glass" id="locate"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.4" fill="currentColor"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg></div>
+            <div class="mt-btn glass" id="reset"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg></div>
+          </div>
+
+          <div class="glass-pop glass" id="themePop">
+            <div class="tp-row active" data-theme="crimson"><span class="tdot" style="background:#FF3B4E"></span>Crimson · 绯红</div>
+            <div class="tp-row" data-theme="arctic"><span class="tdot" style="background:#6FC9FF"></span>Arctic · 冰蓝</div>
+            <div class="tp-row" data-theme="neon"><span class="tdot" style="background:#00FFA3"></span>Neon · 霓虹</div>
+            <div class="tp-row" data-theme="sunset"><span class="tdot" style="background:#FF7A3D"></span>Sunset · 暮色</div>
+            <div class="tp-row" data-theme="mono"><span class="tdot" style="background:#FFFFFF"></span>Mono · 单色</div>
+          </div>
+
+          <div class="map-attrib glass">© OpenStreetMap © CARTO</div>
+
+          <div class="map-bottom glass">
+            <div class="mstats">
+              <div><div class="mv">1,284</div><div class="ml">KM 总里程</div></div>
+              <div><div class="mv">37</div><div class="ml">城市</div></div>
+              <div><div class="mv">18%</div><div class="ml">道路覆盖</div></div>
+              <div><div class="mv">632</div><div class="ml">活跃天</div></div>
+            </div>
+            <div class="tline">
+              <label id="tlLabel">2026 年 8 月</label>
+              <input type="range" id="timeline" min="1" max="20" value="20">
+            </div>
+            <div class="chips">
+              <span class="chip on" data-range="all">全部</span>
+              <span class="chip" data-range="2026">2026</span>
+              <span class="chip" data-range="2025">2025</span>
+              <span class="sep"></span>
+              <span class="chip on" id="denAll">全部足迹</span>
+              <span class="chip" id="denHigh">仅高频</span>
+              <span class="sep"></span>
+              <span class="chip on" id="modeLine">线</span>
+              <span class="chip" id="modeDot">点</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="toast"></div>
+      <div class="homebar"></div>
+    </div>
+    <div class="fdesc">深色底图 + 高亮足迹（线/点双模式）<br>拖动时间轴回放足迹生长 · 主题切换 · 缩放/定位</div>
+  </section>
+
+  <!-- ══ ③ 统计 ══ -->
+  <section class="fwrap">
+    <div class="flabel"><span class="fnum">3</span>统计</div>
+    <div class="phone" id="p-stats">
+      <div class="island"></div>
+      <div class="statusbar">
+        <span class="time">9:41</span>
+        <span class="icons">
+          <svg width="17" height="11" viewBox="0 0 17 11"><rect x="0" y="7" width="3" height="4" rx="0.6" fill="#F2F4F8"/><rect x="4.5" y="5" width="3" height="6" rx="0.6" fill="#F2F4F8"/><rect x="9" y="2.5" width="3" height="8.5" rx="0.6" fill="#F2F4F8"/><rect x="13.5" y="0" width="3" height="11" rx="0.6" fill="#F2F4F8"/></svg>
+          <svg width="16" height="11" viewBox="0 0 16 11"><path d="M8 9.6c.9 0 1.7.35 2.3.9l-.9 1c-.35-.3-.85-.5-1.4-.5s-1.05.2-1.4.5l-.9-1c.6-.55 1.4-.9 2.3-.9z" fill="#F2F4F8"/><path d="M4.8 8.9c.8-.7 1.9-1.2 3.2-1.2s2.4.5 3.2 1.2l-1.1 1.1c-.5-.4-1.3-.7-2.1-.7s-1.6.3-2.1.7L4.8 8.9z" fill="#F2F4F8"/><path d="M2 6.2C4.2 4 6 3 8 3s3.8 1 6 3.2l-1.2 1.2C11.1 5.6 9.6 4.8 8 4.8S4.9 5.6 3.2 7.4L2 6.2z" fill="#F2F4F8"/></svg>
+          <svg width="25" height="12" viewBox="0 0 25 12"><rect x="0.5" y="0.5" width="21" height="11" rx="3" stroke="#F2F4F8" opacity=".35" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1.5" fill="#F2F4F8"/><path d="M23 4v4c1-.3 1.5-.9 1.5-2S24 4.3 23 4z" fill="#F2F4F8" opacity=".35"/></svg>
+        </span>
+      </div>
+      <div class="screen">
+        <div class="content">
+          <div class="page-title">统计</div>
+          <div class="stat-grid">
+            <div class="stat-card">
+              <div class="l">去过的城市</div>
+              <div class="v">37</div>
+              <div class="d">+6 今年</div>
+            </div>
+            <div class="stat-card">
+              <div class="l">总里程</div>
+              <div class="v">1,284 KM</div>
+              <div class="d">+96 KM 今年</div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>每年足迹</h3>
+            <div class="cap">最近 8 年 · 足迹量</div>
+            <div style="display:flex;gap:7px;align-items:flex-end;height:100px;padding-top:8px">
+              <div class="bcol"><div class="bar" style="height:18px"></div><span class="y">18</span></div>
+              <div class="bcol"><div class="bar" style="height:26px"></div><span class="y">19</span></div>
+              <div class="bcol"><div class="bar" style="height:34px"></div><span class="y">20</span></div>
+              <div class="bcol"><div class="bar" style="height:30px"></div><span class="y">21</span></div>
+              <div class="bcol"><div class="bar" style="height:52px"></div><span class="y">22</span></div>
+              <div class="bcol"><div class="bar" style="height:60px"></div><span class="y">23</span></div>
+              <div class="bcol"><div class="bar on" style="height:78px"></div><span class="y">24</span></div>
+              <div class="bcol"><div class="bar on" style="height:64px"></div><span class="y">25</span></div>
+            </div>
+          </div>
+          <div class="card">
+            <h3>常去的地方</h3>
+            <div class="cap">按足迹点数量</div>
+            <div class="row"><span class="rk">1</span><span class="nm">上海</span><span class="ct">512</span></div>
+            <div class="row"><span class="rk">2</span><span class="nm">北京</span><span class="ct">489</span></div>
+            <div class="row"><span class="rk">3</span><span class="nm">成都</span><span class="ct">356</span></div>
+            <div class="row"><span class="rk">4</span><span class="nm">广州</span><span class="ct">298</span></div>
+            <div class="row"><span class="rk">5</span><span class="nm">杭州</span><span class="ct">231</span></div>
+          </div>
+        </div>
+      </div>
+      <div class="toast"></div>
+      <div class="homebar"></div>
+    </div>
+    <div class="fdesc">总览卡片 + 每年足迹 + 常去城市（深色玻璃卡）</div>
+  </section>
+
+  <!-- ══ ④ 设置 ══ -->
+  <section class="fwrap">
+    <div class="flabel"><span class="fnum">4</span>设置与数据</div>
+    <div class="phone" id="p-settings">
+      <div class="island"></div>
+      <div class="statusbar">
+        <span class="time">9:41</span>
+        <span class="icons">
+          <svg width="17" height="11" viewBox="0 0 17 11"><rect x="0" y="7" width="3" height="4" rx="0.6" fill="#F2F4F8"/><rect x="4.5" y="5" width="3" height="6" rx="0.6" fill="#F2F4F8"/><rect x="9" y="2.5" width="3" height="8.5" rx="0.6" fill="#F2F4F8"/><rect x="13.5" y="0" width="3" height="11" rx="0.6" fill="#F2F4F8"/></svg>
+          <svg width="16" height="11" viewBox="0 0 16 11"><path d="M8 9.6c.9 0 1.7.35 2.3.9l-.9 1c-.35-.3-.85-.5-1.4-.5s-1.05.2-1.4.5l-.9-1c.6-.55 1.4-.9 2.3-.9z" fill="#F2F4F8"/><path d="M4.8 8.9c.8-.7 1.9-1.2 3.2-1.2s2.4.5 3.2 1.2l-1.1 1.1c-.5-.4-1.3-.7-2.1-.7s-1.6.3-2.1.7L4.8 8.9z" fill="#F2F4F8"/><path d="M2 6.2C4.2 4 6 3 8 3s3.8 1 6 3.2l-1.2 1.2C11.1 5.6 9.6 4.8 8 4.8S4.9 5.6 3.2 7.4L2 6.2z" fill="#F2F4F8"/></svg>
+          <svg width="25" height="12" viewBox="0 0 25 12"><rect x="0.5" y="0.5" width="21" height="11" rx="3" stroke="#F2F4F8" opacity=".35" fill="none"/><rect x="2" y="2" width="15" height="8" rx="1.5" fill="#F2F4F8"/><path d="M23 4v4c1-.3 1.5-.9 1.5-2S24 4.3 23 4z" fill="#F2F4F8" opacity=".35"/></svg>
+        </span>
+      </div>
+      <div class="screen">
+        <div class="content">
+          <div class="page-title">设置</div>
+
+          <div class="sec-label">数据来源</div>
+          <div class="set-card">
+            <div class="set-row">
+              <span class="ic blue"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C7.6 2 4 5.6 4 10c0 5.2 7 11.6 7.3 11.9.4.4 1 .4 1.4 0C13 21.6 20 15.2 20 10c0-4.4-3.6-8-8-8zm0 10.5A2.5 2.5 0 1 1 12 7a2.5 2.5 0 0 1 0 5.5z"/></svg></span>
+              <div><div class="t">照片位置</div><div class="s">自动提取 GPS 拍摄地</div></div>
+              <span class="v">3,247 条</span><span class="chev">›</span>
+            </div>
+            <div class="set-row">
+              <span class="ic cyan"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4"/></svg></span>
+              <div><div class="t">CSV 文件</div><div class="s">手动导入的足迹文件</div></div>
+              <span class="v">2 个</span><span class="chev">›</span>
+            </div>
+            <div class="set-row">
+              <span class="ic green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span>
+              <div><div class="t">手动添加</div><div class="s">长按地图补充的足迹</div></div>
+              <span class="v">12 条</span><span class="chev">›</span>
+            </div>
+          </div>
+
+          <div class="sec-label">操作</div>
+          <div class="set-card">
+            <div class="set-row" id="actScan">
+              <span class="ic gray"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M20 12a8 8 0 1 1-2.34-5.66"/><path d="M20 3v4h-4"/></svg></span>
+              <div><div class="t">重新扫描相册</div><div class="s">同步新增照片的位置</div></div>
+              <span class="chev">›</span>
+            </div>
+            <div class="set-row" id="actCsv">
+              <span class="ic gray"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M7 3h7l4 4v14H7z"/><path d="M14 3v4h4"/></svg></span>
+              <div><div class="t">导入 CSV 文件</div><div class="s">支持自定义列映射</div></div>
+              <span class="chev">›</span>
+            </div>
+            <div class="set-row" id="actExport">
+              <span class="ic gray"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 15V4m0 0l-4 4m4-4l4 4"/><path d="M4 13v6a1.5 1.5 0 0 0 1.5 1.5h13A1.5 1.5 0 0 0 20 19v-6"/></svg></span>
+              <div><div class="t">导出备份</div><div class="s">生成 CSV / KML 文件</div></div>
+              <span class="chev">›</span>
+            </div>
+          </div>
+
+          <div class="sec-label">外观</div>
+          <div class="set-card">
+            <div class="set-row" id="themeRow">
+              <span class="ic blue"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="7" r="3"/><circle cx="9" cy="18" r="3"/><circle cx="17" cy="18" r="3"/></svg></span>
+              <div><div class="t">足迹主题</div><div class="s">地图底色与足迹配色联动</div></div>
+              <span class="v" id="themeName">Crimson · 绯红</span><span class="chev">›</span>
+            </div>
+          </div>
+
+          <div class="sec-label">隐私</div>
+          <div class="set-card">
+            <div class="set-row">
+              <span class="ic green"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 4.5-3 8.5-7 10-4-1.5-7-5.5-7-10V6z"/><path d="M9 12l2 2 4-4"/></svg></span>
+              <div><div class="t">数据仅保存在本机</div><div class="s">无账号 · 无上传 · 无广告</div></div>
+            </div>
+          </div>
+
+          <div class="danger-row" id="actClear">清空所有数据</div>
+          <div class="footver">版本 1.0.0</div>
+        </div>
+      </div>
+      <div class="toast"></div>
+      <div class="homebar"></div>
+    </div>
+    <div class="fdesc">数据来源 / 操作 / 主题 / 隐私</div>
+  </section>
+
+</main>
+
+<footer class="page-note">
+  下一阶段：SwiftUI + MapKit（深色外观）工程 · M1 相册扫描 + 足迹层渲染
+</footer>
+
+<script>
+  function toast(phone, msg) {
+    const t = phone.querySelector('.toast');
+    t.textContent = msg;
+    t.classList.add('show');
+    clearTimeout(t._t);
+    t._t = setTimeout(() => t.classList.remove('show'), 1900);
+  }
+
+  // ══════════════ ② 地图 ══════════════
+  const MAP_CENTER = [121.4737, 31.2304]; // 上海人民广场
+  const MONTH_MIN = 1, MONTH_MAX = 20;    // 2025-01 → 2026-08
+  const ROUTES = [
+    {freq: 4, month: 1,  coords: [[121.4455,31.2215],[121.4510,31.2230],[121.4580,31.2250],[121.4660,31.2275],[121.4737,31.2304]]},
+    {freq: 4, month: 1,  coords: [[121.4737,31.2304],[121.4660,31.2268],[121.4580,31.2242],[121.4510,31.2222],[121.4455,31.2208]]},
+    {freq: 3, month: 3,  coords: [[121.4737,31.2304],[121.4770,31.2335],[121.4810,31.2360],[121.4850,31.2385],[121.4895,31.2405]]},
+    {freq: 3, month: 3,  coords: [[121.4737,31.2304],[121.4770,31.2270],[121.4815,31.2245],[121.4860,31.2225],[121.4910,31.2210]]},
+    {freq: 2, month: 6,  coords: [[121.4737,31.2304],[121.4790,31.2330],[121.4840,31.2355],[121.4895,31.2380]]},
+    {freq: 2, month: 8,  coords: [[121.4455,31.2215],[121.4480,31.2160],[121.4520,31.2120],[121.4560,31.2085]]},
+    {freq: 1, month: 13, coords: [[121.4560,31.2085],[121.4620,31.2040],[121.4690,31.2005]]},
+    {freq: 1, month: 16, coords: [[121.4737,31.2304],[121.4850,31.2320],[121.4950,31.2340],[121.5050,31.2365],[121.5150,31.2390]]},
+    {freq: 1, month: 18, coords: [[121.4895,31.2380],[121.4950,31.2340],[121.4990,31.2280],[121.5020,31.2220]]}
+  ];
+
+  const THEMES = {
+    crimson: {c: '#FF3B4E', tint: 'transparent'},
+    arctic:  {c: '#6FC9FF', tint: 'rgba(90,170,255,.06)'},
+    neon:    {c: '#00FFA3', tint: 'rgba(0,255,163,.05)'},
+    sunset:  {c: '#FF7A3D', tint: 'rgba(150,70,230,.16)'},
+    mono:    {c: '#FFFFFF', tint: 'transparent'}
+  };
+
+  let map = null, theme = 'crimson', minFreq = 1, dotMode = false;
+
+  function monthLabel(v) {
+    const y = 2025 + Math.floor((v - 1) / 12), m = (v - 1) % 12 + 1;
+    return y + ' 年 ' + m + ' 月';
+  }
+
+  function applyFilter() {
+    const f = ['all', ['<=', ['get', 'month'], +document.getElementById('timeline').value], ['>=', ['get', 'freq'], minFreq]];
+    map.setFilter('fp-glow', f);
+    map.setFilter('fp-line', f);
+    map.setFilter('fp-dots', f);
+  }
+
+  function applyTheme(name) {
+    theme = name;
+    const t = THEMES[name];
+    document.documentElement.style.setProperty('--accent', t.c);
+    document.documentElement.style.setProperty('--accent-soft', t.c + '2E');
+    document.getElementById('themeDot').style.background = t.c;
+    document.getElementById('themeName').textContent =
+      ({crimson:'Crimson · 绯红', arctic:'Arctic · 冰蓝', neon:'Neon · 霓虹', sunset:'Sunset · 暮色', mono:'Mono · 单色'})[name];
+    document.getElementById('mapTint').style.background = t.tint;
+    document.querySelectorAll('#themePop .tp-row').forEach(r => r.classList.toggle('active', r.dataset.theme === name));
+    if (!map) return;
+    map.setPaintProperty('fp-line', 'line-color', t.c);
+    map.setPaintProperty('fp-glow', 'line-color', t.c);
+    map.setPaintProperty('fp-dots', 'circle-color', t.c);
+  }
+
+  function initMap() {
+    if (typeof maplibregl === 'undefined') throw new Error('no maplibre');
+    map = new maplibregl.Map({
+      container: 'mlmap',
+      style: {
+        version: 8,
+        sources: {
+          carto: {
+            type: 'raster',
+            tiles: ['https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
+                    'https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
+                    'https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png',
+                    'https://d.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}@2x.png'],
+            tileSize: 256,
+            attribution: '© OpenStreetMap © CARTO'
+          }
+        },
+        layers: [{id: 'carto', type: 'raster', source: 'carto', paint: {'raster-opacity': 0.55}}]
+      },
+      center: MAP_CENTER, zoom: 12.3,
+      attributionControl: false, dragRotate: false, pitchWithRotate: false
+    });
+    map.on('load', () => {
+      map.addSource('fp', {
+        type: 'geojson',
+        data: {type: 'FeatureCollection', features: ROUTES.map(r => ({
+          type: 'Feature',
+          properties: {freq: r.freq, month: r.month},
+          geometry: {type: 'LineString', coordinates: r.coords}
+        }))}
+      });
+      map.addLayer({
+        id: 'fp-glow', type: 'line', source: 'fp',
+        filter: ['==', ['get', 'freq'], 4],
+        paint: {line-color: '#FF3B4E', 'line-width': 8, 'line-opacity': .35, 'line-blur': 3.5, 'line-cap': 'round', 'line-join': 'round'}
+      });
+      map.addLayer({
+        id: 'fp-line', type: 'line', source: 'fp',
+        paint: {
+          'line-color': '#FF3B4E', 'line-cap': 'round', 'line-join': 'round',
+          'line-width': ['case', ['==', ['get', 'freq'], 4], 3.2, ['==', ['get', 'freq'], 3], 2.6, ['==', ['get', 'freq'], 2], 2.2, 1.6],
+          'line-opacity': ['case', ['==', ['get', 'freq'], 4], .95, ['==', ['get', 'freq'], 3], .8, ['==', ['get', 'freq'], 2], .6, .35]
+        }
+      });
+      map.addLayer({
+        id: 'fp-dots', type: 'circle', source: 'fp',
+        layout: {visibility: 'none'},
+        paint: {'circle-radius': 2.4, 'circle-color': '#FF3B4E', 'circle-opacity': .85, 'circle-stroke-color': 'rgba(255,255,255,.35)', 'circle-stroke-width': .4}
+      });
+      applyTheme(theme);
+      applyFilter();
+    });
+  }
+
+  try { initMap(); } catch (e) {
+    document.getElementById('mapFallback').style.display = 'flex';
+    document.getElementById('mlmap').style.display = 'none';
+  }
+
+  // 时间轴
+  const timeline = document.getElementById('timeline');
+  const tlLabel = document.getElementById('tlLabel');
+  function updateTimeline() { tlLabel.textContent = monthLabel(+timeline.value); if (map) applyFilter(); }
+  timeline.addEventListener('input', updateTimeline);
+
+  // 时间范围
+  document.querySelectorAll('[data-range]').forEach(chip => {
+    chip.addEventListener('click', () => {
+      document.querySelectorAll('[data-range]').forEach(c => c.classList.remove('on'));
+      chip.classList.add('on');
+      const r = chip.dataset.range;
+      if (r === 'all')      { timeline.min = MONTH_MIN; timeline.max = MONTH_MAX; timeline.value = MONTH_MAX; }
+      else if (r === '2026'){ timeline.min = 13; timeline.max = MONTH_MAX; timeline.value = MONTH_MAX; }
+      else                  { timeline.min = MONTH_MIN; timeline.max = 12; timeline.value = 12; }
+      updateTimeline();
+    });
+  });
+
+  // 密度过滤
+  document.getElementById('denAll').addEventListener('click', () => {
+    minFreq = 1;
+    document.getElementById('denAll').classList.add('on');
+    document.getElementById('denHigh').classList.remove('on');
+    if (map) applyFilter();
+  });
+  document.getElementById('denHigh').addEventListener('click', () => {
+    minFreq = 3;
+    document.getElementById('denHigh').classList.add('on');
+    document.getElementById('denAll').classList.remove('on');
+    if (map) applyFilter();
+  });
+
+  // 线 / 点模式
+  function setDotMode(dot) {
+    dotMode = dot;
+    document.getElementById('modeDot').classList.toggle('on', dot);
+    document.getElementById('modeLine').classList.toggle('on', !dot);
+    if (!map) return;
+    map.setLayoutProperty('fp-dots', 'visibility', dot ? 'visible' : 'none');
+    map.setLayoutProperty('fp-line', 'visibility', dot ? 'none' : 'visible');
+    map.setLayoutProperty('fp-glow', 'visibility', dot ? 'none' : 'visible');
+    toast(document.getElementById('p-map'), dot ? '点模式：足迹是离散小点' : '线模式：走过的路高亮');
+  }
+  document.getElementById('modeLine').addEventListener('click', () => setDotMode(false));
+  document.getElementById('modeDot').addEventListener('click', () => setDotMode(true));
+
+  // 主题
+  document.getElementById('themeBtn').addEventListener('click', () =>
+    document.getElementById('themePop').classList.toggle('show'));
+  document.querySelectorAll('#themePop .tp-row').forEach(r => r.addEventListener('click', () => {
+    applyTheme(r.dataset.theme);
+    document.getElementById('themePop').classList.remove('show');
+    toast(document.getElementById('p-map'), '主题：' + r.textContent.trim());
+  }));
+  document.getElementById('themeRow').addEventListener('click', () => {
+    const names = Object.keys(THEMES);
+    applyTheme(names[(names.indexOf(theme) + 1) % names.length]);
+    toast(document.getElementById('p-settings'), '已切换主题：' + document.getElementById('themeName').textContent);
+  });
+  document.addEventListener('click', e => {
+    const pop = document.getElementById('themePop');
+    if (!pop.contains(e.target) && !e.target.closest('#themeBtn')) pop.classList.remove('show');
+  });
+
+  // 地图控件
+  if (typeof maplibregl !== 'undefined') {
+    document.getElementById('zoomIn').addEventListener('click', () => map.zoomIn({duration: 300}));
+    document.getElementById('zoomOut').addEventListener('click', () => map.zoomOut({duration: 300}));
+    document.getElementById('locate').addEventListener('click', () => map.easeTo({center: MAP_CENTER, zoom: 14.5, duration: 800}));
+    document.getElementById('reset').addEventListener('click', () => map.easeTo({center: MAP_CENTER, zoom: 12.3, duration: 800}));
+  }
+  document.getElementById('backBtn').addEventListener('click', () => toast(document.getElementById('p-map'), '返回（原型演示）'));
+  document.getElementById('mapSettings').addEventListener('click', () => toast(document.getElementById('p-map'), '设置（原型演示）'));
+
+  // ══════════════ ① 授权流程模拟 ══════════════
+  const authBtn = document.getElementById('authBtn');
+  authBtn.addEventListener('click', () => {
+    if (authBtn.classList.contains('done')) return;
+    authBtn.disabled = true;
+    authBtn.innerHTML = '<span class="spin"></span>正在扫描照片…';
+    setTimeout(() => {
+      authBtn.classList.add('done');
+      authBtn.innerHTML = '✓ 已完成 · 提取 3,247 个位置';
+      toast(document.getElementById('p-auth'), '已从 4,086 张照片中提取位置');
+    }, 1600);
+  });
+  document.getElementById('csvLater').addEventListener('click', () =>
+    toast(document.getElementById('p-auth'), '请选择 .csv 文件（原型演示）'));
+
+  // ══════════════ ④ 设置操作 ══════════════
+  document.getElementById('actScan').addEventListener('click', () =>
+    toast(document.getElementById('p-settings'), '正在重新扫描相册…'));
+  document.getElementById('actCsv').addEventListener('click', () =>
+    toast(document.getElementById('p-settings'), '请选择 .csv 文件（原型演示）'));
+  document.getElementById('actExport').addEventListener('click', () =>
+    toast(document.getElementById('p-settings'), '已导出 足迹备份.csv'));
+  document.getElementById('actClear').addEventListener('click', () =>
+    toast(document.getElementById('p-settings'), '原型演示：清空需二次确认'));
+</script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Xcode user state and build products
+DerivedData/
+build/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+
+# Local backups and generated test artifacts
+.backups/
+测试截图/
+
+# Local secrets
+.env
+.env.*
+Secrets.xcconfig
+Local.xcconfig
