@@ -266,7 +266,8 @@ struct MapScreen: View {
                 let dist = GeoMath.distanceMeters(from: (p.lat, p.lon), to: (s.lat, s.lon))
                 // 真实轨迹判据：45 分钟内移动 ≤3km（步行/骑行/驾车的连续记录）
                 // 超界即断线——不同城市/时段的点绝不相连（消除杂乱蜘蛛网）
-                if gap > 45 * 60 || dist > 3000 {
+                let crossedDomainBoundary = MapLayerSemantics.crossesTrajectoryBoundary(p, s)
+                if crossedDomainBoundary || gap > 45 * 60 || dist > 3000 {
                     flush()
                 }
             }
@@ -830,7 +831,10 @@ struct MapScreen: View {
                 sortBy: [SortDescriptor(\.timestamp)]))) ?? []
             let workoutSnaps = workoutRows.map {
                 FootprintSnapshot(lat: $0.latitude, lon: $0.longitude, t: $0.timestamp,
-                                  source: FootprintSource.health.rawValue)
+                                  source: FootprintSource.health.rawValue,
+                                  trajectoryID: "health:\($0.workoutID)",
+                                  sessionID: $0.workoutID,
+                                  segmentID: "\($0.routeID ?? "legacy:\($0.workoutID)"):\($0.segmentIndex ?? 0)")
             }
             let displaySnaps = snaps + workoutSnaps
 

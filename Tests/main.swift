@@ -224,6 +224,41 @@ check(workoutDomain.allSatisfy { Set($0.segments.map(\.sessionID)) == Set([$0.se
 check(workoutDomain.first(where: { $0.sessionID == "workout-1" })?.quality.accuratePointRatio == 1,
       "轨迹领域-质量统计保留精度")
 
+// HKWorkoutRouteQuery 的回调 chunk 可能乱序；chunk 不能被误当成 Segment。
+let routeOrderBase = Date(timeIntervalSince1970: 1_702_000_000)
+let unorderedRoutePoints = [
+    WorkoutRouteRawPoint(id: "chunk2", latitude: 31.0010, longitude: 121.0010,
+                         timestamp: routeOrderBase.addingTimeInterval(20)),
+    WorkoutRouteRawPoint(id: "chunk1", latitude: 31.0000, longitude: 121.0000,
+                         timestamp: routeOrderBase),
+    WorkoutRouteRawPoint(id: "chunk3", latitude: 31.0020, longitude: 121.0020,
+                         timestamp: routeOrderBase.addingTimeInterval(40)),
+    WorkoutRouteRawPoint(id: "after-gap", latitude: 31.0030, longitude: 121.0030,
+                         timestamp: routeOrderBase.addingTimeInterval(4_000))
+]
+let assignedRouteOrder = WorkoutRouteMetadata.assign(unorderedRoutePoints)
+check(assignedRouteOrder.map(\.id) == ["chunk1", "chunk2", "chunk3", "after-gap"],
+      "Workout Route-跨chunk整体按时间排序")
+check(assignedRouteOrder.map(\.segmentIndex) == [0, 0, 0, 1],
+      "Workout Route-chunk不分段，真实断层才分段")
+check(assignedRouteOrder.map(\.pointIndex) == [0, 1, 2, 0],
+      "Workout Route-每个Segment独立点序")
+let boundaryA = FootprintSnapshot(
+    lat: 31, lon: 121, t: routeOrderBase, source: FootprintSource.health.rawValue,
+    trajectoryID: "health:w1", sessionID: "w1", segmentID: "r1:0")
+let boundaryB = FootprintSnapshot(
+    lat: 31.00001, lon: 121.00001, t: routeOrderBase.addingTimeInterval(1),
+    source: FootprintSource.health.rawValue,
+    trajectoryID: "health:w2", sessionID: "w2", segmentID: "r2:0")
+let sameBoundary = FootprintSnapshot(
+    lat: 31.00002, lon: 121.00002, t: routeOrderBase.addingTimeInterval(2),
+    source: FootprintSource.health.rawValue,
+    trajectoryID: "health:w1", sessionID: "w1", segmentID: "r1:0")
+check(MapLayerSemantics.crossesTrajectoryBoundary(boundaryA, boundaryB),
+      "地图路线-相邻Workout强制断线")
+check(!MapLayerSemantics.crossesTrajectoryBoundary(boundaryA, sameBoundary),
+      "地图路线-同Workout同Route可连续")
+
 // ── 同级随机区域候选 ──
 let cities = ["哈尔滨市", "大连市", "昆明市", "成都市", "西安市", "青岛市", "杭州市", "上海市", "深圳市"]
 let next = randomCandidate(cities, excluding: "哈尔滨市", recent: ["大连市", "昆明市"])

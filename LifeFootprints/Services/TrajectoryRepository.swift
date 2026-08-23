@@ -29,9 +29,11 @@ struct TrajectoryRepository {
             TrajectorySample(
                 id: "workout:\(row.workoutID):\(Int64((row.timestamp.timeIntervalSince1970 * 1_000).rounded())):\(index)",
                 source: .healthWorkout, sourceIdentifier: row.workoutID,
-                sessionID: row.workoutID, activityType: activityByWorkout[row.workoutID],
+                sessionID: row.workoutID, routeID: row.routeID,
+                activityType: activityByWorkout[row.workoutID],
                 latitude: row.latitude, longitude: row.longitude, timestamp: row.timestamp,
-                altitude: row.altitude)
+                altitude: row.altitude, horizontalAccuracy: row.horizontalAccuracy,
+                speed: row.speed, course: row.course)
         }
         return TrajectoryBuilder.build(samples: autoSamples + workoutSamples)
     }

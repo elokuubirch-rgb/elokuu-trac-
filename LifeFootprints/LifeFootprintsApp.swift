@@ -36,7 +36,8 @@ struct LifeFootprintsApp: App {
 
         do {
             container = try ModelContainer(for: FootprintPoint.self, PhotoRecord.self,
-                                           WorkoutRecord.self, WorkoutRoutePoint.self)
+                                           WorkoutRecord.self, WorkoutRouteRecord.self,
+                                           WorkoutRoutePoint.self)
         } catch {
             fatalError("无法初始化数据容器: \(error)")
         }

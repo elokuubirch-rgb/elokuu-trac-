@@ -21,4 +21,13 @@ public enum MapLayerSemantics {
             $0.source != FootprintSource.health.rawValue
         }
     }
+
+    /// 只要任一点带有领域边界，trajectory/session/segment 任一变化都必须断线。
+    public static func crossesTrajectoryBoundary(_ previous: FootprintSnapshot,
+                                                  _ current: FootprintSnapshot) -> Bool {
+        guard previous.trajectoryID != nil || current.trajectoryID != nil else { return false }
+        return previous.trajectoryID != current.trajectoryID ||
+            previous.sessionID != current.sessionID ||
+            previous.segmentID != current.segmentID
+    }
 }

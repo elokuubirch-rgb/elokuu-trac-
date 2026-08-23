@@ -7,12 +7,20 @@ public struct FootprintSnapshot: Equatable {
     public let t: Date
     /// 数据来源（health/gps 为路线点，线层全量保留——线路优先级）
     public let source: String
+    public let trajectoryID: String?
+    public let sessionID: String?
+    public let segmentID: String?
 
-    public init(lat: Double, lon: Double, t: Date, source: String = "csv") {
+    public init(lat: Double, lon: Double, t: Date, source: String = "csv",
+                trajectoryID: String? = nil, sessionID: String? = nil,
+                segmentID: String? = nil) {
         self.lat = lat
         self.lon = lon
         self.t = t
         self.source = source
+        self.trajectoryID = trajectoryID
+        self.sessionID = sessionID
+        self.segmentID = segmentID
     }
 }
 

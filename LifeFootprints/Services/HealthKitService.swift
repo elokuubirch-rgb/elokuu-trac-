@@ -9,7 +9,7 @@ enum HealthKitService {
 
     static var isAvailable: Bool { HKHealthStore.isHealthDataAvailable() }
 
-    /// 授权并导入全部锻炼路线
+    /// 授权并同步全部锻炼。已有 Workout 不再直接跳过：pending/failed 可补取延迟 Route。
     static func requestAndImport(container: ModelContainer,
                                  progress: @escaping @Sendable (String) -> Void) async -> Int {
         guard isAvailable else {
@@ -32,40 +32,89 @@ enum HealthKitService {
         let count = workouts.count
         appLog.info("[Health] 锻炼记录 \(count) 条")
         let context = ModelContext(container)
-        let existing = Set(((try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? [])
-            .map(\.healthKitUUID))
+        backfillLegacyRouteBoundaries(in: context)
+        let existingRecords = (try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? []
+        let recordByID = Dictionary(uniqueKeysWithValues: existingRecords.map { ($0.healthKitUUID, $0) })
+        let existingRoutes = Set(((try? context.fetch(FetchDescriptor<WorkoutRouteRecord>())) ?? [])
+            .map(\.routeID))
         var addedRoutes = 0
         for (i, workout) in workouts.enumerated() {
             let workoutID = workout.uuid.uuidString
-            guard !existing.contains(workoutID) else { continue }
             let label = workoutLabel(workout)
+            let record: WorkoutRecord
+            if let existing = recordByID[workoutID] {
+                record = existing
+                // 已有可用路线已被 Route 实体覆盖时无需重复下载全部点。
+                if existing.routeSyncState == .available { continue }
+            } else {
+                record = WorkoutRecord(
+                    healthKitUUID: workoutID,
+                    workoutType: workoutTypeName(workout),
+                    startDate: workout.startDate, endDate: workout.endDate,
+                    duration: workout.duration,
+                    distanceMeters: workout.totalDistance?.doubleValue(for: .meter()) ?? 0,
+                    caloriesKCal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()) ?? 0,
+                    elevationGain: 0, routeAvailable: false, routeSyncState: .unknown)
+                context.insert(record)
+            }
             progress("正在读取路线 \(i + 1)/\(count)（\(label)）")
-            let locations = await fetchRoute(workout: workout, store: store)
-            if !locations.isEmpty {
-                appLog.info("[Health] \(label)：\(locations.count) 个轨迹点")
-            }
+            record.routeLastCheckedAt = Date()
+            let routes = await fetchRoutes(workout: workout, store: store)
             var elevationGain = 0.0
-            for pair in zip(locations, locations.dropFirst()) {
-                elevationGain += max(0, pair.1.altitude - pair.0.altitude)
+            var importedForWorkout = 0
+            for route in routes where !existingRoutes.contains(route.routeID) {
+                let ordered = route.locations.sorted { $0.timestamp < $1.timestamp }
+                guard !ordered.isEmpty else { continue }
+                context.insert(WorkoutRouteRecord(
+                    routeID: route.routeID, workoutID: workoutID,
+                    sourceIdentifier: route.sourceIdentifier,
+                    sourceName: route.sourceName,
+                    deviceIdentifier: route.deviceIdentifier))
+                let raw = ordered.enumerated().map { index, location in
+                    WorkoutRouteRawPoint(
+                        id: String(index), latitude: location.coordinate.latitude,
+                        longitude: location.coordinate.longitude, timestamp: location.timestamp)
+                }
+                let orderByID = Dictionary(uniqueKeysWithValues:
+                    WorkoutRouteMetadata.assign(raw).map { ($0.id, $0) })
+                for (index, location) in ordered.enumerated() {
+                    let order = orderByID[String(index)]
+                    context.insert(WorkoutRoutePoint(
+                        workoutID: workoutID, latitude: location.coordinate.latitude,
+                        longitude: location.coordinate.longitude, altitude: location.altitude,
+                        timestamp: location.timestamp, routeID: route.routeID,
+                        segmentIndex: order?.segmentIndex, pointIndex: order?.pointIndex,
+                        horizontalAccuracy: validMetric(location.horizontalAccuracy),
+                        verticalAccuracy: validMetric(location.verticalAccuracy),
+                        speed: validMetric(location.speed), course: validMetric(location.course),
+                        sourceIdentifier: route.sourceIdentifier))
+                }
+                for pair in zip(ordered, ordered.dropFirst()) {
+                    elevationGain += max(0, pair.1.altitude - pair.0.altitude)
+                }
+                importedForWorkout += 1
+                appLog.info("[Health] \(label) Route \(route.routeID)：\(ordered.count) 点")
             }
-            let record = WorkoutRecord(
-                healthKitUUID: workoutID,
-                workoutType: workoutTypeName(workout),
-                startDate: workout.startDate, endDate: workout.endDate,
-                duration: workout.duration,
-                distanceMeters: workout.totalDistance?.doubleValue(for: .meter()) ?? 0,
-                caloriesKCal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()) ?? 0,
-                elevationGain: elevationGain, routeAvailable: !locations.isEmpty)
-            context.insert(record)
-            for loc in locations {
-                context.insert(WorkoutRoutePoint(
-                    workoutID: workoutID, latitude: loc.coordinate.latitude,
-                    longitude: loc.coordinate.longitude, altitude: loc.altitude,
-                    timestamp: loc.timestamp))
+            if routes.contains(where: { !$0.locations.isEmpty }) {
+                record.routeSyncState = .available
+                record.routeAvailable = true
+                record.routeRetryCount = 0
+                record.routeLastError = nil
+                record.elevationGain = max(record.elevationGain, elevationGain)
+            } else {
+                // Route 可能延迟到达；空结果不是终态，下次同步继续查询。
+                record.routeSyncState = .pending
+                record.routeAvailable = false
+                record.routeRetryCount = (record.routeRetryCount ?? 0) + 1
             }
-            if !locations.isEmpty { addedRoutes += 1 }
+            addedRoutes += importedForWorkout
         }
-        try? context.save()
+        do {
+            try context.save()
+        } catch {
+            appLog.error("[Health] 保存失败: \(error.localizedDescription)")
+            return 0
+        }
         NotificationCenter.default.post(name: .dataImported, object: nil)
         appLog.info("[Health] 独立 Workout Route 导入：新增 \(addedRoutes) 条")
         return addedRoutes
@@ -86,8 +135,16 @@ enum HealthKitService {
         }
     }
 
-    /// 锻炼路线：先取路线样本，再逐块累积定位点
-    private static func fetchRoute(workout: HKWorkout, store: HKHealthStore) async -> [CLLocation] {
+    private struct RoutePayload {
+        let routeID: String
+        let sourceIdentifier: String?
+        let sourceName: String?
+        let deviceIdentifier: String?
+        let locations: [CLLocation]
+    }
+
+    /// 读取一个 Workout 关联的全部 Route；每个 Route 单独累积所有流式 chunk。
+    private static func fetchRoutes(workout: HKWorkout, store: HKHealthStore) async -> [RoutePayload] {
         let routes: [HKWorkoutRoute] = await withCheckedContinuation { continuation in
             let query = HKSampleQuery(
                 sampleType: HKSeriesType.workoutRoute(),
@@ -98,9 +155,22 @@ enum HealthKitService {
             }
             store.execute(query)
         }
-        guard let route = routes.first else { return [] }
+        var result: [RoutePayload] = []
+        for route in routes {
+            let locations = await fetchLocations(route: route, store: store)
+            result.append(RoutePayload(
+                routeID: route.uuid.uuidString,
+                sourceIdentifier: route.sourceRevision.source.bundleIdentifier,
+                sourceName: route.sourceRevision.source.name,
+                deviceIdentifier: route.device?.localIdentifier,
+                locations: locations))
+        }
+        return result
+    }
 
-        return await withCheckedContinuation { continuation in
+    private static func fetchLocations(route: HKWorkoutRoute,
+                                       store: HKHealthStore) async -> [CLLocation] {
+        await withCheckedContinuation { continuation in
             final class Box: @unchecked Sendable {
                 private let lock = NSLock()
                 var points: [CLLocation] = []
@@ -123,6 +193,44 @@ enum HealthKitService {
             }
             store.execute(routeQuery)
         }
+    }
+
+    /// 旧库只有 workoutID。将旧点归入稳定的 legacy Route，避免升级后重复导入。
+    private static func backfillLegacyRouteBoundaries(in context: ModelContext) {
+        let points = (try? context.fetch(FetchDescriptor<WorkoutRoutePoint>(
+            sortBy: [SortDescriptor(\.timestamp)]))) ?? []
+        let legacy = points.filter { $0.routeID == nil }
+        guard !legacy.isEmpty else { return }
+        let existingRouteIDs = Set(((try? context.fetch(FetchDescriptor<WorkoutRouteRecord>())) ?? [])
+            .map(\.routeID))
+        let workouts = Dictionary(uniqueKeysWithValues:
+            ((try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? []).map { ($0.healthKitUUID, $0) })
+        for (workoutID, rows) in Dictionary(grouping: legacy, by: \.workoutID) {
+            let routeID = "legacy:\(workoutID)"
+            if !existingRouteIDs.contains(routeID) {
+                context.insert(WorkoutRouteRecord(routeID: routeID, workoutID: workoutID))
+            }
+            let raw = rows.enumerated().map { index, point in
+                WorkoutRouteRawPoint(id: String(index), latitude: point.latitude,
+                                     longitude: point.longitude, timestamp: point.timestamp)
+            }
+            let metadata = Dictionary(uniqueKeysWithValues:
+                WorkoutRouteMetadata.assign(raw).map { ($0.id, $0) })
+            for (index, point) in rows.enumerated() {
+                point.routeID = routeID
+                point.segmentIndex = metadata[String(index)]?.segmentIndex
+                point.pointIndex = metadata[String(index)]?.pointIndex
+            }
+            if let workout = workouts[workoutID] {
+                workout.routeSyncState = .available
+                workout.routeAvailable = true
+            }
+        }
+        try? context.save()
+    }
+
+    private static func validMetric(_ value: Double) -> Double? {
+        value >= 0 && value.isFinite ? value : nil
     }
 
     private static func workoutLabel(_ workout: HKWorkout) -> String {
