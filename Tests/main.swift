@@ -182,7 +182,9 @@ let semanticSnapshots = [
     FootprintSnapshot(lat: 31.1, lon: 121.1, t: semanticBase, source: FootprintSource.csv.rawValue),
     FootprintSnapshot(lat: 31.2, lon: 121.2, t: semanticBase, source: FootprintSource.manual.rawValue),
     FootprintSnapshot(lat: 31.3, lon: 121.3, t: semanticBase, source: FootprintSource.gps.rawValue),
-    FootprintSnapshot(lat: 31.4, lon: 121.4, t: semanticBase, source: FootprintSource.health.rawValue)
+    FootprintSnapshot(lat: 31.4, lon: 121.4, t: semanticBase, source: FootprintSource.health.rawValue),
+    FootprintSnapshot(lat: 31.3, lon: 121.3, t: semanticBase,
+                      source: FootprintSource.gps.rawValue, isSuppressedDuplicate: true)
 ]
 check(MapLayerSemantics.autoTrajectory(semanticSnapshots).map(\.source) == [FootprintSource.gps.rawValue],
       "图层语义-自动轨迹只消费GPS")
@@ -190,6 +192,7 @@ check(MapLayerSemantics.workoutTrajectory(semanticSnapshots).map(\.source) == [F
       "图层语义-运动轨迹只消费HealthKit")
 check(MapLayerSemantics.footprintDots(semanticSnapshots).allSatisfy {
     $0.source != FootprintSource.photo.rawValue && $0.source != FootprintSource.health.rawValue
+        && !$0.isSuppressedDuplicate
 }, "图层语义-照片和健康点不泄漏到普通点层")
 
 // ── Trajectory Domain：Builder 负责会话/路线/分段，Map 不再猜边界 ──
@@ -223,6 +226,82 @@ check(workoutDomain.allSatisfy { Set($0.segments.map(\.sessionID)) == Set([$0.se
       "轨迹领域-Segment保留Session边界")
 check(workoutDomain.first(where: { $0.sessionID == "workout-1" })?.quality.accuratePointRatio == 1,
       "轨迹领域-质量统计保留精度")
+
+// ── Trajectory Conflict：局部重叠只抑制低优先级区间，原始点仍可追溯 ──
+let conflictSamples = [
+    trajectorySample("auto-0", .coreLocation, 0, 31.0000, 121.0000, session: "auto-overlap"),
+    trajectorySample("auto-1", .coreLocation, 60, 31.0005, 121.0005, session: "auto-overlap"),
+    trajectorySample("auto-2", .coreLocation, 120, 31.0010, 121.0010, session: "auto-overlap"),
+    trajectorySample("auto-3", .coreLocation, 180, 31.0015, 121.0015, session: "auto-overlap"),
+    trajectorySample("auto-4", .coreLocation, 240, 31.0020, 121.0020, session: "auto-overlap"),
+    trajectorySample("health-1", .healthWorkout, 60, 31.0005, 121.0005,
+                     session: "workout-overlap", route: "route-overlap"),
+    trajectorySample("health-2", .healthWorkout, 120, 31.0010, 121.0010,
+                     session: "workout-overlap", route: "route-overlap"),
+    trajectorySample("health-3", .healthWorkout, 180, 31.0015, 121.0015,
+                     session: "workout-overlap", route: "route-overlap")
+]
+let conflictTrajectories = TrajectoryBuilder.build(samples: conflictSamples)
+let conflictResolution = TrajectoryConflictResolver.resolve(conflictTrajectories)
+let conflict = conflictResolution.conflicts.first
+check(conflictResolution.conflicts.count == 1
+      && conflict?.winnerTrajectoryID.hasPrefix("healthWorkout:") == true
+      && conflict?.suppressedTrajectoryID.hasPrefix("coreLocation:") == true,
+      "轨迹冲突-HealthKit优先于重复Core Location", "\(conflictResolution.conflicts)")
+let resolvedAuto = conflictResolution.points.filter { $0.source == .coreLocation }
+check(resolvedAuto.count == 5 && resolvedAuto.filter {
+    $0.suppressedByTrajectoryID != nil
+}.count == 3,
+      "轨迹冲突-原始点保留且只抑制重叠区间")
+let autoVisiblePieces = Set(resolvedAuto.filter {
+    $0.suppressedByTrajectoryID == nil
+}.map(\.segmentID))
+check(autoVisiblePieces.count == 2,
+      "轨迹冲突-重叠区间两侧强制断段", "\(autoVisiblePieces)")
+check(TrajectoryConflictResolver.resolve(conflictTrajectories.reversed()).conflicts
+      == conflictResolution.conflicts,
+      "轨迹冲突-输入乱序仍确定")
+
+let multiWinnerSamples = conflictSamples + [
+    trajectorySample("health-copy-1", .healthWorkout, 60, 31.0005, 121.0005,
+                     session: "workout-overlap-copy", route: "route-overlap-copy"),
+    trajectorySample("health-copy-2", .healthWorkout, 120, 31.0010, 121.0010,
+                     session: "workout-overlap-copy", route: "route-overlap-copy"),
+    trajectorySample("health-copy-3", .healthWorkout, 180, 31.0015, 121.0015,
+                     session: "workout-overlap-copy", route: "route-overlap-copy")
+]
+let multiWinnerResolution = TrajectoryConflictResolver.resolve(
+    TrajectoryBuilder.build(samples: multiWinnerSamples))
+let autoSuppressors = Set(multiWinnerResolution.points.filter {
+    $0.source == .coreLocation && $0.suppressedByTrajectoryID != nil
+}.compactMap(\.suppressedByTrajectoryID))
+check(autoSuppressors == Set(["healthWorkout:workout-overlap"]),
+      "轨迹冲突-多候选指向最高优先级胜者", "\(autoSuppressors)")
+
+let parallelSamples = conflictSamples + [
+    trajectorySample("parallel-1", .healthWorkout, 60, 31.0205, 121.0205,
+                     session: "workout-parallel", route: "route-parallel"),
+    trajectorySample("parallel-2", .healthWorkout, 120, 31.0210, 121.0210,
+                     session: "workout-parallel", route: "route-parallel"),
+    trajectorySample("parallel-3", .healthWorkout, 180, 31.0215, 121.0215,
+                     session: "workout-parallel", route: "route-parallel")
+]
+check(TrajectoryConflictResolver.resolve(
+    TrajectoryBuilder.build(samples: parallelSamples)).conflicts.count == 1,
+      "轨迹冲突-同时段平行路线不误判")
+
+let sameSourceSamples = [
+    trajectorySample("good-1", .coreLocation, 300, 31.1, 121.1, session: "auto-good", accuracy: 5),
+    trajectorySample("good-2", .coreLocation, 360, 31.101, 121.101, session: "auto-good", accuracy: 5),
+    trajectorySample("good-3", .coreLocation, 420, 31.102, 121.102, session: "auto-good", accuracy: 5),
+    trajectorySample("poor-1", .coreLocation, 300, 31.1, 121.1, session: "auto-poor", accuracy: 200),
+    trajectorySample("poor-2", .coreLocation, 360, 31.101, 121.101, session: "auto-poor", accuracy: 200),
+    trajectorySample("poor-3", .coreLocation, 420, 31.102, 121.102, session: "auto-poor", accuracy: 200)
+]
+let sameSourceConflict = TrajectoryConflictResolver.resolve(
+    TrajectoryBuilder.build(samples: sameSourceSamples)).conflicts.first
+check(sameSourceConflict?.winnerTrajectoryID.contains("auto-good") == true,
+      "轨迹冲突-同源选择高质量轨迹", "\(String(describing: sameSourceConflict))")
 
 // HKWorkoutRouteQuery 的回调 chunk 可能乱序；chunk 不能被误当成 Segment。
 let routeOrderBase = Date(timeIntervalSince1970: 1_702_000_000)

@@ -37,4 +37,8 @@ struct TrajectoryRepository {
         }
         return TrajectoryBuilder.build(samples: autoSamples + workoutSamples)
     }
+
+    func loadResolved() throws -> TrajectoryResolution {
+        TrajectoryConflictResolver.resolve(try load())
+    }
 }

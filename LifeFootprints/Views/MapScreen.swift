@@ -827,16 +827,34 @@ struct MapScreen: View {
             let snaps: [FootprintSnapshot] = ptRows
                 .map { FootprintSnapshot(lat: $0.latitude, lon: $0.longitude, t: $0.timestamp,
                                          source: $0.sourceRaw) }
-            let workoutRows = (try? pointContext.fetch(FetchDescriptor<WorkoutRoutePoint>(
-                sortBy: [SortDescriptor(\.timestamp)]))) ?? []
-            let workoutSnaps = workoutRows.map {
-                FootprintSnapshot(lat: $0.latitude, lon: $0.longitude, t: $0.timestamp,
-                                  source: FootprintSource.health.rawValue,
-                                  trajectoryID: "health:\($0.workoutID)",
-                                  sessionID: $0.workoutID,
-                                  segmentID: "\($0.routeID ?? "legacy:\($0.workoutID)"):\($0.segmentIndex ?? 0)")
+            let trajectoryResolution = try? TrajectoryRepository(container: container).loadResolved()
+            let trajectorySnaps: [FootprintSnapshot]
+            if let trajectoryResolution {
+                trajectorySnaps = trajectoryResolution.points.map { resolved in
+                    let source = resolved.source == .healthWorkout
+                        ? FootprintSource.health.rawValue : FootprintSource.gps.rawValue
+                    return FootprintSnapshot(
+                        lat: resolved.point.latitude, lon: resolved.point.longitude,
+                        t: resolved.point.timestamp, source: source,
+                        trajectoryID: resolved.trajectoryID, sessionID: resolved.sessionID,
+                        segmentID: resolved.segmentID,
+                        isSuppressedDuplicate: resolved.suppressedByTrajectoryID != nil)
+                }
+            } else {
+                let workoutRows = (try? pointContext.fetch(FetchDescriptor<WorkoutRoutePoint>(
+                    sortBy: [SortDescriptor(\.timestamp)]))) ?? []
+                let workoutSnaps = workoutRows.map {
+                    FootprintSnapshot(lat: $0.latitude, lon: $0.longitude, t: $0.timestamp,
+                                      source: FootprintSource.health.rawValue,
+                                      trajectoryID: "health:\($0.workoutID)",
+                                      sessionID: $0.workoutID,
+                                      segmentID: "\($0.routeID ?? "legacy:\($0.workoutID)"):\($0.segmentIndex ?? 0)")
+                }
+                trajectorySnaps = snaps.filter { $0.source == FootprintSource.gps.rawValue }
+                    + workoutSnaps
             }
-            let displaySnaps = snaps + workoutSnaps
+            let displaySnaps = snaps.filter { $0.source != FootprintSource.gps.rawValue }
+                + trajectorySnaps
 
             let cal = Calendar.current
             var seen = Set<Date>()
@@ -903,22 +921,31 @@ struct MapScreen: View {
             let photoRowTotal = 0
             let photoRegionTotal = 0
             #endif
-            // TrailIndex v2 只消费领域轨迹，保留 source/trajectory/session/segment 边界。
-            let trajectories = (try? TrajectoryRepository(container: container).load()) ?? []
-            let trailPoints = trajectories.flatMap { trajectory in
-                trajectory.segments.flatMap { segment in
-                    segment.points.map { point in
-                        TrailPoint(
-                            lat: point.latitude, lon: point.longitude,
-                            t: point.timestamp.timeIntervalSince1970,
-                            source: point.source,
-                            trajectoryID: trajectory.id,
-                            sessionID: segment.sessionID,
-                            segmentID: segment.id,
-                            horizontalAccuracy: point.horizontalAccuracy,
-                            confidence: segment.quality.confidence,
-                            originalPointID: point.id)
-                    }
+            // 冲突解析与地图线层共用同一结果；重复来源不会再次参与照片吸附。
+            let trailPoints: [TrailPoint]
+            if let trajectoryResolution {
+                trailPoints = trajectoryResolution.visiblePoints.map { resolved in
+                    TrailPoint(
+                        lat: resolved.point.latitude, lon: resolved.point.longitude,
+                        t: resolved.point.timestamp.timeIntervalSince1970,
+                        source: resolved.source,
+                        trajectoryID: resolved.trajectoryID,
+                        sessionID: resolved.sessionID,
+                        segmentID: resolved.segmentID,
+                        horizontalAccuracy: resolved.point.horizontalAccuracy,
+                        confidence: resolved.confidence,
+                        originalPointID: resolved.point.id)
+                }
+            } else {
+                trailPoints = displaySnaps.filter {
+                    $0.source == FootprintSource.health.rawValue
+                        || $0.source == FootprintSource.gps.rawValue
+                }.map {
+                    TrailPoint(lat: $0.lat, lon: $0.lon, t: $0.t.timeIntervalSince1970,
+                               source: $0.source == FootprintSource.health.rawValue
+                                ? .healthWorkout : .coreLocation,
+                               trajectoryID: $0.trajectoryID, sessionID: $0.sessionID,
+                               segmentID: $0.segmentID)
                 }
             }
             let trailIndex = TrailIndex(points: trailPoints)

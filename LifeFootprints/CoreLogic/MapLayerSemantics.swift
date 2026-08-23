@@ -5,12 +5,16 @@ import Foundation
 public enum MapLayerSemantics {
     /// Core Location 自动轨迹。照片、CSV 和手动地点都不是轨迹采样点。
     public static func autoTrajectory(_ snapshots: [FootprintSnapshot]) -> [FootprintSnapshot] {
-        snapshots.filter { $0.source == FootprintSource.gps.rawValue }
+        snapshots.filter {
+            $0.source == FootprintSource.gps.rawValue && !$0.isSuppressedDuplicate
+        }
     }
 
-    /// HealthKit 运动路线。后续会由带 workout/route 边界的领域模型替代。
+    /// HealthKit 运动路线，边界与跨来源冲突已由领域解析结果标注。
     public static func workoutTrajectory(_ snapshots: [FootprintSnapshot]) -> [FootprintSnapshot] {
-        snapshots.filter { $0.source == FootprintSource.health.rawValue }
+        snapshots.filter {
+            $0.source == FootprintSource.health.rawValue && !$0.isSuppressedDuplicate
+        }
     }
 
     /// 普通足迹点层不显示照片点，也不泄漏受“运动路线”开关控制的健康点。
@@ -18,7 +22,7 @@ public enum MapLayerSemantics {
     public static func footprintDots(_ snapshots: [FootprintSnapshot]) -> [FootprintSnapshot] {
         snapshots.filter {
             $0.source != FootprintSource.photo.rawValue &&
-            $0.source != FootprintSource.health.rawValue
+            $0.source != FootprintSource.health.rawValue && !$0.isSuppressedDuplicate
         }
     }
 
