@@ -1,0 +1,24 @@
+import Foundation
+
+/// 地图图层的数据语义。照片、轨迹与当前位置必须使用各自的数据源，
+/// 旧数据库中的混合 FootprintPoint 只在这里被分类，不能由 UI 临时猜测。
+public enum MapLayerSemantics {
+    /// Core Location 自动轨迹。照片、CSV 和手动地点都不是轨迹采样点。
+    public static func autoTrajectory(_ snapshots: [FootprintSnapshot]) -> [FootprintSnapshot] {
+        snapshots.filter { $0.source == FootprintSource.gps.rawValue }
+    }
+
+    /// HealthKit 运动路线。后续会由带 workout/route 边界的领域模型替代。
+    public static func workoutTrajectory(_ snapshots: [FootprintSnapshot]) -> [FootprintSnapshot] {
+        snapshots.filter { $0.source == FootprintSource.health.rawValue }
+    }
+
+    /// 普通足迹点层不显示照片点，也不泄漏受“运动路线”开关控制的健康点。
+    /// CSV/手动点暂时保留为旧版导入地点，直到 imported trajectory 语义落地。
+    public static func footprintDots(_ snapshots: [FootprintSnapshot]) -> [FootprintSnapshot] {
+        snapshots.filter {
+            $0.source != FootprintSource.photo.rawValue &&
+            $0.source != FootprintSource.health.rawValue
+        }
+    }
+}

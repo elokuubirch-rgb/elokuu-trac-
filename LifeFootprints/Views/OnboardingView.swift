@@ -123,14 +123,12 @@ struct OnboardingView: View {
                     scanText = "正在扫描 \(done) / \(total) 张照片"
                 }
             })
-            let drafts = result.drafts
             let infos = result.photoInfos
             // 入库（后台 ModelContext，主线程零阻塞）
-            let added = await FootprintStore.importDraftsInBackground(drafts, container: container)
             let photoAdded = await PhotoStore.upsertInBackground(infos, container: container)
             await MainActor.run {
-                appLog.info("[Onboarding] 足迹新增 \(added)，照片新增 \(photoAdded)")
-                doneCount = added
+                appLog.info("[Onboarding] 照片地点新增 \(photoAdded)")
+                doneCount = photoAdded
                 scanText = nil
             }
             // 后台收尾：缩略图 + 行政区逆地理（限两批；进入主界面后由 MainTabView 常驻循环接管）

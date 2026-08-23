@@ -202,30 +202,21 @@ struct MapScreen: View {
         }
         layers.visible = visible
 
-        // 线层（**线路优先级**）：健康/主动记录路线点全量保留（不采样，线路完整），
-        // 其余历史点按 2500 采样；合并后按时间排序（断线逻辑保持真实轨迹）
-        let routePoints = filtered.filter { $0.source == FootprintSource.health.rawValue
-                                            || $0.source == FootprintSource.gps.rawValue }
-        let rest = filtered.filter { $0.source != FootprintSource.health.rawValue
-                                     && $0.source != FootprintSource.gps.rawValue }
-        let sampledRest: [FootprintSnapshot]
-        if rest.count > cap {
-            let stride = rest.count / cap
-            sampledRest = rest.enumerated().compactMap { $0.offset % stride == 0 ? $0.element : nil }
-        } else {
-            sampledRest = rest
-        }
-        let ordered = (routePoints + sampledRest).sorted { $0.t < $1.t }
-        layers.routes = makeRoutes(from: ordered.filter { $0.source != FootprintSource.health.rawValue },
-                                   workout: false)
-        layers.workoutRoutes = makeRoutes(from: ordered.filter { $0.source == FootprintSource.health.rawValue },
-                                          workout: true)
+        // 只有真实采样源可进入折线。历史 photo/csv/manual 点即使仍在数据库，
+        // 也不能连接成 Personal Trajectory。
+        layers.routes = makeRoutes(
+            from: MapLayerSemantics.autoTrajectory(filtered).sorted { $0.t < $1.t },
+            workout: false)
+        layers.workoutRoutes = makeRoutes(
+            from: MapLayerSemantics.workoutTrajectory(filtered).sorted { $0.t < $1.t },
+            workout: true)
 
-        let buckets = freqBuckets(of: visible)
+        let dotSnapshots = MapLayerSemantics.footprintDots(visible)
+        let buckets = freqBuckets(of: dotSnapshots)
         // 流畅优先：≤600 点采样（保持密度观感）
-        let step = max(1, visible.count / 600)
+        let step = max(1, dotSnapshots.count / 600)
         var dots: [FootprintDot] = []
-        for (index, s) in visible.enumerated() where index % step == 0 {
+        for (index, s) in dotSnapshots.enumerated() where index % step == 0 {
             dots.append(FootprintDot(id: index, lat: s.lat, lon: s.lon, freq: freq(of: s, buckets: buckets)))
         }
         layers.dots = dots
@@ -363,7 +354,8 @@ struct MapScreen: View {
                 workoutRoutes: workoutRoutes,
                 markers: clusterMarkers,
                 highlightedPhoto: highlightedReviewPhoto,
-                track: LocationService.shared.track,
+                // Current Location 只由 MapKit 蓝点表达，不能自动形成实时历史线。
+                track: [],
                 showPhotos: showPhotos,
                 showDots: showDots,
                 showLines: showLines,
@@ -399,9 +391,6 @@ struct MapScreen: View {
                 // 仅在主动记录轨迹时跟随定位；平时镜头停留在足迹数据上（一生足迹逻辑）
                 guard followsUser, !headingFollowEnabled, LocationService.shared.isRecording,
                       let coord = LocationService.shared.location?.coordinate else { return }
-                if LocationService.shared.track.count == 1 {
-                    appLog.info("[Camera] 记录中 → 地图跟随当前位置")
-                }
                 #if DEBUG
                 MapDebugLog.log("记录中→follow(\(String(format: "%.4f", coord.latitude)),\(String(format: "%.4f", coord.longitude)))")
                 #endif

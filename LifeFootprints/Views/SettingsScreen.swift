@@ -299,8 +299,7 @@ struct SettingsScreen: View {
                 return
             }
             let result = PhotoScanner.scanWithPhotos(progress: { _, _ in })
-            let added = await FootprintStore.importDraftsInBackground(result.drafts, container: container)
-            _ = await PhotoStore.upsertInBackground(result.photoInfos, container: container)
+            let added = await PhotoStore.upsertInBackground(result.photoInfos, container: container)
             await MainActor.run {
                 busyText = nil
                 scanResult = added

@@ -175,6 +175,23 @@ for (lat, lon) in [(31.2304, 121.4737), (31.2310, 121.4740)] {
 }
 check(drafts.count == 2 && drafts[0].source == FootprintSource.csv.rawValue, "草稿模型", "\(drafts.count)")
 
+// ── 地图图层语义：照片/地点不能冒充轨迹，健康点不能泄漏到普通点层 ──
+let semanticBase = Date(timeIntervalSince1970: 1_700_100_000)
+let semanticSnapshots = [
+    FootprintSnapshot(lat: 31.0, lon: 121.0, t: semanticBase, source: FootprintSource.photo.rawValue),
+    FootprintSnapshot(lat: 31.1, lon: 121.1, t: semanticBase, source: FootprintSource.csv.rawValue),
+    FootprintSnapshot(lat: 31.2, lon: 121.2, t: semanticBase, source: FootprintSource.manual.rawValue),
+    FootprintSnapshot(lat: 31.3, lon: 121.3, t: semanticBase, source: FootprintSource.gps.rawValue),
+    FootprintSnapshot(lat: 31.4, lon: 121.4, t: semanticBase, source: FootprintSource.health.rawValue)
+]
+check(MapLayerSemantics.autoTrajectory(semanticSnapshots).map(\.source) == [FootprintSource.gps.rawValue],
+      "图层语义-自动轨迹只消费GPS")
+check(MapLayerSemantics.workoutTrajectory(semanticSnapshots).map(\.source) == [FootprintSource.health.rawValue],
+      "图层语义-运动轨迹只消费HealthKit")
+check(MapLayerSemantics.footprintDots(semanticSnapshots).allSatisfy {
+    $0.source != FootprintSource.photo.rawValue && $0.source != FootprintSource.health.rawValue
+}, "图层语义-照片和健康点不泄漏到普通点层")
+
 // ── 同级随机区域候选 ──
 let cities = ["哈尔滨市", "大连市", "昆明市", "成都市", "西安市", "青岛市", "杭州市", "上海市", "深圳市"]
 let next = randomCandidate(cities, excluding: "哈尔滨市", recent: ["大连市", "昆明市"])

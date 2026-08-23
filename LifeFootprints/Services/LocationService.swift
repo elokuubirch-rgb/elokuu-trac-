@@ -6,7 +6,7 @@ extension Notification.Name {
     static let footprintsCaptured = Notification.Name("footprintsCaptured")
 }
 
-/// 实时定位服务：GPS 位置、海拔、精度、时间戳 + 会话轨迹 +
+/// 实时定位服务：GPS 位置、海拔、精度、时间戳 +
 /// 主动轨迹记录 + 低功耗后台足迹（访问监测 + 重大位置变化）。
 @Observable
 final class LocationService: NSObject, CLLocationManagerDelegate {
@@ -19,7 +19,6 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
 
     private(set) var authorization: CLAuthorizationStatus = .notDetermined
     private(set) var location: CLLocation?
-    private(set) var track: [CLLocationCoordinate2D] = []
     private(set) var smoothedAltitude: Double = 0
     private(set) var altitudeHistory: [Double] = []
 
@@ -275,18 +274,6 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
             captureBackgroundLocation(latest)
         }
 
-        // 屏幕轨迹（地图实时折线，仅显示用，仍按 15m 稀疏采样）
-        if latest.horizontalAccuracy >= 0 {
-            if let last = track.last {
-                let d = latest.distance(from: CLLocation(latitude: last.latitude, longitude: last.longitude))
-                if d > 15 {
-                    track.append(latest.coordinate)
-                }
-            } else {
-                track.append(latest.coordinate)
-            }
-        }
-
         // 主动轨迹记录：完整过滤流水线（距离+时间+速度+转向+精度）+ 统计
         if isRecording {
             recordLocation(latest)
@@ -294,9 +281,8 @@ final class LocationService: NSObject, CLLocationManagerDelegate {
 
         let lat = String(format: "%.5f", latest.coordinate.latitude)
         let lon = String(format: "%.5f", latest.coordinate.longitude)
-        let trackCount = track.count
         let altitude = smoothedAltitude
-        appLog.info("[Loc] \(lat),\(lon) 海拔\(Int(altitude))m(平滑) 精度±\(Int(latest.horizontalAccuracy))m\(isFirst ? " [首个定位]" : "") 轨迹\(trackCount)点")
+        appLog.info("[Loc] \(lat),\(lon) 海拔\(Int(altitude))m(平滑) 精度±\(Int(latest.horizontalAccuracy))m\(isFirst ? " [首个定位]" : "")")
     }
 
     /// 主动轨迹记录：把一个原始点送入过滤流水线，更新统计并把通过的点转成草稿。
