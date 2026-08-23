@@ -75,7 +75,7 @@ enum FootprintStore {
     }
 
     /// 后台线程版导入（十万级数据专用）：后台 ModelContext 插入+保存，主线程零阻塞
-    /// dense=true：密集路线（健康路线/主动轨迹记录）跳过 50m 去重——
+    /// dense=true：密集路线导入跳过 50m 去重——
     /// 路线点间距仅几米，去重会互相吞掉导致无法成线
     static func importDraftsInBackground(_ drafts: [FootprintDraft], container: ModelContainer,
                                          dense: Bool = false) async -> Int {

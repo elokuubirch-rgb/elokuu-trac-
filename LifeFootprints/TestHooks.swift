@@ -48,7 +48,6 @@ enum TestHooks {
     static var routeToggle: Bool { env["FP_ROUTE_TOGGLE"] == "1" }
     static var headingFollow: Bool { env["FP_HEADING_FOLLOW"] == "1" }
     static var markerTap: Bool { env["FP_MARKER_TAP"] == "1" }
-    static var autoRecord: Bool { env["FP_AUTO_RECORD"] == "1" }
     static var startMapType: String? { env["FP_MAP"] }
     static var startPitch: Double? { env["FP_PITCH"].flatMap(Double.init) }
     static var seedCustomMap: Bool { env["FP_SEED_CUSTOM_MAP"] == "1" }

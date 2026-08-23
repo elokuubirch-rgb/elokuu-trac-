@@ -387,15 +387,6 @@ struct MapScreen: View {
                 // 逆地理有进展 → 重载快照，照片标记渐进出现
                 scheduleReload()
             }
-            .onChange(of: LocationService.shared.location?.timestamp) { _, _ in
-                // 仅在主动记录轨迹时跟随定位；平时镜头停留在足迹数据上（一生足迹逻辑）
-                guard followsUser, !headingFollowEnabled, LocationService.shared.isRecording,
-                      let coord = LocationService.shared.location?.coordinate else { return }
-                #if DEBUG
-                MapDebugLog.log("记录中→follow(\(String(format: "%.4f", coord.latitude)),\(String(format: "%.4f", coord.longitude)))")
-                #endif
-                cameraCommand = .follow(coord, animated: true)
-            }
 
             // 定位详情只在用户主动点击定位后短暂出现，不长期占据地图。
             if !chromeHidden, locationDetailsVisible, let loc = LocationService.shared.location {
@@ -969,35 +960,6 @@ struct MapScreen: View {
         }
     }
 
-    // MARK: - 底部照片架（Apple Maps 地点卡风格）/ 轨迹记录
-
-    private var recordingText: String {
-        let s = Int(LocationService.shared.recordingDuration)
-        return String(format: "%02d:%02d", s / 60, s % 60)
-    }
-
-    /// 主动轨迹记录开关：停止后智能融合入库（时间+空间去重，跨来源合并）
-    private func toggleRecording() {
-        let svc = LocationService.shared
-        if svc.isRecording {
-            let drafts = svc.stopRecording()
-            let container = context.container
-            Task.detached(priority: .userInitiated) {
-                // dense：主动记录的轨迹点密集，跳过空间去重保持连续性
-                let added = await FootprintStore.importDraftsInBackground(drafts, container: container, dense: true)
-                await MainActor.run {
-                    svc.noteStoredCount(added)
-                    appLog.info("[Rec] 最终诊断摘要：\n\(svc.diagnosticSummary())")
-                    showTapToast("记录完成：接收\(svc.receivedLocationCount) · 采纳\(svc.acceptedLocationCount) · 入库\(added)")
-                    scheduleReload()
-                }
-            }
-        } else {
-            svc.startRecording()
-            showTapToast("开始记录轨迹 · 再次点击停止")
-        }
-    }
-
     // MARK: - 交互
 
     /// 纯净模式切换（双击进入/单击恢复由 handleMapTap 处理）
@@ -1214,22 +1176,6 @@ struct MapScreen: View {
                     appLog.info("[Test] 模拟点击照片标记 → \(first.name)")
                     handleMarkerTap(first)
                 }
-            }
-        }
-        if TestHooks.autoRecord {
-            Task {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                appLog.info("[Test] 模拟开始轨迹记录")
-                LocationService.shared.startRecording()
-                try? await Task.sleep(nanoseconds: 14_000_000_000)
-                appLog.info("[Test] 模拟停止轨迹记录")
-                let drafts = LocationService.shared.stopRecording()
-                let c = context.container
-                let added = await FootprintStore.importDraftsInBackground(drafts, container: c, dense: true)
-                LocationService.shared.noteStoredCount(added)
-                appLog.info("[Test] 记录融合入库 +\(added)")
-                appLog.info("[Test] 诊断摘要：\n\(LocationService.shared.diagnosticSummary())")
-                scheduleReload()
             }
         }
         if TestHooks.doubleTap {
