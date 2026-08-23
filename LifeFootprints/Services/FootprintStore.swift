@@ -151,6 +151,7 @@ enum FootprintStore {
         let all = (try? context.fetch(FetchDescriptor<FootprintPoint>())) ?? []
         for p in all { context.delete(p) }
         try? context.save()
+        NotificationCenter.default.post(name: .dataImported, object: nil)
     }
 
     static func sourceCounts(of points: [FootprintPoint]) -> (photo: Int, csv: Int, manual: Int, gps: Int, health: Int) {

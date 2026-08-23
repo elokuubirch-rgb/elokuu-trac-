@@ -22,6 +22,9 @@ struct SettingsScreen: View {
     @AppStorage("bgFootprints") private var bgFootprints = false
     @AppStorage("reviewRecentDedupEnabled") private var reviewRecentDedupEnabled = true
     @AppStorage("reviewGroupSize") private var reviewGroupSize = 20
+    @AppStorage(HealthKitSyncCoordinator.automaticSyncEnabledKey)
+    private var healthAutomaticSync = false
+    @State private var healthStatus = HealthKitSyncSnapshot.empty
 
     var body: some View {
         NavigationStack {
@@ -50,6 +53,47 @@ struct SettingsScreen: View {
                     Text("定位")
                 } footer: {
                     Text("基于系统「访问监测」和「重大位置变化」。日常停留自动留点；高铁、飞机按距离稀疏记录关键点，不持续开启 GPS。开启需允许「始终」访问位置。")
+                }
+
+                Section {
+                    Toggle(isOn: Binding(
+                        get: { healthAutomaticSync },
+                        set: { updateHealthAutomaticSync($0) }
+                    )) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("自动同步苹果健康")
+                            Text("新增或更新锻炼路线时自动增量同步")
+                                .font(.system(size: 11))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .disabled(!HealthKitService.isAvailable || healthStatus.isSyncing)
+                    .accessibilityIdentifier("health-auto-sync-toggle")
+
+                    LabeledContent("同步状态") {
+                        Text(healthStatus.isSyncing ? "同步中" : (healthStatus.enabled ? "已开启" : "已关闭"))
+                            .foregroundStyle(healthStatus.isSyncing ? .orange : .secondary)
+                    }
+                    if let date = healthStatus.lastSuccessAt {
+                        LabeledContent("上次成功") {
+                            Text(date.formatted(date: .abbreviated, time: .shortened))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    LabeledContent("路线队列") {
+                        Text("待重试 \(healthStatus.pendingCount) · 失败 \(healthStatus.failedCount) · 无路线 \(healthStatus.noRouteCount)")
+                            .font(.system(size: 11))
+                            .foregroundStyle(.secondary)
+                    }
+                    if let error = healthStatus.lastError, !error.isEmpty {
+                        Text(error)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.red)
+                    }
+                } header: {
+                    Text("苹果健康同步")
+                } footer: {
+                    Text("无路线的锻炼会指数退避重试；连续确认且结束超过 7 天后标记为“无路线”。手动同步仍会重新检查。")
                 }
 
                 Section {
@@ -113,8 +157,9 @@ struct SettingsScreen: View {
                         actionRow("doc.badge.plus", "导入 CSV 文件", "自动识别列 · 一生足迹备份直接导入")
                     }
                     Button { importHealth() } label: {
-                        actionRow("figure.run", "导入苹果健康运动", "Apple Watch / iPhone 锻炼路线")
+                        actionRow("figure.run", "立即同步苹果健康", "Apple Watch / iPhone 锻炼路线")
                     }
+                    .accessibilityIdentifier("health-sync-now")
                     Button { exportCSV() } label: {
                         actionRow("square.and.arrow.up", "导出备份", "生成 CSV 文件")
                     }
@@ -231,12 +276,17 @@ struct SettingsScreen: View {
         }
         .preferredColorScheme(.dark)
         .onAppear(perform: refreshSourceCounts)
+        .onAppear(perform: refreshHealthStatus)
         .onAppear { customMapSources = MapSourceStore.load() }
         .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
             refreshSourceCounts()
         }
         .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
             refreshSourceCounts()
+            refreshHealthStatus()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .healthKitSyncStatusChanged)) { _ in
+            refreshHealthStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: .mapSourcesChanged)) { _ in
             customMapSources = MapSourceStore.load()
@@ -321,15 +371,34 @@ struct SettingsScreen: View {
         }
         busyText = "正在请求健康权限…"
         let container = context.container
+        let enableAutomaticSync = healthAutomaticSync
         Task.detached(priority: .userInitiated) {
-            let added = await HealthKitService.requestAndImport(container: container) { text in
+            let added = await HealthKitService.requestAndImport(
+                container: container, enableAutomaticSync: enableAutomaticSync) { text in
                 Task { @MainActor in busyText = text }
             }
             await MainActor.run {
                 busyText = nil
                 scanResult = added
+                refreshHealthStatus()
             }
         }
+    }
+
+    private func updateHealthAutomaticSync(_ enabled: Bool) {
+        healthAutomaticSync = enabled
+        if enabled {
+            importHealth()
+        } else {
+            Task {
+                await HealthKitSyncCoordinator.shared.disableAutomaticSync()
+                refreshHealthStatus()
+            }
+        }
+    }
+
+    private func refreshHealthStatus() {
+        healthStatus = HealthKitSyncStatusStore.snapshot(container: context.container)
     }
 
     private func exportCSV() {

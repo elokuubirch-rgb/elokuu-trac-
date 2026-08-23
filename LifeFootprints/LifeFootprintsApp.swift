@@ -19,6 +19,12 @@ struct LifeFootprintsApp: App {
     init() {
         #if DEBUG
         let fp = ProcessInfo.processInfo.environment.filter { $0.key.hasPrefix("FP_") }
+        if fp["FP_UI_TEST"] == "1" {
+            UserDefaults.standard.set(true, forKey: "onboarded")
+            UserDefaults.standard.set(false, forKey: "bgFootprints")
+            UserDefaults.standard.set(false,
+                                      forKey: HealthKitSyncCoordinator.automaticSyncEnabledKey)
+        }
         if let language = fp["FP_LANGUAGE"], AppLanguage(rawValue: language) != nil {
             UserDefaults.standard.set(language, forKey: "appLanguage")
         }

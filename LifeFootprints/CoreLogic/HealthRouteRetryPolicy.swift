@@ -4,6 +4,8 @@ import Foundation
 public enum HealthRouteRetryPolicy {
     public static let initialDelay: TimeInterval = 5 * 60
     public static let maximumDelay: TimeInterval = 24 * 60 * 60
+    public static let noRouteAttemptThreshold = 8
+    public static let noRouteGracePeriod: TimeInterval = 7 * 24 * 60 * 60
 
     public static func delay(afterAttempt attempt: Int) -> TimeInterval {
         guard attempt > 0 else { return 0 }
@@ -19,5 +21,15 @@ public enum HealthRouteRetryPolicy {
         }
         guard let lastCheckedAt else { return true }
         return now.timeIntervalSince(lastCheckedAt) >= delay(afterAttempt: retryCount ?? 0)
+    }
+
+    /// 多次确认且 Workout 已结束足够久后进入 noRoute，避免永久轮询无路线运动。
+    public static func stateAfterEmptyResult(retryCount: Int, workoutEnd: Date,
+                                             now: Date = Date()) -> String {
+        if retryCount >= noRouteAttemptThreshold,
+           now.timeIntervalSince(workoutEnd) >= noRouteGracePeriod {
+            return "noRoute"
+        }
+        return "pending"
     }
 }

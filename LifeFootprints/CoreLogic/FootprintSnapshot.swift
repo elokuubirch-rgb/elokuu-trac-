@@ -12,10 +12,13 @@ public struct FootprintSnapshot: Equatable {
     public let segmentID: String?
     /// 原始点仍保留在快照和统计中；重复来源只从点/线显示层排除。
     public let isSuppressedDuplicate: Bool
+    public let suppressedBySource: String?
+    public let originalPointID: String?
 
     public init(lat: Double, lon: Double, t: Date, source: String = "csv",
                 trajectoryID: String? = nil, sessionID: String? = nil,
-                segmentID: String? = nil, isSuppressedDuplicate: Bool = false) {
+                segmentID: String? = nil, isSuppressedDuplicate: Bool = false,
+                suppressedBySource: String? = nil, originalPointID: String? = nil) {
         self.lat = lat
         self.lon = lon
         self.t = t
@@ -24,6 +27,8 @@ public struct FootprintSnapshot: Equatable {
         self.sessionID = sessionID
         self.segmentID = segmentID
         self.isSuppressedDuplicate = isSuppressedDuplicate
+        self.suppressedBySource = suppressedBySource
+        self.originalPointID = originalPointID
     }
 }
 

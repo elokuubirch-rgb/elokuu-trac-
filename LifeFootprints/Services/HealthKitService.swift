@@ -11,6 +11,7 @@ enum HealthKitService {
 
     /// 授权并同步全部锻炼。已有 Workout 不再直接跳过：pending/failed 可补取延迟 Route。
     static func requestAndImport(container: ModelContainer,
+                                 enableAutomaticSync: Bool,
                                  progress: @escaping @Sendable (String) -> Void) async -> Int {
         guard isAvailable else {
             appLog.error("[Health] 此设备不支持健康数据")
@@ -24,13 +25,16 @@ enum HealthKitService {
             ])
         } catch {
             appLog.error("[Health] 授权失败: \(error.localizedDescription)")
+            HealthKitSyncStatusStore.setEnabled(false)
+            HealthKitSyncStatusStore.markFailed(error.localizedDescription)
             return 0
         }
         appLog.info("[Health] 授权成功，读取锻炼记录…")
 
-        UserDefaults.standard.set(true, forKey: HealthKitSyncCoordinator.automaticSyncEnabledKey)
+        HealthKitSyncStatusStore.setEnabled(enableAutomaticSync)
         return await HealthKitSyncCoordinator.shared.synchronizeManually(
-            container: container, progress: progress)
+            container: container, enableAutomaticSync: enableAutomaticSync,
+            progress: progress)
     }
 
     static func performFullSync(store: HKHealthStore, container: ModelContainer,
@@ -38,11 +42,17 @@ enum HealthKitService {
         do {
             let workouts = try await fetchWorkouts(store: store)
             appLog.info("[Health] 全量锻炼记录 \(workouts.count) 条")
-            return await importChanges(workouts: workouts, deletedWorkoutIDs: [],
-                                       store: store, container: container,
-                                       progress: progress) ?? 0
+            guard let added = await importChanges(
+                workouts: workouts, deletedWorkoutIDs: [], store: store,
+                container: container, progress: progress) else {
+                HealthKitSyncStatusStore.markFailed("本地健康数据保存失败")
+                return 0
+            }
+            HealthKitSyncStatusStore.markSucceeded()
+            return added
         } catch {
             appLog.error("[Health] 全量查询失败: \(error.localizedDescription)")
+            HealthKitSyncStatusStore.markFailed(error.localizedDescription)
             return 0
         }
     }
@@ -65,12 +75,17 @@ enum HealthKitService {
                 }
             guard let added = await importChanges(
                 workouts: all, deletedWorkoutIDs: Set(changes.deleted.map(\.uuid)),
-                store: store, container: container, progress: progress) else { return 0 }
+                store: store, container: container, progress: progress) else {
+                HealthKitSyncStatusStore.markFailed("本地健康数据保存失败")
+                return 0
+            }
             if let newAnchor = changes.newAnchor { HealthKitAnchorStore.save(newAnchor) }
+            HealthKitSyncStatusStore.markSucceeded()
             appLog.info("[Health] 增量同步：变化 \(changes.workouts.count)，重试 \(retries.count)，删除 \(changes.deleted.count)")
             return added
         } catch {
             appLog.error("[Health] 增量查询失败: \(error.localizedDescription)")
+            HealthKitSyncStatusStore.markFailed(error.localizedDescription)
             return 0
         }
     }
@@ -185,7 +200,10 @@ enum HealthKitService {
                 // Route 可能延迟到达；空结果不是终态，下次同步继续查询。
                 record.routeSyncState = .pending
                 record.routeAvailable = false
-                record.routeRetryCount = (record.routeRetryCount ?? 0) + 1
+                let retryCount = (record.routeRetryCount ?? 0) + 1
+                record.routeRetryCount = retryCount
+                record.routeSyncStateRaw = HealthRouteRetryPolicy.stateAfterEmptyResult(
+                    retryCount: retryCount, workoutEnd: record.endDate)
                 record.routeLastError = nil
             }
             addedRoutes += importedForWorkout
@@ -248,8 +266,8 @@ enum HealthKitService {
             let eligible = forceRetry || HealthRouteRetryPolicy.shouldRetry(
                 stateRaw: row.routeSyncStateRaw, retryCount: row.routeRetryCount,
                 lastCheckedAt: row.routeLastCheckedAt, now: now)
-            guard eligible, row.routeSyncState != .available,
-                  row.routeSyncState != .noRoute else { return nil }
+            guard eligible, row.routeSyncState != .available else { return nil }
+            if row.routeSyncState == .noRoute, !forceRetry { return nil }
             return UUID(uuidString: row.healthKitUUID)
         })
     }

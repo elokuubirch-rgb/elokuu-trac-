@@ -134,6 +134,8 @@ struct MapScreen: View {
         var monthCount: Int
         var scope: MapTimeScope
         var snapshotCount: Int
+        var showLines: Bool
+        var showWorkouts: Bool
     }
 
     private struct DerivedLayers {
@@ -147,7 +149,8 @@ struct MapScreen: View {
     /// 派生图层版本：重算落地后 +1，驱动原生图层重建（contentToken 的组成部分）
     @State private var derivedVersion = 0
     @State private var derivedKey = DerivedKey(reloadVersion: -1, monthIndex: -1,
-                                               monthCount: -1, scope: .all, snapshotCount: -1)
+                                               monthCount: -1, scope: .all, snapshotCount: -1,
+                                               showLines: true, showWorkouts: true)
     @State private var derivedGeneration = 0
 
     private var currentDerivedKey: DerivedKey {
@@ -155,7 +158,8 @@ struct MapScreen: View {
                    monthIndex: Int(monthIndex.rounded()),
                    monthCount: monthStarts.count,
                    scope: timeScope,
-                   snapshotCount: pointSnapshots.count)
+                   snapshotCount: pointSnapshots.count,
+                   showLines: showLines, showWorkouts: showWorkouts)
     }
 
     /// 后台重算全部派生图层；期间旧图层继续显示（交互零等待）。
@@ -167,11 +171,15 @@ struct MapScreen: View {
         let snapshots = pointSnapshots
         let cutoff = cutoffDate
         let scope = timeScope
+        let showLines = key.showLines
+        let showWorkouts = key.showWorkouts
         #if DEBUG
         let startedAt = CACurrentMediaTime()
         #endif
         Task.detached(priority: .userInitiated) {
-            let layers = Self.computeDerivedLayers(snapshots: snapshots, cutoff: cutoff, scope: scope)
+            let layers = Self.computeDerivedLayers(
+                snapshots: snapshots, cutoff: cutoff, scope: scope,
+                showLines: showLines, showWorkouts: showWorkouts)
             #if DEBUG
             let ms = (CACurrentMediaTime() - startedAt) * 1000
             #endif
@@ -188,7 +196,9 @@ struct MapScreen: View {
 
     /// 纯函数：输入快照 + 时间窗口 → 全部图层（任意线程执行，不触碰任何状态）
     nonisolated private static func computeDerivedLayers(snapshots: [FootprintSnapshot],
-                                                         cutoff: Date?, scope: MapTimeScope) -> DerivedLayers {
+                                                         cutoff: Date?, scope: MapTimeScope,
+                                                         showLines: Bool,
+                                                         showWorkouts: Bool) -> DerivedLayers {
         var layers = DerivedLayers()
         guard let cutoff else { return layers }
         let filtered = snapshots.filter { $0.t < cutoff && scope.contains($0.t) }
@@ -205,13 +215,16 @@ struct MapScreen: View {
         // 只有真实采样源可进入折线。历史 photo/csv/manual 点即使仍在数据库，
         // 也不能连接成 Personal Trajectory。
         layers.routes = makeRoutes(
-            from: MapLayerSemantics.autoTrajectory(filtered).sorted { $0.t < $1.t },
+            from: MapLayerSemantics.autoTrajectory(
+                filtered, workoutSourceVisible: showWorkouts).sorted { $0.t < $1.t },
             workout: false)
         layers.workoutRoutes = makeRoutes(
-            from: MapLayerSemantics.workoutTrajectory(filtered).sorted { $0.t < $1.t },
+            from: MapLayerSemantics.workoutTrajectory(
+                filtered, autoSourceVisible: showLines).sorted { $0.t < $1.t },
             workout: true)
 
-        let dotSnapshots = MapLayerSemantics.footprintDots(visible)
+        let dotSnapshots = MapLayerSemantics.footprintDots(
+            visible, workoutSourceVisible: showWorkouts)
         let buckets = freqBuckets(of: dotSnapshots)
         // 流畅优先：≤600 点采样（保持密度观感）
         let step = max(1, dotSnapshots.count / 600)
@@ -567,6 +580,7 @@ struct MapScreen: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
             // 足迹/照片入库完成 → 重载快照（替代主线程 @Query 监听）
+            TrajectoryResolutionCache.shared.invalidate()
             scheduleReload()
         }
         .onChange(of: navigation.mapPhotoHighlight) { _, _ in applyNavigationHighlight() }
@@ -825,20 +839,33 @@ struct MapScreen: View {
             let ptRows = (try? pointContext.fetch(FetchDescriptor<FootprintPoint>(
                 sortBy: [SortDescriptor(\.timestamp)]))) ?? []
             let snaps: [FootprintSnapshot] = ptRows
-                .map { FootprintSnapshot(lat: $0.latitude, lon: $0.longitude, t: $0.timestamp,
-                                         source: $0.sourceRaw) }
+                .map {
+                    let id = TrajectorySampleIdentity.footprint(
+                        source: $0.sourceRaw, latitude: $0.latitude,
+                        longitude: $0.longitude, timestamp: $0.timestamp)
+                    return FootprintSnapshot(lat: $0.latitude, lon: $0.longitude,
+                                             t: $0.timestamp, source: $0.sourceRaw,
+                                             originalPointID: id)
+                }
             let trajectoryResolution = try? TrajectoryRepository(container: container).loadResolved()
             let trajectorySnaps: [FootprintSnapshot]
             if let trajectoryResolution {
                 trajectorySnaps = trajectoryResolution.points.map { resolved in
-                    let source = resolved.source == .healthWorkout
-                        ? FootprintSource.health.rawValue : FootprintSource.gps.rawValue
+                    let source: String
+                    switch resolved.source {
+                    case .healthWorkout: source = FootprintSource.health.rawValue
+                    case .coreLocation: source = FootprintSource.gps.rawValue
+                    case .imported: source = FootprintSource.csv.rawValue
+                    case .inferred: source = FootprintSource.manual.rawValue
+                    }
                     return FootprintSnapshot(
                         lat: resolved.point.latitude, lon: resolved.point.longitude,
                         t: resolved.point.timestamp, source: source,
                         trajectoryID: resolved.trajectoryID, sessionID: resolved.sessionID,
                         segmentID: resolved.segmentID,
-                        isSuppressedDuplicate: resolved.suppressedByTrajectoryID != nil)
+                        isSuppressedDuplicate: resolved.suppressedByTrajectoryID != nil,
+                        suppressedBySource: resolved.suppressedBySource?.rawValue,
+                        originalPointID: resolved.point.id)
                 }
             } else {
                 let workoutRows = (try? pointContext.fetch(FetchDescriptor<WorkoutRoutePoint>(
@@ -853,8 +880,11 @@ struct MapScreen: View {
                 trajectorySnaps = snaps.filter { $0.source == FootprintSource.gps.rawValue }
                     + workoutSnaps
             }
-            let displaySnaps = snaps.filter { $0.source != FootprintSource.gps.rawValue }
-                + trajectorySnaps
+            let resolvedOriginalIDs = Set(trajectorySnaps.compactMap(\.originalPointID))
+            let displaySnaps = snaps.filter {
+                guard let id = $0.originalPointID else { return true }
+                return !resolvedOriginalIDs.contains(id)
+            } + trajectorySnaps
 
             let cal = Calendar.current
             var seen = Set<Date>()
@@ -940,12 +970,16 @@ struct MapScreen: View {
                 trailPoints = displaySnaps.filter {
                     $0.source == FootprintSource.health.rawValue
                         || $0.source == FootprintSource.gps.rawValue
+                        || ($0.source == FootprintSource.csv.rawValue && $0.trajectoryID != nil)
                 }.map {
-                    TrailPoint(lat: $0.lat, lon: $0.lon, t: $0.t.timeIntervalSince1970,
-                               source: $0.source == FootprintSource.health.rawValue
-                                ? .healthWorkout : .coreLocation,
-                               trajectoryID: $0.trajectoryID, sessionID: $0.sessionID,
-                               segmentID: $0.segmentID)
+                    let source: TrajectorySource
+                    if $0.source == FootprintSource.health.rawValue { source = .healthWorkout }
+                    else if $0.source == FootprintSource.csv.rawValue { source = .imported }
+                    else { source = .coreLocation }
+                    return TrailPoint(lat: $0.lat, lon: $0.lon,
+                                      t: $0.t.timeIntervalSince1970, source: source,
+                                      trajectoryID: $0.trajectoryID, sessionID: $0.sessionID,
+                                      segmentID: $0.segmentID)
                 }
             }
             let trailIndex = TrailIndex(points: trailPoints)

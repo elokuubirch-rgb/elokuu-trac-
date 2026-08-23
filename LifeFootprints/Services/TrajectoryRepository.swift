@@ -10,7 +10,7 @@ struct TrajectoryRepository {
         context.autosaveEnabled = false
 
         let footprintRows = try context.fetch(FetchDescriptor<FootprintPoint>(
-            predicate: #Predicate { $0.sourceRaw == "gps" },
+            predicate: #Predicate { $0.sourceRaw == "gps" || $0.sourceRaw == "csv" },
             sortBy: [SortDescriptor(\.timestamp)]))
         let workoutRows = try context.fetch(FetchDescriptor<WorkoutRoutePoint>(
             sortBy: [SortDescriptor(\.timestamp)]))
@@ -19,11 +19,23 @@ struct TrajectoryRepository {
             ($0.healthKitUUID, $0.workoutType)
         })
 
-        let autoSamples = footprintRows.enumerated().map { index, row in
+        let footprintSamples = footprintRows.map { row in
             TrajectorySample(
-                id: "footprint:\(Int64((row.timestamp.timeIntervalSince1970 * 1_000).rounded())):\(index)",
-                source: .coreLocation,
+                id: TrajectorySampleIdentity.footprint(
+                    source: row.sourceRaw, latitude: row.latitude,
+                    longitude: row.longitude, timestamp: row.timestamp),
+                source: row.sourceRaw == FootprintSource.gps.rawValue ? .coreLocation : .imported,
                 latitude: row.latitude, longitude: row.longitude, timestamp: row.timestamp)
+        }
+        let autoSamples = footprintSamples.filter { $0.source == .coreLocation }
+        let importedRaw = footprintSamples.filter { $0.source == .imported }
+        let importedSessions = ImportedTrajectoryClassifier.sessions(for: importedRaw)
+        let importedSamples = importedRaw.compactMap { sample -> TrajectorySample? in
+            guard let sessionID = importedSessions[sample.id] else { return nil }
+            return TrajectorySample(
+                id: sample.id, source: .imported, sourceIdentifier: "csv",
+                sessionID: sessionID, latitude: sample.latitude,
+                longitude: sample.longitude, timestamp: sample.timestamp)
         }
         let workoutSamples = workoutRows.enumerated().map { index, row in
             TrajectorySample(
@@ -35,10 +47,27 @@ struct TrajectoryRepository {
                 altitude: row.altitude, horizontalAccuracy: row.horizontalAccuracy,
                 speed: row.speed, course: row.course)
         }
-        return TrajectoryBuilder.build(samples: autoSamples + workoutSamples)
+        return TrajectoryBuilder.build(samples: autoSamples + importedSamples + workoutSamples)
     }
 
     func loadResolved() throws -> TrajectoryResolution {
-        TrajectoryConflictResolver.resolve(try load())
+        if let cached = TrajectoryResolutionCache.shared.value { return cached }
+        let resolution = TrajectoryConflictResolver.resolve(try load())
+        TrajectoryResolutionCache.shared.value = resolution
+        return resolution
     }
+}
+
+/// 地图重建期间复用解析结果；任何数据导入/删除通知都会显式失效。
+final class TrajectoryResolutionCache: @unchecked Sendable {
+    static let shared = TrajectoryResolutionCache()
+    private let lock = NSLock()
+    private var stored: TrajectoryResolution?
+
+    var value: TrajectoryResolution? {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+
+    func invalidate() { value = nil }
 }

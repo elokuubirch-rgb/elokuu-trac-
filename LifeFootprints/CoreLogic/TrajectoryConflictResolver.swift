@@ -45,12 +45,15 @@ public struct ResolvedTrajectoryPoint: Equatable, Sendable {
     public let point: TrajectoryPoint
     public let confidence: Double
     public let suppressedByTrajectoryID: String?
+    public let suppressedBySource: TrajectorySource?
 }
 
 public struct TrajectoryResolution: Equatable, Sendable {
     public let trajectories: [Trajectory]
     public let conflicts: [TrajectoryConflict]
     public let points: [ResolvedTrajectoryPoint]
+    /// 通过时间窗口剪枝后真正进入空间相似度判断的轨迹对数量。
+    public let comparedPairCount: Int
 
     public var visiblePoints: [ResolvedTrajectoryPoint] {
         points.filter { $0.suppressedByTrajectoryID == nil }
@@ -64,11 +67,19 @@ public enum TrajectoryConflictResolver {
     ) -> TrajectoryResolution {
         let ordered = trajectories.sorted { $0.id < $1.id }
         var conflicts: [TrajectoryConflict] = []
-        if ordered.count > 1 {
-            for leftIndex in 0..<(ordered.count - 1) {
-                for rightIndex in (leftIndex + 1)..<ordered.count {
+        var comparedPairCount = 0
+        let chronological = ordered.sorted {
+            $0.startTime == $1.startTime ? $0.id < $1.id : $0.startTime < $1.startTime
+        }
+        if chronological.count > 1 {
+            for leftIndex in 0..<(chronological.count - 1) {
+                for rightIndex in (leftIndex + 1)..<chronological.count {
+                    if chronological[rightIndex].startTime > chronological[leftIndex].endTime {
+                        break
+                    }
+                    comparedPairCount += 1
                     if let conflict = conflict(
-                        between: ordered[leftIndex], and: ordered[rightIndex],
+                        between: chronological[leftIndex], and: chronological[rightIndex],
                         configuration: configuration) {
                         conflicts.append(conflict)
                     }
@@ -86,10 +97,11 @@ public enum TrajectoryConflictResolver {
         let preferenceRank = Dictionary(uniqueKeysWithValues: ordered.sorted {
             prefers($0, over: $1)
         }.enumerated().map { ($0.element.id, $0.offset) })
+        let sourceByID = Dictionary(uniqueKeysWithValues: ordered.map { ($0.id, $0.source) })
         let flattenedPoints: [ResolvedTrajectoryPoint] = ordered.flatMap { trajectory in
             Self.resolvedPoints(for: trajectory,
                                 conflicts: conflictsByLoser[trajectory.id] ?? [],
-                                preferenceRank: preferenceRank)
+                                preferenceRank: preferenceRank, sourceByID: sourceByID)
         }.sorted {
             if $0.point.timestamp != $1.point.timestamp {
                 return $0.point.timestamp < $1.point.timestamp
@@ -98,7 +110,8 @@ public enum TrajectoryConflictResolver {
             return $0.point.id < $1.point.id
         }
         return TrajectoryResolution(trajectories: ordered, conflicts: conflicts,
-                                    points: flattenedPoints)
+                                    points: flattenedPoints,
+                                    comparedPairCount: comparedPairCount)
     }
 
     private static func conflict(
@@ -165,7 +178,8 @@ public enum TrajectoryConflictResolver {
 
     private static func resolvedPoints(for trajectory: Trajectory,
                                        conflicts: [TrajectoryConflict],
-                                       preferenceRank: [String: Int]) -> [ResolvedTrajectoryPoint] {
+                                       preferenceRank: [String: Int],
+                                       sourceByID: [String: TrajectorySource]) -> [ResolvedTrajectoryPoint] {
         trajectory.segments.flatMap { segment in
             let ordered = segment.points.sorted {
                 $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp < $1.timestamp
@@ -189,7 +203,8 @@ public enum TrajectoryConflictResolver {
                     trajectoryID: trajectory.id, sessionID: segment.sessionID,
                     segmentID: resolvedSegmentID, source: trajectory.source,
                     point: point, confidence: segment.quality.confidence,
-                    suppressedByTrajectoryID: suppressor)
+                    suppressedByTrajectoryID: suppressor,
+                    suppressedBySource: suppressor.flatMap { sourceByID[$0] })
             }
         }
     }

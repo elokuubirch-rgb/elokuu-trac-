@@ -184,12 +184,16 @@ let semanticSnapshots = [
     FootprintSnapshot(lat: 31.3, lon: 121.3, t: semanticBase, source: FootprintSource.gps.rawValue),
     FootprintSnapshot(lat: 31.4, lon: 121.4, t: semanticBase, source: FootprintSource.health.rawValue),
     FootprintSnapshot(lat: 31.3, lon: 121.3, t: semanticBase,
-                      source: FootprintSource.gps.rawValue, isSuppressedDuplicate: true)
+                      source: FootprintSource.gps.rawValue, isSuppressedDuplicate: true,
+                      suppressedBySource: TrajectorySource.healthWorkout.rawValue)
 ]
 check(MapLayerSemantics.autoTrajectory(semanticSnapshots).map(\.source) == [FootprintSource.gps.rawValue],
       "图层语义-自动轨迹只消费GPS")
 check(MapLayerSemantics.workoutTrajectory(semanticSnapshots).map(\.source) == [FootprintSource.health.rawValue],
       "图层语义-运动轨迹只消费HealthKit")
+check(MapLayerSemantics.autoTrajectory(
+    semanticSnapshots, workoutSourceVisible: false).count == 2,
+      "图层语义-关闭胜出来源后恢复被抑制轨迹")
 check(MapLayerSemantics.footprintDots(semanticSnapshots).allSatisfy {
     $0.source != FootprintSource.photo.rawValue && $0.source != FootprintSource.health.rawValue
         && !$0.isSuppressedDuplicate
@@ -302,6 +306,36 @@ let sameSourceConflict = TrajectoryConflictResolver.resolve(
     TrajectoryBuilder.build(samples: sameSourceSamples)).conflicts.first
 check(sameSourceConflict?.winnerTrajectoryID.contains("auto-good") == true,
       "轨迹冲突-同源选择高质量轨迹", "\(String(describing: sameSourceConflict))")
+
+// 时间窗口剪枝：大量互不重叠的历史轨迹不进入昂贵的空间相似度比较。
+let disjointSamples = (0..<500).map { index in
+    trajectorySample("disjoint-\(index)", .coreLocation, Double(index) * 4_000,
+                     30 + Double(index % 10) * 0.01, 120,
+                     session: "disjoint-\(index)")
+}
+let disjointResolution = TrajectoryConflictResolver.resolve(
+    TrajectoryBuilder.build(samples: disjointSamples))
+check(disjointResolution.trajectories.count == 500
+      && disjointResolution.comparedPairCount == 0,
+      "轨迹冲突-时间窗口剪枝避免全量两两比较",
+      "compared=\(disjointResolution.comparedPairCount)")
+
+// CSV 只有连续移动序列进入 imported 轨迹；稀疏旅行地点保持普通地点。
+let importedContinuous = [
+    trajectorySample("csv-1", .imported, 10_000, 31.0, 121.0),
+    trajectorySample("csv-2", .imported, 10_120, 31.001, 121.001),
+    trajectorySample("csv-3", .imported, 10_240, 31.002, 121.002)
+]
+let importedSessions = ImportedTrajectoryClassifier.sessions(for: importedContinuous)
+check(importedSessions.count == 3 && Set(importedSessions.values).count == 1,
+      "Imported轨迹-连续CSV识别为同一Session", "\(importedSessions)")
+let importedSparse = [
+    trajectorySample("place-1", .imported, 20_000, 31, 121),
+    trajectorySample("place-2", .imported, 20_000 + 86_400, 32, 122),
+    trajectorySample("place-3", .imported, 20_000 + 172_800, 33, 123)
+]
+check(ImportedTrajectoryClassifier.sessions(for: importedSparse).isEmpty,
+      "Imported轨迹-稀疏CSV仍是普通地点")
 
 // HKWorkoutRouteQuery 的回调 chunk 可能乱序；chunk 不能被误当成 Segment。
 let routeOrderBase = Date(timeIntervalSince1970: 1_702_000_000)
@@ -551,6 +585,15 @@ check(!HealthRouteRetryPolicy.shouldRetry(
       && !HealthRouteRetryPolicy.shouldRetry(
         stateRaw: "noRoute", retryCount: 0, lastCheckedAt: nil, now: retryNow),
       "Health Route重试-终态不重试")
+let oldWorkoutEnd = retryNow.addingTimeInterval(-HealthRouteRetryPolicy.noRouteGracePeriod)
+check(HealthRouteRetryPolicy.stateAfterEmptyResult(
+    retryCount: 7, workoutEnd: oldWorkoutEnd, now: retryNow) == "pending"
+      && HealthRouteRetryPolicy.stateAfterEmptyResult(
+        retryCount: 8, workoutEnd: oldWorkoutEnd, now: retryNow) == "noRoute",
+      "Health Route重试-多次确认后进入无路线终态")
+check(HealthRouteRetryPolicy.stateAfterEmptyResult(
+    retryCount: 99, workoutEnd: retryNow.addingTimeInterval(-60), now: retryNow) == "pending",
+      "Health Route重试-新近Workout不提前终止")
 
 // ── 后台低功耗交通策略（本地 / 高铁 / 飞机）──
 let bgBase = BackgroundLocationSample(latitude: 31.2304, longitude: 121.4737,

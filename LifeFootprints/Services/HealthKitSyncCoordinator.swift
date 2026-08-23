@@ -30,9 +30,10 @@ final class HealthKitSyncCoordinator {
     }
 
     func synchronizeManually(container: ModelContainer,
+                             enableAutomaticSync: Bool,
                              progress: @escaping @Sendable (String) -> Void) async -> Int {
         self.container = container
-        await enableBackgroundDelivery()
+        if enableAutomaticSync { await enableBackgroundDelivery() }
         while isSyncing {
             do {
                 try await Task.sleep(nanoseconds: 100_000_000)
@@ -42,8 +43,22 @@ final class HealthKitSyncCoordinator {
         }
         let added = await synchronize(
             forceFull: true, forcePendingRetry: true, progress: progress)
-        startObserversIfNeeded()
+        if enableAutomaticSync { startObserversIfNeeded() }
         return added
+    }
+
+    func disableAutomaticSync() async {
+        for observer in observers { store.stop(observer) }
+        observers.removeAll()
+        let types: [HKObjectType] = [HKObjectType.workoutType(), HKSeriesType.workoutRoute()]
+        for type in types {
+            do {
+                try await store.disableBackgroundDelivery(for: type)
+            } catch {
+                appLog.error("[Health] 关闭后台投递失败: \(error.localizedDescription)")
+            }
+        }
+        HealthKitSyncStatusStore.setEnabled(false)
     }
 
     @discardableResult
@@ -55,6 +70,7 @@ final class HealthKitSyncCoordinator {
             return 0
         }
         isSyncing = true
+        HealthKitSyncStatusStore.markStarted()
         let added: Int
         if forceFull {
             added = await HealthKitService.performFullSync(
@@ -77,8 +93,11 @@ final class HealthKitSyncCoordinator {
         let types: [HKSampleType] = [HKObjectType.workoutType(), HKSeriesType.workoutRoute()]
         for type in types {
             let query = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completion, error in
-                guard error == nil else {
-                    appLog.error("[Health] Observer失败: \(error!.localizedDescription)")
+                if let error {
+                    appLog.error("[Health] Observer失败: \(error.localizedDescription)")
+                    Task { @MainActor in
+                        HealthKitSyncStatusStore.markFailed(error.localizedDescription)
+                    }
                     completion()
                     return
                 }
