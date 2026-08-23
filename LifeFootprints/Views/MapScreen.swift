@@ -903,14 +903,28 @@ struct MapScreen: View {
             let photoRowTotal = 0
             let photoRegionTotal = 0
             #endif
-            // 轨迹索引（健康/记录路线点）→ 照片精细级标记吸附到轨迹
-            let trailIndex = TrailIndex(points: displaySnaps
-                .filter { $0.source == FootprintSource.health.rawValue
-                           || $0.source == FootprintSource.gps.rawValue }
-                .map { TrailPoint(lat: $0.lat, lon: $0.lon, t: $0.t.timeIntervalSince1970) })
+            // TrailIndex v2 只消费领域轨迹，保留 source/trajectory/session/segment 边界。
+            let trajectories = (try? TrajectoryRepository(container: container).load()) ?? []
+            let trailPoints = trajectories.flatMap { trajectory in
+                trajectory.segments.flatMap { segment in
+                    segment.points.map { point in
+                        TrailPoint(
+                            lat: point.latitude, lon: point.longitude,
+                            t: point.timestamp.timeIntervalSince1970,
+                            source: point.source,
+                            trajectoryID: trajectory.id,
+                            sessionID: segment.sessionID,
+                            segmentID: segment.id,
+                            horizontalAccuracy: point.horizontalAccuracy,
+                            confidence: segment.quality.confidence,
+                            originalPointID: point.id)
+                    }
+                }
+            }
+            let trailIndex = TrailIndex(points: trailPoints)
             var snapExact = 0, snapSnap = 0, snapInterp = 0, snapKept = 0
             let clIndex = ClusterIndex.build(records: phRows, trails: trailIndex, onSnap: { r in
-                switch r {
+                switch r.kind {
                 case .exact: snapExact += 1
                 case .snapped: snapSnap += 1
                 case .interpolated: snapInterp += 1

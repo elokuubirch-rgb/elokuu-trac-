@@ -417,6 +417,40 @@ check(abs(gapSnap.0 - 31.2350) < 0.0001 && abs(gapSnap.1 - 121.4780) < 0.0001,
 let gapInterp = snapPhotoToTrail(lat: 999, lon: 999, time: 40_000, trails: gapped)
 check(gapInterp.0 == 999 && gapInterp.1 == 999, "间隙内不跨线路插值", "\(gapInterp)")
 
+// ── TrailIndex v2：来源可追溯，禁止跨领域边界插值 ──
+let v2Trail = TrailIndex(points: [
+    TrailPoint(lat: 31.0000, lon: 121.0000, t: 1_000,
+               source: .coreLocation, trajectoryID: "auto-1", sessionID: "auto-s1",
+               segmentID: "auto-seg", confidence: 0.6, originalPointID: "a1"),
+    TrailPoint(lat: 31.0010, lon: 121.0010, t: 1_100,
+               source: .coreLocation, trajectoryID: "auto-1", sessionID: "auto-s1",
+               segmentID: "auto-seg", confidence: 0.6, originalPointID: "a2"),
+    TrailPoint(lat: 31.0000, lon: 121.0000, t: 1_000,
+               source: .healthWorkout, trajectoryID: "workout-1", sessionID: "workout-1",
+               segmentID: "route-1", confidence: 0.95, originalPointID: "w1"),
+    TrailPoint(lat: 31.0020, lon: 121.0020, t: 1_100,
+               source: .healthWorkout, trajectoryID: "workout-1", sessionID: "workout-1",
+               segmentID: "route-1", confidence: 0.95, originalPointID: "w2")
+])
+let v2Match = snapPhotoToTrailResult(
+    lat: 31.001, lon: 121.001, time: 1_050, trails: v2Trail)
+check(v2Match.source == .healthWorkout && v2Match.trajectoryID == "workout-1"
+      && v2Match.segmentID == "route-1",
+      "TrailIndex v2-匹配结果保留来源和领域边界", "\(v2Match)")
+check(abs(v2Match.confidence - 0.95) < 0.001 && v2Match.timeDelta == 0,
+      "TrailIndex v2-匹配结果保留置信度和时间差", "\(v2Match)")
+
+let crossBoundaryOnly = TrailIndex(points: [
+    TrailPoint(lat: 31, lon: 121, t: 2_000,
+               source: .healthWorkout, trajectoryID: "w1", sessionID: "w1", segmentID: "r1"),
+    TrailPoint(lat: 31.001, lon: 121.001, t: 2_100,
+               source: .healthWorkout, trajectoryID: "w2", sessionID: "w2", segmentID: "r2")
+])
+check(crossBoundaryOnly.interpolate(at: 2_050) == nil,
+      "TrailIndex v2-不同Workout禁止时间插值")
+check(crossBoundaryOnly.nearestOnRoute(to: 31.0005, lon: 121.0005, within: 100) == nil,
+      "TrailIndex v2-不同Workout禁止空间连段")
+
 // ── 后台低功耗交通策略（本地 / 高铁 / 飞机）──
 let bgBase = BackgroundLocationSample(latitude: 31.2304, longitude: 121.4737,
                                       timestamp: 1_700_000_000, speedMPS: 0,

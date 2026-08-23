@@ -146,17 +146,8 @@ struct ClusterIndex {
                                                     time: r.timestamp.timeIntervalSince1970,
                                                     trails: trails)
             onSnap?(snapResult)
-            let snapped: (Double, Double)
-            let attachedToRoute: Bool
-            switch snapResult {
-            case .exact(let a, let b), .snapped(let a, let b),
-                 .interpolated(let a, let b):
-                snapped = (a, b)
-                attachedToRoute = true
-            case .kept(let a, let b):
-                snapped = (a, b)
-                attachedToRoute = false
-            }
+            let snapped = (snapResult.lat, snapResult.lon)
+            let attachedToRoute = snapResult.kind != .kept
             add(&pBuckets, province, r, lat: r.latitude, lon: r.longitude, isCountry: isCountry)
             let cityKey = "\(province)|\(city)"
             add(&cBuckets, cityKey, r, lat: r.latitude, lon: r.longitude)
