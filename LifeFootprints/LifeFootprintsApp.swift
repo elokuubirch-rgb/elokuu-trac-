@@ -54,6 +54,8 @@ struct LifeFootprintsApp: App {
         }
         // 若用户之前开启过后台足迹，冷启动或系统定位唤醒时立即恢复监听。
         LocationService.shared.restoreBackgroundMonitoring()
+        // 用户完成过 HealthKit 授权后，冷启动恢复 observer 并执行一次锚点增量同步。
+        HealthKitSyncCoordinator.shared.restoreIfEnabled(container: container)
     }
 
     var body: some Scene {

@@ -451,6 +451,28 @@ check(crossBoundaryOnly.interpolate(at: 2_050) == nil,
 check(crossBoundaryOnly.nearestOnRoute(to: 31.0005, lon: 121.0005, within: 100) == nil,
       "TrailIndex v2-不同Workout禁止空间连段")
 
+// ── HealthKit Route 延迟到达：指数退避且终态不重试 ──
+check(HealthRouteRetryPolicy.delay(afterAttempt: 0) == 0
+      && HealthRouteRetryPolicy.delay(afterAttempt: 1) == 300
+      && HealthRouteRetryPolicy.delay(afterAttempt: 2) == 600,
+      "Health Route重试-指数退避")
+check(HealthRouteRetryPolicy.delay(afterAttempt: 99) == 86_400,
+      "Health Route重试-最长24小时")
+let retryNow = Date(timeIntervalSince1970: 100_000)
+check(!HealthRouteRetryPolicy.shouldRetry(
+    stateRaw: "pending", retryCount: 2,
+    lastCheckedAt: retryNow.addingTimeInterval(-599), now: retryNow),
+      "Health Route重试-退避期内跳过")
+check(HealthRouteRetryPolicy.shouldRetry(
+    stateRaw: "failed", retryCount: 2,
+    lastCheckedAt: retryNow.addingTimeInterval(-600), now: retryNow),
+      "Health Route重试-到期恢复")
+check(!HealthRouteRetryPolicy.shouldRetry(
+    stateRaw: "available", retryCount: 0, lastCheckedAt: nil, now: retryNow)
+      && !HealthRouteRetryPolicy.shouldRetry(
+        stateRaw: "noRoute", retryCount: 0, lastCheckedAt: nil, now: retryNow),
+      "Health Route重试-终态不重试")
+
 // ── 后台低功耗交通策略（本地 / 高铁 / 飞机）──
 let bgBase = BackgroundLocationSample(latitude: 31.2304, longitude: 121.4737,
                                       timestamp: 1_700_000_000, speedMPS: 0,

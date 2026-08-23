@@ -28,15 +28,77 @@ enum HealthKitService {
         }
         appLog.info("[Health] 授权成功，读取锻炼记录…")
 
-        let workouts = await fetchWorkouts(store: store)
-        let count = workouts.count
-        appLog.info("[Health] 锻炼记录 \(count) 条")
+        UserDefaults.standard.set(true, forKey: HealthKitSyncCoordinator.automaticSyncEnabledKey)
+        return await HealthKitSyncCoordinator.shared.synchronizeManually(
+            container: container, progress: progress)
+    }
+
+    static func performFullSync(store: HKHealthStore, container: ModelContainer,
+                                progress: @escaping @Sendable (String) -> Void) async -> Int {
+        do {
+            let workouts = try await fetchWorkouts(store: store)
+            appLog.info("[Health] 全量锻炼记录 \(workouts.count) 条")
+            return await importChanges(workouts: workouts, deletedWorkoutIDs: [],
+                                       store: store, container: container,
+                                       progress: progress) ?? 0
+        } catch {
+            appLog.error("[Health] 全量查询失败: \(error.localizedDescription)")
+            return 0
+        }
+    }
+
+    static func performIncrementalSync(store: HKHealthStore, container: ModelContainer,
+                                       forcePendingRetry: Bool,
+                                       progress: @escaping @Sendable (String) -> Void) async -> Int {
+        let previousAnchor = HealthKitAnchorStore.load()
+        do {
+            let changes = try await fetchWorkoutChanges(store: store, anchor: previousAnchor)
+            let pendingIDs = pendingWorkoutIDs(
+                in: container, forceRetry: forcePendingRetry)
+            let changedIDs = Set(changes.workouts.map(\.uuid))
+            let retryIDs = pendingIDs.subtracting(changedIDs)
+            let retries = retryIDs.isEmpty
+                ? [] : try await fetchWorkouts(store: store, ids: retryIDs)
+            let all = Dictionary(uniqueKeysWithValues:
+                (changes.workouts + retries).map { ($0.uuid, $0) }).values.sorted {
+                    $0.startDate < $1.startDate
+                }
+            guard let added = await importChanges(
+                workouts: all, deletedWorkoutIDs: Set(changes.deleted.map(\.uuid)),
+                store: store, container: container, progress: progress) else { return 0 }
+            if let newAnchor = changes.newAnchor { HealthKitAnchorStore.save(newAnchor) }
+            appLog.info("[Health] 增量同步：变化 \(changes.workouts.count)，重试 \(retries.count)，删除 \(changes.deleted.count)")
+            return added
+        } catch {
+            appLog.error("[Health] 增量查询失败: \(error.localizedDescription)")
+            return 0
+        }
+    }
+
+    /// 返回 nil 表示 SwiftData 保存失败，此时调用方不得推进 anchor。
+    private static func importChanges(workouts: [HKWorkout], deletedWorkoutIDs: Set<UUID>,
+                                      store: HKHealthStore, container: ModelContainer,
+                                      progress: @escaping @Sendable (String) -> Void) async -> Int? {
         let context = ModelContext(container)
         backfillLegacyRouteBoundaries(in: context)
+        let deletedStrings = Set(deletedWorkoutIDs.map(\.uuidString))
+        if !deletedStrings.isEmpty {
+            for row in (try? context.fetch(FetchDescriptor<WorkoutRoutePoint>())) ?? []
+            where deletedStrings.contains(row.workoutID) { context.delete(row) }
+            for row in (try? context.fetch(FetchDescriptor<WorkoutRouteRecord>())) ?? []
+            where deletedStrings.contains(row.workoutID) { context.delete(row) }
+            for row in (try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? []
+            where deletedStrings.contains(row.healthKitUUID) { context.delete(row) }
+        }
+
+        let count = workouts.count
         let existingRecords = (try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? []
-        let recordByID = Dictionary(uniqueKeysWithValues: existingRecords.map { ($0.healthKitUUID, $0) })
-        let existingRoutes = Set(((try? context.fetch(FetchDescriptor<WorkoutRouteRecord>())) ?? [])
-            .map(\.routeID))
+        var recordByID = Dictionary(uniqueKeysWithValues: existingRecords
+            .filter { !deletedStrings.contains($0.healthKitUUID) }
+            .map { ($0.healthKitUUID, $0) })
+        let routeRows = (try? context.fetch(FetchDescriptor<WorkoutRouteRecord>())) ?? []
+        var existingRoutes = Set(routeRows.map(\.routeID))
+        var workoutsWithRoutes = Set(routeRows.map(\.workoutID))
         var addedRoutes = 0
         for (i, workout) in workouts.enumerated() {
             let workoutID = workout.uuid.uuidString
@@ -44,6 +106,12 @@ enum HealthKitService {
             let record: WorkoutRecord
             if let existing = recordByID[workoutID] {
                 record = existing
+                record.workoutType = workoutTypeName(workout)
+                record.startDate = workout.startDate
+                record.endDate = workout.endDate
+                record.duration = workout.duration
+                record.distanceMeters = workout.totalDistance?.doubleValue(for: .meter()) ?? 0
+                record.caloriesKCal = workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()) ?? 0
                 // 已有可用路线已被 Route 实体覆盖时无需重复下载全部点。
                 if existing.routeSyncState == .available { continue }
             } else {
@@ -56,10 +124,20 @@ enum HealthKitService {
                     caloriesKCal: workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()) ?? 0,
                     elevationGain: 0, routeAvailable: false, routeSyncState: .unknown)
                 context.insert(record)
+                recordByID[workoutID] = record
             }
             progress("正在读取路线 \(i + 1)/\(count)（\(label)）")
             record.routeLastCheckedAt = Date()
-            let routes = await fetchRoutes(workout: workout, store: store)
+            let routes: [RoutePayload]
+            do {
+                routes = try await fetchRoutes(workout: workout, store: store)
+            } catch {
+                record.routeSyncState = .failed
+                record.routeAvailable = workoutsWithRoutes.contains(workoutID)
+                record.routeRetryCount = (record.routeRetryCount ?? 0) + 1
+                record.routeLastError = error.localizedDescription
+                continue
+            }
             var elevationGain = 0.0
             var importedForWorkout = 0
             for route in routes where !existingRoutes.contains(route.routeID) {
@@ -93,9 +171,11 @@ enum HealthKitService {
                     elevationGain += max(0, pair.1.altitude - pair.0.altitude)
                 }
                 importedForWorkout += 1
+                existingRoutes.insert(route.routeID)
+                workoutsWithRoutes.insert(workoutID)
                 appLog.info("[Health] \(label) Route \(route.routeID)：\(ordered.count) 点")
             }
-            if routes.contains(where: { !$0.locations.isEmpty }) {
+            if workoutsWithRoutes.contains(workoutID) || routes.contains(where: { !$0.locations.isEmpty }) {
                 record.routeSyncState = .available
                 record.routeAvailable = true
                 record.routeRetryCount = 0
@@ -106,6 +186,7 @@ enum HealthKitService {
                 record.routeSyncState = .pending
                 record.routeAvailable = false
                 record.routeRetryCount = (record.routeRetryCount ?? 0) + 1
+                record.routeLastError = nil
             }
             addedRoutes += importedForWorkout
         }
@@ -113,7 +194,7 @@ enum HealthKitService {
             try context.save()
         } catch {
             appLog.error("[Health] 保存失败: \(error.localizedDescription)")
-            return 0
+            return nil
         }
         NotificationCenter.default.post(name: .dataImported, object: nil)
         appLog.info("[Health] 独立 Workout Route 导入：新增 \(addedRoutes) 条")
@@ -122,17 +203,55 @@ enum HealthKitService {
 
     // MARK: - HealthKit 查询
 
-    private static func fetchWorkouts(store: HKHealthStore) async -> [HKWorkout] {
-        await withCheckedContinuation { continuation in
+    private struct WorkoutChanges {
+        let workouts: [HKWorkout]
+        let deleted: [HKDeletedObject]
+        let newAnchor: HKQueryAnchor?
+    }
+
+    private static func fetchWorkoutChanges(store: HKHealthStore,
+                                            anchor: HKQueryAnchor?) async throws -> WorkoutChanges {
+        try await withCheckedThrowingContinuation { continuation in
+            let query = HKAnchoredObjectQuery(
+                type: HKObjectType.workoutType(), predicate: nil, anchor: anchor,
+                limit: HKObjectQueryNoLimit) { _, samples, deleted, newAnchor, error in
+                    if let error { continuation.resume(throwing: error); return }
+                    continuation.resume(returning: WorkoutChanges(
+                        workouts: (samples as? [HKWorkout]) ?? [],
+                        deleted: deleted ?? [], newAnchor: newAnchor))
+                }
+            store.execute(query)
+        }
+    }
+
+    private static func fetchWorkouts(store: HKHealthStore,
+                                      ids: Set<UUID>? = nil) async throws -> [HKWorkout] {
+        try await withCheckedThrowingContinuation { continuation in
+            let predicate = ids.map { HKQuery.predicateForObjects(with: $0) }
             let query = HKSampleQuery(
                 sampleType: HKObjectType.workoutType(),
-                predicate: nil,
+                predicate: predicate,
                 limit: HKObjectQueryNoLimit,
-                sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]) { _, samples, _ in
+                sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierStartDate, ascending: true)]) { _, samples, error in
+                if let error { continuation.resume(throwing: error); return }
                 continuation.resume(returning: (samples as? [HKWorkout]) ?? [])
             }
             store.execute(query)
         }
+    }
+
+    private static func pendingWorkoutIDs(in container: ModelContainer,
+                                          forceRetry: Bool) -> Set<UUID> {
+        let context = ModelContext(container)
+        let now = Date()
+        return Set(((try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? []).compactMap { row in
+            let eligible = forceRetry || HealthRouteRetryPolicy.shouldRetry(
+                stateRaw: row.routeSyncStateRaw, retryCount: row.routeRetryCount,
+                lastCheckedAt: row.routeLastCheckedAt, now: now)
+            guard eligible, row.routeSyncState != .available,
+                  row.routeSyncState != .noRoute else { return nil }
+            return UUID(uuidString: row.healthKitUUID)
+        })
     }
 
     private struct RoutePayload {
@@ -144,20 +263,22 @@ enum HealthKitService {
     }
 
     /// 读取一个 Workout 关联的全部 Route；每个 Route 单独累积所有流式 chunk。
-    private static func fetchRoutes(workout: HKWorkout, store: HKHealthStore) async -> [RoutePayload] {
-        let routes: [HKWorkoutRoute] = await withCheckedContinuation { continuation in
+    private static func fetchRoutes(workout: HKWorkout,
+                                    store: HKHealthStore) async throws -> [RoutePayload] {
+        let routes: [HKWorkoutRoute] = try await withCheckedThrowingContinuation { continuation in
             let query = HKSampleQuery(
                 sampleType: HKSeriesType.workoutRoute(),
                 predicate: HKQuery.predicateForObjects(from: workout),
                 limit: HKObjectQueryNoLimit,
-                sortDescriptors: nil) { _, samples, _ in
+                sortDescriptors: nil) { _, samples, error in
+                if let error { continuation.resume(throwing: error); return }
                 continuation.resume(returning: (samples as? [HKWorkoutRoute]) ?? [])
             }
             store.execute(query)
         }
         var result: [RoutePayload] = []
         for route in routes {
-            let locations = await fetchLocations(route: route, store: store)
+            let locations = try await fetchLocations(route: route, store: store)
             result.append(RoutePayload(
                 routeID: route.uuid.uuidString,
                 sourceIdentifier: route.sourceRevision.source.bundleIdentifier,
@@ -169,26 +290,28 @@ enum HealthKitService {
     }
 
     private static func fetchLocations(route: HKWorkoutRoute,
-                                       store: HKHealthStore) async -> [CLLocation] {
-        await withCheckedContinuation { continuation in
+                                       store: HKHealthStore) async throws -> [CLLocation] {
+        try await withCheckedThrowingContinuation { continuation in
             final class Box: @unchecked Sendable {
                 private let lock = NSLock()
                 var points: [CLLocation] = []
                 var resumed = false
 
-                func append(_ locations: [CLLocation], done: Bool, error: Error?) -> [CLLocation]? {
+                func append(_ locations: [CLLocation], done: Bool,
+                            error: Error?) -> Result<[CLLocation], Error>? {
                     lock.lock()
                     defer { lock.unlock() }
                     points.append(contentsOf: locations)
                     guard (done || error != nil), !resumed else { return nil }
                     resumed = true
-                    return points
+                    if let error { return .failure(error) }
+                    return .success(points)
                 }
             }
             let box = Box()
             let routeQuery = HKWorkoutRouteQuery(route: route) { _, locations, done, error in
-                if let completed = box.append(locations ?? [], done: done, error: error) {
-                    continuation.resume(returning: completed)
+                if let result = box.append(locations ?? [], done: done, error: error) {
+                    continuation.resume(with: result)
                 }
             }
             store.execute(routeQuery)
@@ -251,5 +374,30 @@ enum HealthKitService {
         default: name = "锻炼"
         }
         return name
+    }
+}
+
+/// HKQueryAnchor 只有在业务数据成功落库后才覆盖，避免“anchor 已前进、数据未保存”的永久丢失。
+private enum HealthKitAnchorStore {
+    private static let key = "healthKitWorkoutQueryAnchor.v1"
+
+    static func load(defaults: UserDefaults = .standard) -> HKQueryAnchor? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        do {
+            return try NSKeyedUnarchiver.unarchivedObject(ofClass: HKQueryAnchor.self, from: data)
+        } catch {
+            appLog.error("[Health] Anchor读取失败，将从头增量同步: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    static func save(_ anchor: HKQueryAnchor, defaults: UserDefaults = .standard) {
+        do {
+            let data = try NSKeyedArchiver.archivedData(
+                withRootObject: anchor, requiringSecureCoding: true)
+            defaults.set(data, forKey: key)
+        } catch {
+            appLog.error("[Health] Anchor保存失败: \(error.localizedDescription)")
+        }
     }
 }
