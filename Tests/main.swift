@@ -192,6 +192,38 @@ check(MapLayerSemantics.footprintDots(semanticSnapshots).allSatisfy {
     $0.source != FootprintSource.photo.rawValue && $0.source != FootprintSource.health.rawValue
 }, "图层语义-照片和健康点不泄漏到普通点层")
 
+// ── Trajectory Domain：Builder 负责会话/路线/分段，Map 不再猜边界 ──
+let trajectoryBase = Date(timeIntervalSince1970: 1_701_000_000)
+func trajectorySample(_ id: String, _ source: TrajectorySource, _ seconds: Double,
+                      _ lat: Double, _ lon: Double, session: String? = nil,
+                      route: String? = nil, accuracy: Double? = 10) -> TrajectorySample {
+    TrajectorySample(id: id, source: source, sourceIdentifier: session,
+                     sessionID: session, routeID: route,
+                     latitude: lat, longitude: lon,
+                     timestamp: trajectoryBase.addingTimeInterval(seconds),
+                     horizontalAccuracy: accuracy)
+}
+let domainSamples = [
+    trajectorySample("a1", .coreLocation, 0, 31.0000, 121.0000),
+    trajectorySample("a2", .coreLocation, 60, 31.0005, 121.0005),
+    trajectorySample("a3", .coreLocation, 4_000, 31.0010, 121.0010),
+    trajectorySample("w1-r1-1", .healthWorkout, 100, 31.1000, 121.1000, session: "workout-1", route: "route-1"),
+    trajectorySample("w1-r1-2", .healthWorkout, 160, 31.1005, 121.1005, session: "workout-1", route: "route-1"),
+    trajectorySample("w1-r2-1", .healthWorkout, 170, 31.1006, 121.1006, session: "workout-1", route: "route-2"),
+    trajectorySample("w2-1", .healthWorkout, 171, 31.1007, 121.1007, session: "workout-2", route: "route-3")
+]
+let domainTrajectories = TrajectoryBuilder.build(samples: domainSamples)
+let autoDomain = domainTrajectories.filter { $0.source == .coreLocation }
+let workoutDomain = domainTrajectories.filter { $0.source == .healthWorkout }
+check(autoDomain.count == 2, "轨迹领域-Core Location时间断层生成新Session", "count=\(autoDomain.count)")
+check(workoutDomain.count == 2, "轨迹领域-不同Workout永不合并", "count=\(workoutDomain.count)")
+check(workoutDomain.first(where: { $0.sessionID == "workout-1" })?.segments.count == 2,
+      "轨迹领域-同Workout多Route保持独立Segment")
+check(workoutDomain.allSatisfy { Set($0.segments.map(\.sessionID)) == Set([$0.sessionID]) },
+      "轨迹领域-Segment保留Session边界")
+check(workoutDomain.first(where: { $0.sessionID == "workout-1" })?.quality.accuratePointRatio == 1,
+      "轨迹领域-质量统计保留精度")
+
 // ── 同级随机区域候选 ──
 let cities = ["哈尔滨市", "大连市", "昆明市", "成都市", "西安市", "青岛市", "杭州市", "上海市", "深圳市"]
 let next = randomCandidate(cities, excluding: "哈尔滨市", recent: ["大连市", "昆明市"])
