@@ -10,6 +10,8 @@ struct RouteLine: Identifiable {
     let coords: [CLLocationCoordinate2D]
     let freq: Int
     let isWorkout: Bool
+    /// 与 canonical/raw 数据分离的纯派生显示 geometry；在后台 route 构建阶段生成。
+    let renderGeometry: ZoomAwareRouteGeometry
 
     let contentFingerprint: UInt64
 
@@ -18,6 +20,14 @@ struct RouteLine: Identifiable {
         self.coords = coords
         self.freq = freq
         self.isWorkout = isWorkout
+        #if DEBUG
+        self.renderGeometry = PerformanceDiagnostics.measure(
+            "RenderGeometry.LOD.build", metadata: "points=\(coords.count)") {
+                ZoomAwareRouteGeometry(coordinates: coords)
+            }
+        #else
+        self.renderGeometry = ZoomAwareRouteGeometry(coordinates: coords)
+        #endif
         self.id = stableID ?? Self.fallbackID(coords: coords, isWorkout: isWorkout)
         self.contentFingerprint = Self.fingerprint(coords: coords, freq: freq,
                                                    isWorkout: isWorkout)

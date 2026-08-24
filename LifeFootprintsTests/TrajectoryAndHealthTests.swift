@@ -1,5 +1,6 @@
 import XCTest
 import SwiftData
+import MapKit
 @testable import LifeFootprints
 
 final class TrajectoryAndHealthTests: XCTestCase {
@@ -64,7 +65,8 @@ final class TrajectoryAndHealthTests: XCTestCase {
 
     func testProfessionalLineUsesOneOverlayAndPreservesThreeStrokeParameters() {
         let historical = ProfessionalLineStyle.make(alpha: 0.8, width: 2.6, tag: 0)
-        XCTAssertEqual(MapOverlayAmplificationPolicy.polylineCount(forLogicalRouteCount: 900), 900)
+        XCTAssertEqual(MapOverlayAmplificationPolicy.overlayCount(forLogicalRouteCount: 900), 900)
+        XCTAssertEqual(MapOverlayAmplificationPolicy.polylineCount(forLogicalRouteCount: 900), 0)
         XCTAssertEqual(historical.casing.alpha, 0.34, accuracy: 0.0001)
         XCTAssertEqual(historical.casing.width, 5.0, accuracy: 0.0001)
         XCTAssertEqual(historical.casing.tone, .casing)
@@ -123,6 +125,52 @@ final class TrajectoryAndHealthTests: XCTestCase {
             MapPresentationBatchPolicy.nextBatchSize(previous: 64, elapsedMilliseconds: 20), 64)
         XCTAssertEqual(
             MapPresentationBatchPolicy.nextBatchSize(previous: 8, elapsedMilliseconds: 100), 8)
+    }
+
+    func testZoomAwareGeometryPreservesEndpointsAndErrorBound() {
+        let raw = (0..<1_000).map { index in
+            MKMapPoint(x: Double(index) * 1_000,
+                       y: sin(Double(index) / 35) * 8_000 + Double(index) * 12)
+        }
+        let tolerance = 256.0
+        let simplified = ZoomAwareRouteGeometry.simplify(raw, tolerance: tolerance)
+
+        XCTAssertLessThan(simplified.count, raw.count)
+        XCTAssertEqual(simplified.first?.x, raw.first?.x)
+        XCTAssertEqual(simplified.first?.y, raw.first?.y)
+        XCTAssertEqual(simplified.last?.x, raw.last?.x)
+        XCTAssertEqual(simplified.last?.y, raw.last?.y)
+        XCTAssertLessThanOrEqual(
+            ZoomAwareRouteGeometry.maximumDeviation(of: raw, from: simplified),
+            tolerance + 0.0001)
+    }
+
+    func testZoomAwareGeometryUsesRawCloseUpAndSubpointLODWhenFar() {
+        let coordinates = (0..<600).map { index in
+            CLLocationCoordinate2D(
+                latitude: 31.20 + Double(index) * 0.00001,
+                longitude: 121.40 + sin(Double(index) / 18) * 0.002)
+        }
+        let geometry = ZoomAwareRouteGeometry(coordinates: coordinates)
+        let close = geometry.level(for: MKZoomScale(1))
+        let farScale = MKZoomScale(0.000001)
+        let far = geometry.level(for: farScale)
+
+        XCTAssertEqual(close.maximumMapPointError, 0)
+        XCTAssertEqual(close.points.count, coordinates.count)
+        XCTAssertLessThan(far.points.count, close.points.count)
+        XCTAssertLessThanOrEqual(
+            far.maximumMapPointError * Double(farScale),
+            ZoomAwareRouteGeometry.maximumScreenPointError)
+        XCTAssertEqual(far.points.first?.x, close.points.first?.x)
+        XCTAssertEqual(far.points.first?.y, close.points.first?.y)
+        XCTAssertEqual(far.points.last?.x, close.points.last?.x)
+        XCTAssertEqual(far.points.last?.y, close.points.last?.y)
+        var previousCount = geometry.rawPoints.count
+        for level in geometry.levels {
+            XCTAssertLessThanOrEqual(level.points.count * 100, previousCount * 65)
+            previousCount = level.points.count
+        }
     }
 
     @MainActor

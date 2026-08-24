@@ -7,7 +7,7 @@ import Foundation
 final class PersistentTrajectoryCache: @unchecked Sendable {
     static let shared = PersistentTrajectoryCache(fileURL: defaultURL())
     static let schemaVersion = 1
-    static let geometryPresentationVersion = 1
+    static let geometryPresentationVersion = 2
 
     private let fileURL: URL
     private let lock = NSLock()

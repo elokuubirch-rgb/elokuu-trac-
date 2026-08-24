@@ -123,6 +123,17 @@
 
 诊断同时记录 `MapScreen.init=86`、但 `onAppear=1`、`loadSnapshots=1`、location task=1：这是 SwiftUI value-view 的轻量重新初始化，不是地图页销毁/重建，也没有再次 fetch、trajectory build 或 MapKit presentation rebuild。623,384 点真机 batch 最大耗时与切页第一帧：Not measured，待最终真机复测。
 
+### Commit 08 — add zoom-aware trajectory geometry
+
+- canonical/raw trajectory 保持不变；每个已经按业务规则切开的 `RouteLine` 独立生成 zoom-aware render geometry，不跨 trajectory / session / route / segment 合并或连线。
+- 使用 Douglas–Peucker 多级 geometry；每一级保留原始首尾点，并以 MapKit map-point 空间的最大垂距作为严格误差上限。
+- renderer 按实时 `zoomScale` 选择满足 `mapPointError × zoomScale ≤ 0.25 screen point` 的最粗层级；没有满足条件的层级自动使用 raw geometry，所以街区/近距为完整或更精细路径。
+- 一条逻辑路线仍只有一个 `ZoomAwareRouteOverlay`、一份 renderer 与原三次 casing/glow/core stroke；没有改变线宽、alpha、颜色、cap/join、overlay level、点击范围或照片锚点。
+- LOD 在后台 derived-layer 构建阶段生成，不进入主线程 overlay batch；只有相对上一个常驻层级点数至少降低 35% 的层级才保留，跳过层级只会回退到更精细 geometry，并将常驻 LOD 数组控制为几何级数。
+- 跨 world-wrap 的路线禁用简化并使用 raw geometry；persistent derived-cache geometry presentation version 从 1 升至 2，旧派生缓存安全失效，raw SwiftData 不受影响。
+
+阶段证据：Build Passed；Xcode unit 18/18 Passed（含端点保持、独立误差复算、近距 raw、远距减点、屏幕误差 ≤0.25pt、常驻层级收益阈值）；Core 139/139 Passed；同一 seeded dataset 的 fit / near / far UI 回归 1/1 Passed，逐图对比 Commit 07 与修改前基线，路线完整性、远处曲线轮廓、三层 stroke、照片数量及锚点无可感知变化；`git diff --check` Passed。623,384 点真机 raw/render point count、LOD build 与 draw 耗时：Not measured，待最终真机复测。
+
 ## 3. Before / After
 
 待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。

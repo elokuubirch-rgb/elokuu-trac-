@@ -808,7 +808,7 @@ final class FootprintDotsRenderer: MKOverlayRenderer {
     }
 }
 
-// MARK: - 专业路线 overlay（一条逻辑路线只创建一个 MKPolyline）
+// MARK: - 专业路线 overlay（一条逻辑路线只创建一个 overlay）
 
 struct MapLineStrokeStyle: Equatable {
     let alpha: CGFloat
@@ -845,7 +845,8 @@ struct ProfessionalLineStyle: Equatable {
 }
 
 enum MapOverlayAmplificationPolicy {
-    static func polylineCount(forLogicalRouteCount count: Int) -> Int { count }
+    static func overlayCount(forLogicalRouteCount count: Int) -> Int { count }
+    static func polylineCount(forLogicalRouteCount _: Int) -> Int { 0 }
 }
 
 struct MapRoutePresentationState: Equatable {
@@ -886,9 +887,143 @@ enum MapPresentationBatchPolicy {
     }
 }
 
+struct ZoomAwareRouteGeometry {
+    struct Level {
+        let maximumMapPointError: Double
+        let points: [MKMapPoint]
+    }
+
+    /// 误差按 screen point 约束；比 1px（@3x）更保守。
+    static let maximumScreenPointError = 0.25
+    static let mapPointTolerances: [Double] = [
+        16, 64, 256, 1_024, 4_096, 16_384, 65_536, 262_144
+    ]
+
+    let rawPoints: [MKMapPoint]
+    let levels: [Level]
+
+    init(coordinates: [CLLocationCoordinate2D]) {
+        let raw = coordinates.map(MKMapPoint.init)
+        rawPoints = raw
+        guard raw.count > 2, !Self.crossesWorldWrap(raw) else {
+            levels = []
+            return
+        }
+        var generated: [Level] = []
+        var lastStoredCount = raw.count
+        for tolerance in Self.mapPointTolerances {
+            let simplified = Self.simplify(raw, tolerance: tolerance)
+            // 只保留有实质收益的层级，避免 GPS 噪声使多个近似 raw 数组常驻内存。
+            // 跳过层级只会让 renderer 继续使用更精细 geometry，不会扩大误差。
+            guard simplified.count * 100 <= lastStoredCount * 65 else { continue }
+            generated.append(Level(maximumMapPointError: tolerance, points: simplified))
+            lastStoredCount = simplified.count
+        }
+        levels = generated
+    }
+
+    func level(for zoomScale: MKZoomScale) -> Level {
+        let scale = max(Double(zoomScale), Double.leastNonzeroMagnitude)
+        let allowedMapPointError = Self.maximumScreenPointError / scale
+        return levels.last(where: { $0.maximumMapPointError <= allowedMapPointError })
+            ?? Level(maximumMapPointError: 0, points: rawPoints)
+    }
+
+    static func simplify(_ points: [MKMapPoint], tolerance: Double) -> [MKMapPoint] {
+        guard points.count > 2, tolerance > 0 else { return points }
+        var retained = Array(repeating: false, count: points.count)
+        retained[0] = true
+        retained[points.count - 1] = true
+        var ranges: [(Int, Int)] = [(0, points.count - 1)]
+        let toleranceSquared = tolerance * tolerance
+
+        while let (start, end) = ranges.popLast() {
+            guard end > start + 1 else { continue }
+            var furthestIndex = -1
+            var furthestDistanceSquared = 0.0
+            for index in (start + 1)..<end {
+                let distance = squaredDistance(
+                    from: points[index], toSegmentFrom: points[start], to: points[end])
+                if distance > furthestDistanceSquared {
+                    furthestDistanceSquared = distance
+                    furthestIndex = index
+                }
+            }
+            if furthestIndex >= 0, furthestDistanceSquared > toleranceSquared {
+                retained[furthestIndex] = true
+                ranges.append((start, furthestIndex))
+                ranges.append((furthestIndex, end))
+            }
+        }
+        return points.enumerated().compactMap { retained[$0.offset] ? $0.element : nil }
+    }
+
+    static func maximumDeviation(of raw: [MKMapPoint], from simplified: [MKMapPoint]) -> Double {
+        guard simplified.count >= 2 else { return raw.isEmpty ? 0 : .infinity }
+        return raw.reduce(0) { maximum, point in
+            let nearest = zip(simplified, simplified.dropFirst()).reduce(Double.infinity) {
+                min($0, squaredDistance(from: point, toSegmentFrom: $1.0, to: $1.1))
+            }
+            return max(maximum, sqrt(nearest))
+        }
+    }
+
+    private static func squaredDistance(from point: MKMapPoint,
+                                        toSegmentFrom start: MKMapPoint,
+                                        to end: MKMapPoint) -> Double {
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let lengthSquared = dx * dx + dy * dy
+        guard lengthSquared > 0 else {
+            let px = point.x - start.x
+            let py = point.y - start.y
+            return px * px + py * py
+        }
+        let projection = min(1, max(0,
+            ((point.x - start.x) * dx + (point.y - start.y) * dy) / lengthSquared))
+        let px = point.x - (start.x + projection * dx)
+        let py = point.y - (start.y + projection * dy)
+        return px * px + py * py
+    }
+
+    private static func crossesWorldWrap(_ points: [MKMapPoint]) -> Bool {
+        let halfWorld = MKMapSize.world.width / 2
+        return zip(points, points.dropFirst()).contains { abs($0.x - $1.x) > halfWorld }
+    }
+}
+
+final class ZoomAwareRouteOverlay: NSObject, MKOverlay {
+    let geometry: ZoomAwareRouteGeometry
+    let coordinate: CLLocationCoordinate2D
+    let boundingMapRect: MKMapRect
+
+    init(geometry: ZoomAwareRouteGeometry) {
+        self.geometry = geometry
+        if let first = geometry.rawPoints.first {
+            var minX = first.x
+            var maxX = first.x
+            var minY = first.y
+            var maxY = first.y
+            for point in geometry.rawPoints.dropFirst() {
+                minX = min(minX, point.x)
+                maxX = max(maxX, point.x)
+                minY = min(minY, point.y)
+                maxY = max(maxY, point.y)
+            }
+            boundingMapRect = MKMapRect(
+                x: minX, y: minY, width: max(maxX - minX, 1), height: max(maxY - minY, 1))
+            coordinate = MKMapPoint(x: (minX + maxX) / 2, y: (minY + maxY) / 2).coordinate
+        } else {
+            boundingMapRect = .null
+            coordinate = CLLocationCoordinate2D(latitude: 0, longitude: 0)
+        }
+        super.init()
+    }
+}
+
 private struct DesiredRoutePresentation {
     let state: MapRoutePresentationState
-    let coordinates: [CLLocationCoordinate2D]
+    let geometry: ZoomAwareRouteGeometry
     let style: ProfessionalLineStyle
     let visible: Bool
 }
@@ -896,31 +1031,57 @@ private struct DesiredRoutePresentation {
 /// 一个 overlay / 一份 map-point geometry / 一个 renderer；按 MapKit zoomScale
 /// 把原始 point 线宽换算到绘图坐标，依次绘制 casing、glow、core。
 final class ProfessionalPolylineRenderer: MKOverlayPathRenderer {
-    private let polyline: MKPolyline
+    private let routeOverlay: ZoomAwareRouteOverlay
     private let style: ProfessionalLineStyle
     private let themeColor: UIColor
+    private var levelPaths: [Double: CGPath] = [:]
+    #if DEBUG
+    private var lastDiagnosticLevel: Double?
+    #endif
 
-    init(polyline: MKPolyline, style: ProfessionalLineStyle, themeColor: UIColor) {
-        self.polyline = polyline
+    init(routeOverlay: ZoomAwareRouteOverlay, style: ProfessionalLineStyle,
+         themeColor: UIColor) {
+        self.routeOverlay = routeOverlay
         self.style = style
         self.themeColor = themeColor
-        super.init(overlay: polyline)
+        super.init(overlay: routeOverlay)
     }
 
     override func createPath() {
-        guard polyline.pointCount >= 2 else { return }
-        let mapPoints = polyline.points()
+        path = path(for: .init(
+            maximumMapPointError: 0, points: routeOverlay.geometry.rawPoints))
+    }
+
+    private func path(for level: ZoomAwareRouteGeometry.Level) -> CGPath? {
+        if let cached = levelPaths[level.maximumMapPointError] { return cached }
+        let mapPoints = level.points
+        guard mapPoints.count >= 2 else { return nil }
         let routePath = CGMutablePath()
         routePath.move(to: point(for: mapPoints[0]))
-        for index in 1..<polyline.pointCount {
+        for index in 1..<mapPoints.count {
             routePath.addLine(to: point(for: mapPoints[index]))
         }
-        path = routePath
+        levelPaths[level.maximumMapPointError] = routePath
+        return routePath
     }
 
     override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale,
                        in context: CGContext) {
-        guard let routePath = path else { return }
+        let level = routeOverlay.geometry.level(for: zoomScale)
+        guard let routePath = path(for: level) else { return }
+        #if DEBUG
+        if lastDiagnosticLevel != level.maximumMapPointError {
+            lastDiagnosticLevel = level.maximumMapPointError
+            PerformanceDiagnostics.count(
+                "renderGeometry.rendererRawPointCount",
+                by: routeOverlay.geometry.rawPoints.count)
+            PerformanceDiagnostics.count(
+                "renderGeometry.rendererSelectedPointCount", by: level.points.count)
+            PerformanceDiagnostics.event(
+                "renderGeometry.levelSelected",
+                metadata: "tolerance=\(level.maximumMapPointError) raw=\(routeOverlay.geometry.rawPoints.count) selected=\(level.points.count)")
+        }
+        #endif
         for stroke in [style.casing, style.glow, style.core] {
             context.saveGState()
             // MKOverlayPathRenderer 的 path stroke 以中心线两侧展开；换算自原先
@@ -1261,7 +1422,7 @@ struct FootprintMapView: UIViewRepresentable {
                 state: MapRoutePresentationState(
                     id: route.id,
                     fingerprint: presentationFingerprint(route: route, style: style)),
-                coordinates: route.coords, style: style, visible: showLines))
+                geometry: route.renderGeometry, style: style, visible: showLines))
         }
         for route in workoutRoutes {
             let style = ProfessionalLineStyle.make(alpha: 1, width: 4.2, tag: 3)
@@ -1269,7 +1430,7 @@ struct FootprintMapView: UIViewRepresentable {
                 state: MapRoutePresentationState(
                     id: route.id,
                     fingerprint: presentationFingerprint(route: route, style: style)),
-                coordinates: route.coords, style: style, visible: showWorkouts))
+                geometry: route.renderGeometry, style: style, visible: showWorkouts))
         }
         return result
     }
@@ -1306,6 +1467,9 @@ struct FootprintMapView: UIViewRepresentable {
         PerformanceDiagnostics.count("MapPresentation.diff.changed", by: diff.changed.count)
         PerformanceDiagnostics.count("MapPresentation.diff.unchanged", by: diff.unchanged.count)
         PerformanceDiagnostics.count("MapPresentation.logicalRouteCount", by: desired.count)
+        PerformanceDiagnostics.count(
+            "MapPresentation.expectedOverlayCount",
+            by: MapOverlayAmplificationPolicy.overlayCount(forLogicalRouteCount: desired.count))
         PerformanceDiagnostics.count(
             "MapPresentation.expectedPolylineCount",
             by: MapOverlayAmplificationPolicy.polylineCount(forLogicalRouteCount: desired.count))
@@ -1344,11 +1508,10 @@ struct FootprintMapView: UIViewRepresentable {
                 let started = CACurrentMediaTime()
                 let end = min(offset + batchSize, stagedDesired.count)
                 let batch = Array(stagedDesired[offset..<end])
-                var overlays: [MKPolyline] = []
+                var overlays: [ZoomAwareRouteOverlay] = []
                 overlays.reserveCapacity(batch.count)
-                for item in batch where item.coordinates.count >= 2 {
-                    let overlay = MKPolyline(
-                        coordinates: item.coordinates, count: item.coordinates.count)
+                for item in batch where item.geometry.rawPoints.count >= 2 {
+                    let overlay = ZoomAwareRouteOverlay(geometry: item.geometry)
                     let identifier = ObjectIdentifier(overlay)
                     c.pendingRouteOverlayIDs.insert(identifier)
                     c.overlayStyles[identifier] = item.style
@@ -1362,7 +1525,7 @@ struct FootprintMapView: UIViewRepresentable {
                 if !overlays.isEmpty {
                     mapView.addOverlays(overlays, level: .aboveLabels)
                     #if DEBUG
-                    PerformanceDiagnostics.count("MapKit.polyline.create", by: overlays.count)
+                    PerformanceDiagnostics.count("MapKit.routeOverlay.create", by: overlays.count)
                     PerformanceDiagnostics.count("MapKit.overlays.add", by: overlays.count)
                     PerformanceDiagnostics.count("MapKit.overlayBatches")
                     c.diagnosticMutationCount += overlays.count
@@ -1444,20 +1607,21 @@ struct FootprintMapView: UIViewRepresentable {
         addProfessionalLine(track, alpha: 1, width: 4, tag: 1, to: mapView, context: c)
     }
 
-    /// 专业运动地图三次 stroke：视觉参数与顺序不变，但只创建一个 MKPolyline/overlay。
+    /// 专业运动地图三次 stroke：视觉参数与顺序不变，但只创建一个共享 geometry overlay。
     private func addProfessionalLine(_ coordinates: [CLLocationCoordinate2D], alpha: CGFloat,
                                      width: CGFloat, tag: Int, to mapView: MKMapView,
                                      context c: MapCoordinator) {
         guard coordinates.count >= 2 else { return }
-        let polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
+        let overlay = ZoomAwareRouteOverlay(
+            geometry: ZoomAwareRouteGeometry(coordinates: coordinates))
         #if DEBUG
-        PerformanceDiagnostics.count("MapKit.polyline.create")
+        PerformanceDiagnostics.count("MapKit.routeOverlay.create")
         PerformanceDiagnostics.count("MapKit.overlays.add")
         c.diagnosticMutationCount += 1
         #endif
-        c.overlayStyles[ObjectIdentifier(polyline)] = .make(
+        c.overlayStyles[ObjectIdentifier(overlay)] = .make(
             alpha: alpha, width: width, tag: tag)
-        mapView.addOverlay(polyline, level: .aboveLabels)
+        mapView.addOverlay(overlay, level: .aboveLabels)
     }
 
     /// 与 SwiftUI 版一致的频次样式
@@ -1489,7 +1653,7 @@ private final class ReviewPhotoHighlightAnnotation: NSObject, MKAnnotation {
 
 struct PresentedRoute {
     let state: MapRoutePresentationState
-    let overlay: MKPolyline
+    let overlay: ZoomAwareRouteOverlay
     let style: ProfessionalLineStyle
     var visible: Bool
 }
@@ -1611,11 +1775,11 @@ final class MapCoordinator: NSObject, MKMapViewDelegate {
         if let dots = overlay as? FootprintDotsOverlay {
             return FootprintDotsRenderer(overlay: dots, color: parent.themeColor)
         }
-        if overlay is MKPolyline {
+        if let routeOverlay = overlay as? ZoomAwareRouteOverlay {
             let style = overlayStyles[ObjectIdentifier(overlay)]
                 ?? .make(alpha: 0.6, width: 2, tag: 0)
             let renderer = ProfessionalPolylineRenderer(
-                polyline: overlay as! MKPolyline,
+                routeOverlay: routeOverlay,
                 style: style, themeColor: parent.themeColor)
             if pendingRouteOverlayIDs.contains(ObjectIdentifier(overlay)) {
                 renderer.alpha = 0
