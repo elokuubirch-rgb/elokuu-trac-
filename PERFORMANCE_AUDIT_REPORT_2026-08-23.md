@@ -1,7 +1,8 @@
 # LifeFootprints 菜单与地图性能审计报告
 
-日期：2026-08-23  
-审计基线：`5ea8e01`（`feat: complete trajectory and health sync audit`）  
+日期：2026-08-23
+
+审计基线：`5ea8e01`（`feat: complete trajectory and health sync audit`）
 范围：只增加 `DEBUG` 诊断、signpost 和审计测试；未修改产品功能、业务规则或 UI 视觉
 
 ## 1. 结论

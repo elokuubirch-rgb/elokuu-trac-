@@ -1,11 +1,23 @@
 import Foundation
 import SwiftData
 
+enum TrajectoryReadPagingPolicy {
+    static let batchSize = 20_000
+
+    static func batchCount(forRowCount rowCount: Int) -> Int {
+        guard rowCount > 0 else { return 0 }
+        return (rowCount + batchSize - 1) / batchSize
+    }
+
+    static func maximumMaterializedModels(forRowCount rowCount: Int) -> Int {
+        min(max(0, rowCount), batchSize)
+    }
+}
+
 /// SwiftData 只负责提供原始记录；轨迹会话、分段和质量全部由领域 Builder 生成。
 struct TrajectoryRepository {
     let container: ModelContainer
     let persistentCache: PersistentTrajectoryCache
-    private static let routePointBatchSize = 20_000
 
     init(container: ModelContainer,
          persistentCache: PersistentTrajectoryCache = .shared) {
@@ -111,12 +123,12 @@ struct TrajectoryRepository {
             pageContext.autosaveEnabled = false
             var descriptor = FetchDescriptor<WorkoutRoutePoint>(
                 sortBy: [SortDescriptor(\.timestamp)])
-            descriptor.fetchLimit = Self.routePointBatchSize
+            descriptor.fetchLimit = TrajectoryReadPagingPolicy.batchSize
             descriptor.fetchOffset = offset
             #if DEBUG
             let rows = try PerformanceDiagnostics.measure(
                 "SwiftData.workoutRoutePoint.fetch.batch",
-                metadata: "offset=\(offset) limit=\(Self.routePointBatchSize)") {
+                metadata: "offset=\(offset) limit=\(TrajectoryReadPagingPolicy.batchSize)") {
                     try pageContext.fetch(descriptor)
                 }
             #else
@@ -141,7 +153,7 @@ struct TrajectoryRepository {
             PerformanceDiagnostics.count("SwiftData.workoutRoutePoint.fetch.batchModelsMaterialized",
                                          by: rows.count)
             #endif
-            if rows.count < Self.routePointBatchSize { break }
+            if rows.count < TrajectoryReadPagingPolicy.batchSize { break }
         }
         #if DEBUG
         PerformanceDiagnostics.recordDuration(
@@ -162,7 +174,7 @@ struct TrajectoryRepository {
             let pageContext = ModelContext(container)
             var descriptor = FetchDescriptor<WorkoutRoutePoint>(
                 sortBy: [SortDescriptor(\.timestamp)])
-            descriptor.fetchLimit = Self.routePointBatchSize
+            descriptor.fetchLimit = TrajectoryReadPagingPolicy.batchSize
             descriptor.fetchOffset = offset
             let rows = try pageContext.fetch(descriptor)
             guard !rows.isEmpty else { break }
@@ -175,7 +187,7 @@ struct TrajectoryRepository {
                     segmentID: "\($0.routeID ?? "legacy:\($0.workoutID)"):\($0.segmentIndex ?? 0)")
             })
             offset += rows.count
-            if rows.count < Self.routePointBatchSize { break }
+            if rows.count < TrajectoryReadPagingPolicy.batchSize { break }
         }
         return result
     }
