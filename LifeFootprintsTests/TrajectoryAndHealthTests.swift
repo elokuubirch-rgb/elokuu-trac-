@@ -84,6 +84,47 @@ final class TrajectoryAndHealthTests: XCTestCase {
         XCTAssertEqual(workout.core.width, 4.2, accuracy: 0.0001)
     }
 
+    func testMapPresentationNoChangeProducesNoMutations() {
+        let current = [
+            MapRoutePresentationState(id: "a", fingerprint: 1),
+            MapRoutePresentationState(id: "b", fingerprint: 2)
+        ]
+        let diff = MapPresentationDiff.make(current: current, desired: current)
+
+        XCTAssertTrue(diff.added.isEmpty)
+        XCTAssertTrue(diff.removed.isEmpty)
+        XCTAssertTrue(diff.changed.isEmpty)
+        XCTAssertEqual(diff.unchanged, ["a", "b"])
+    }
+
+    func testMapPresentationDiffUpdatesOnlyChangedTrajectory() {
+        let current = [
+            MapRoutePresentationState(id: "stable", fingerprint: 11),
+            MapRoutePresentationState(id: "changed", fingerprint: 22),
+            MapRoutePresentationState(id: "removed", fingerprint: 33)
+        ]
+        let desired = [
+            MapRoutePresentationState(id: "stable", fingerprint: 11),
+            MapRoutePresentationState(id: "changed", fingerprint: 23),
+            MapRoutePresentationState(id: "added", fingerprint: 44)
+        ]
+        let diff = MapPresentationDiff.make(current: current, desired: desired)
+
+        XCTAssertEqual(diff.unchanged, ["stable"])
+        XCTAssertEqual(diff.changed, ["changed"])
+        XCTAssertEqual(diff.removed, ["removed"])
+        XCTAssertEqual(diff.added, ["added"])
+    }
+
+    func testMapPresentationBatchSizeAdaptsToMainThreadBudget() {
+        XCTAssertGreaterThan(
+            MapPresentationBatchPolicy.nextBatchSize(previous: 64, elapsedMilliseconds: 2), 64)
+        XCTAssertLessThan(
+            MapPresentationBatchPolicy.nextBatchSize(previous: 64, elapsedMilliseconds: 20), 64)
+        XCTAssertEqual(
+            MapPresentationBatchPolicy.nextBatchSize(previous: 8, elapsedMilliseconds: 100), 8)
+    }
+
     @MainActor
     func testRepositoryRestartUsesPersistentCacheWithoutRawFetch() throws {
         let configuration = ModelConfiguration(isStoredInMemoryOnly: true)

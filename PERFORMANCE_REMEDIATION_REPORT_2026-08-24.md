@@ -88,6 +88,41 @@
 
 阶段证据：Build Passed；Xcode unit 13/13 Passed（含 900 logical routes → 900 overlays 与三层原始 style 参数断言）；Core 139/139 Passed；同一 iPhone 17 Pro 模拟器、同一 seeded dataset 的 fit / near / far 三缩放级 UI 回归 1/1 Passed，并逐图核验路线完整性、线宽、casing、glow、core 与照片锚点无可感知变化；`git diff --check` Passed。
 
+### Commit 07 — make map presentation incremental and batched
+
+- `RouteLine` 改用跨更新稳定的 domain identity，geometry / frequency / latest-route style / theme 另存 presentation fingerprint；纯 diff 明确区分 added / removed / changed / unchanged。
+- content revision 未变化时不触碰 MapKit；同 ID、同 fingerprint 的路线保持原 overlay 与 renderer，不 remove、不重新 add。
+- 新 geometry 以自适应约 5ms 主线程预算分批创建和提交；首批从 8 条起，根据上一批耗时在 8...512 间调整，并在批次间 yield run loop。
+- 为遵守“路线不得逐条出现、不得暂时缺失、加载顺序不得改变”，新 overlay 在 staging 期间统一 alpha=0，旧 presentation 持续可见；所有 batch 完成后才在一个无动画主线程事务中替换 changed/removed、恢复 route → live track → dots 的既有顺序并一次性显现。
+- 新 revision 到达会取消未完成 staging 并仅清理隐藏的 pending overlay；已显示的旧 presentation 不受影响。
+
+阶段验证：
+
+| 项目 | 结果 |
+| --- | --- |
+| Build | Passed |
+| Xcode unit | 16/16 Passed（含 no-change 零变更 diff、单路线 changed diff、自适应 batch budget） |
+| Core logic | 139/139 Passed |
+| 地图视觉 UI | 1/1 Passed；fit / near / far 逐图核验无可感知变化 |
+| 20 次切换 UI | 1/1 Passed；Map↔Stats 20 轮、Map↔Settings 20 轮、Stats↔Settings 20 轮 |
+| `git diff --check` | Passed |
+
+20 次切换的 App 内部诊断（iPhone 17 Pro 模拟器；不把 XCTest 固定 idle 等待计入 App 性能）：
+
+| 指标 | 调用 | 累计主线程 | 最大单次 | 结论 |
+| --- | ---: | ---: | ---: | --- |
+| `FootprintMapView.updateUIView` | 90 | 3.006 ms | 0.835 ms | 正常 |
+| `MapKit.updateUIView.noMutation` | 89 | — | — | Tab 往返零 MapKit mutation |
+| `MapKit.updateUIView.withMutation` | 1 | — | — | 仅首屏 |
+| `MapKit.overlayBatch.mainThread` | 1 | 0.891 ms | 0.891 ms | seeded 首屏正常 |
+| `MapKit.overlays.add` | 6 | — | — | 首屏 5 route + 1 dots |
+| `MapKit.overlays.remove` | 0 | — | — | 无全量清空 |
+| `MapKit.fullRebuild.calls` | 0 | — | — | 已移除 full rebuild 路径 |
+| `MapScreen.onAppear / loadSnapshots / location task` | 各 1 | — | — | Tab 切换未重跑加载链 |
+| `TrailIndex.build / photoMatching` | 各 1 | 0 ms | 1.857 / 6.294 ms | 后台且未随 Tab 重建 |
+
+诊断同时记录 `MapScreen.init=86`、但 `onAppear=1`、`loadSnapshots=1`、location task=1：这是 SwiftUI value-view 的轻量重新初始化，不是地图页销毁/重建，也没有再次 fetch、trajectory build 或 MapKit presentation rebuild。623,384 点真机 batch 最大耗时与切页第一帧：Not measured，待最终真机复测。
+
 ## 3. Before / After
 
 待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。

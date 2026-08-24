@@ -848,6 +848,51 @@ enum MapOverlayAmplificationPolicy {
     static func polylineCount(forLogicalRouteCount count: Int) -> Int { count }
 }
 
+struct MapRoutePresentationState: Equatable {
+    let id: String
+    let fingerprint: UInt64
+}
+
+struct MapPresentationDiff: Equatable {
+    let added: [String]
+    let removed: [String]
+    let changed: [String]
+    let unchanged: [String]
+
+    static func make(current: [MapRoutePresentationState],
+                     desired: [MapRoutePresentationState]) -> Self {
+        let currentByID = Dictionary(uniqueKeysWithValues: current.map { ($0.id, $0.fingerprint) })
+        let desiredByID = Dictionary(uniqueKeysWithValues: desired.map { ($0.id, $0.fingerprint) })
+        return Self(
+            added: desired.compactMap { currentByID[$0.id] == nil ? $0.id : nil },
+            removed: current.compactMap { desiredByID[$0.id] == nil ? $0.id : nil },
+            changed: desired.compactMap {
+                guard let old = currentByID[$0.id], old != $0.fingerprint else { return nil }
+                return $0.id
+            },
+            unchanged: desired.compactMap {
+                currentByID[$0.id] == $0.fingerprint ? $0.id : nil
+            })
+    }
+}
+
+enum MapPresentationBatchPolicy {
+    static let targetMainThreadMilliseconds = 5.0
+
+    static func nextBatchSize(previous: Int, elapsedMilliseconds: Double) -> Int {
+        guard elapsedMilliseconds > 0 else { return min(previous * 2, 512) }
+        let ratio = targetMainThreadMilliseconds / elapsedMilliseconds
+        return min(512, max(8, Int((Double(previous) * ratio).rounded())))
+    }
+}
+
+private struct DesiredRoutePresentation {
+    let state: MapRoutePresentationState
+    let coordinates: [CLLocationCoordinate2D]
+    let style: ProfessionalLineStyle
+    let visible: Bool
+}
+
 /// 一个 overlay / 一份 map-point geometry / 一个 renderer；按 MapKit zoomScale
 /// 把原始 point 线宽换算到绘图坐标，依次绘制 casing、glow、core。
 final class ProfessionalPolylineRenderer: MKOverlayPathRenderer {
@@ -1020,16 +1065,23 @@ struct FootprintMapView: UIViewRepresentable {
             }
         }
 
-        // 2) 数据内容（月份/重载 → 重建线层；点/照片走画布）
+        // 2) 数据内容：按稳定 route id + presentation fingerprint 增量提交。
+        // 新 geometry 分批、隐藏预装；最后一个 batch 后同一主线程事务显现，
+        // 因而不会逐条出现，也不会在准备期间清空旧地图内容。
         if contentToken != c.lastContentToken {
             c.lastContentToken = contentToken
             c.lastShowDots = showDots
             c.lastShowLines = showLines
             c.lastShowWorkouts = showWorkouts
             c.lastShowPhotos = showPhotos
-            rebuildAll(mapView, context: c)
-            replaceDotsOverlay(on: mapView, context: c)
-            replacePhotoAnnotations(on: mapView, context: c, full: true)
+            c.lastTrackCount = track.count
+            let expectedToken = contentToken
+            reconcileRoutePresentation(on: mapView, context: c) { [weak mapView, weak c] in
+                guard let mapView, let c, c.lastContentToken == expectedToken else { return }
+                replaceTrackLines(mapView, context: c)
+                replaceDotsOverlay(on: mapView, context: c)
+                replacePhotoAnnotations(on: mapView, context: c, full: true)
+            }
         } else {
             if showDots != c.lastShowDots {
                 c.lastShowDots = showDots
@@ -1117,48 +1169,8 @@ struct FootprintMapView: UIViewRepresentable {
         // 3) 实时轨迹（每次定位更新增量重建）
         if track.count != c.lastTrackCount {
             c.lastTrackCount = track.count
-            let removed = mapView.overlays.filter { c.tag(of: $0) == 1 || c.tag(of: $0) == 2 }
-            #if DEBUG
-            PerformanceDiagnostics.count("MapKit.overlays.remove", by: removed.count)
-            c.diagnosticMutationCount += removed.count
-            #endif
-            mapView.removeOverlays(removed)
-            addTrackLines(mapView, context: c)
+            replaceTrackLines(mapView, context: c)
         }
-    }
-
-    /// 全量重建：线层 + 实时轨迹（点/照片走画布；数据版本/月份变化时）
-    private func rebuildAll(_ mapView: MKMapView, context c: MapCoordinator) {
-        #if DEBUG
-        let rebuildStarted = CACurrentMediaTime()
-        defer {
-            PerformanceDiagnostics.recordDuration(
-                "MapKit.fullRebuild.mainThread",
-                milliseconds: (CACurrentMediaTime() - rebuildStarted) * 1_000,
-                mainThread: true)
-        }
-        PerformanceDiagnostics.count("MapPresentation.logicalRouteCount",
-                                     by: routes.count + workoutRoutes.count)
-        PerformanceDiagnostics.count("MapPresentation.expectedPolylineCount",
-                                     by: MapOverlayAmplificationPolicy.polylineCount(
-                                        forLogicalRouteCount: routes.count + workoutRoutes.count))
-        #endif
-        // 等高线瓦片是底图，数据重建时不应被清理。
-        let removed = mapView.overlays.filter { !($0 is MKTileOverlay) }
-        #if DEBUG
-        PerformanceDiagnostics.count("MapKit.fullRebuild.calls")
-        PerformanceDiagnostics.count("MapKit.overlays.remove", by: removed.count)
-        c.diagnosticMutationCount += removed.count
-        #endif
-        mapView.removeOverlays(removed)
-        c.dotsOverlay = nil
-        c.overlayStyles.removeAll()
-        rebuildLinesOnly(mapView, context: c)
-        addTrackLines(mapView, context: c)
-        #if DEBUG
-        MapDebugLog.log("rebuild 全量 frame=\(mapView.bounds.size) 线=\(showLines ? "开" : "关") 线\(routes.count) 点\(dots.count) 标记\(markers.count)")
-        #endif
-        appLog.info("[Map] 全量重建：足迹线=\(showLines ? routes.count : 0) 运动线=\(showWorkouts ? workoutRoutes.count : 0) 标注=\(markers.count)")
     }
 
     private func replaceDotsOverlay(on mapView: MKMapView, context c: MapCoordinator) {
@@ -1235,30 +1247,175 @@ struct FootprintMapView: UIViewRepresentable {
         c.updatePhotoMarkerSizes(on: mapView)
     }
 
-    /// 仅历史轨迹线层（tag=0）
-    private func rebuildLinesOnly(_ mapView: MKMapView, context c: MapCoordinator) {
-        let olds = mapView.overlays.filter { c.tag(of: $0) == 0 }
-        for o in olds { c.overlayStyles.removeValue(forKey: ObjectIdentifier(o)) }
-        #if DEBUG
-        PerformanceDiagnostics.count("MapKit.overlays.remove", by: olds.count)
-        c.diagnosticMutationCount += olds.count
-        #endif
-        mapView.removeOverlays(olds)
+    private func desiredRoutePresentations() -> [DesiredRoutePresentation] {
+        var result: [DesiredRoutePresentation] = []
+        result.reserveCapacity(routes.count + workoutRoutes.count)
         let last = routes.count - 1
         for (i, route) in routes.enumerated() {
             // 最近轨迹（时间最新）高亮：透明度/线宽提升一档，体现时间流动
             let isLatest = (i == last) && routes.count > 1
             let alpha = min(lineOpacity(route.freq) + (isLatest ? 0.35 : 0), 1.0)
             let width = lineWidth(route.freq) + (isLatest ? 1.6 : 0)
-            addProfessionalLine(route.coords, alpha: alpha, width: width, tag: 0,
-                                to: mapView, context: c)
+            let style = ProfessionalLineStyle.make(alpha: alpha, width: width, tag: 0)
+            result.append(DesiredRoutePresentation(
+                state: MapRoutePresentationState(
+                    id: route.id,
+                    fingerprint: presentationFingerprint(route: route, style: style)),
+                coordinates: route.coords, style: style, visible: showLines))
         }
         for route in workoutRoutes {
-            addProfessionalLine(route.coords, alpha: 1, width: 4.2, tag: 3,
-                                to: mapView, context: c)
+            let style = ProfessionalLineStyle.make(alpha: 1, width: 4.2, tag: 3)
+            result.append(DesiredRoutePresentation(
+                state: MapRoutePresentationState(
+                    id: route.id,
+                    fingerprint: presentationFingerprint(route: route, style: style)),
+                coordinates: route.coords, style: style, visible: showWorkouts))
         }
-        setHistoricalLinesVisible(showLines, on: mapView, context: c)
-        setWorkoutLinesVisible(showWorkouts, on: mapView, context: c)
+        return result
+    }
+
+    private func presentationFingerprint(route: RouteLine,
+                                         style: ProfessionalLineStyle) -> UInt64 {
+        var value = route.contentFingerprint
+        func mix(_ component: UInt64) {
+            value ^= component
+            value &*= 1_099_511_628_211
+        }
+        for stroke in [style.casing, style.glow, style.core] {
+            mix(Double(stroke.alpha).bitPattern)
+            mix(Double(stroke.width).bitPattern)
+        }
+        // Renderer 持有创建时的主题色；主题变化必须只替换对应 route presentation。
+        mix(UInt64(bitPattern: Int64(themeColor.hash)))
+        return value
+    }
+
+    private func reconcileRoutePresentation(
+        on mapView: MKMapView,
+        context c: MapCoordinator,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        let desired = desiredRoutePresentations()
+        let currentStates = c.routeOrder.compactMap { c.routePresentations[$0]?.state }
+        let diff = MapPresentationDiff.make(
+            current: currentStates, desired: desired.map(\.state))
+        #if DEBUG
+        PerformanceDiagnostics.count("MapPresentation.diff.calls")
+        PerformanceDiagnostics.count("MapPresentation.diff.added", by: diff.added.count)
+        PerformanceDiagnostics.count("MapPresentation.diff.removed", by: diff.removed.count)
+        PerformanceDiagnostics.count("MapPresentation.diff.changed", by: diff.changed.count)
+        PerformanceDiagnostics.count("MapPresentation.diff.unchanged", by: diff.unchanged.count)
+        PerformanceDiagnostics.count("MapPresentation.logicalRouteCount", by: desired.count)
+        PerformanceDiagnostics.count(
+            "MapPresentation.expectedPolylineCount",
+            by: MapOverlayAmplificationPolicy.polylineCount(forLogicalRouteCount: desired.count))
+        #endif
+
+        let changedIDs = Set(diff.changed)
+        let removedIDs = Set(diff.removed)
+        let stagedDesired = desired.filter {
+            c.routePresentations[$0.state.id] == nil || changedIDs.contains($0.state.id)
+        }
+
+        c.cancelPendingRoutePresentation(on: mapView)
+        guard !stagedDesired.isEmpty || !removedIDs.isEmpty else {
+            for item in desired {
+                guard var existing = c.routePresentations[item.state.id] else { continue }
+                existing.visible = item.visible
+                c.routePresentations[item.state.id] = existing
+                mapView.renderer(for: existing.overlay)?.alpha = item.visible ? 1 : 0
+            }
+            c.routeOrder = desired.map(\.state.id)
+            completion()
+            return
+        }
+
+        c.routePresentationGeneration += 1
+        let generation = c.routePresentationGeneration
+        c.routePresentationTask = Task { @MainActor [weak mapView, weak c] in
+            guard let mapView, let c else { return }
+            var staged: [String: PresentedRoute] = [:]
+            staged.reserveCapacity(stagedDesired.count)
+            var offset = 0
+            var batchSize = min(8, max(1, stagedDesired.count))
+
+            while offset < stagedDesired.count {
+                guard !Task.isCancelled, c.routePresentationGeneration == generation else { return }
+                let started = CACurrentMediaTime()
+                let end = min(offset + batchSize, stagedDesired.count)
+                let batch = Array(stagedDesired[offset..<end])
+                var overlays: [MKPolyline] = []
+                overlays.reserveCapacity(batch.count)
+                for item in batch where item.coordinates.count >= 2 {
+                    let overlay = MKPolyline(
+                        coordinates: item.coordinates, count: item.coordinates.count)
+                    let identifier = ObjectIdentifier(overlay)
+                    c.pendingRouteOverlayIDs.insert(identifier)
+                    c.overlayStyles[identifier] = item.style
+                    let presented = PresentedRoute(
+                        state: item.state, overlay: overlay,
+                        style: item.style, visible: item.visible)
+                    staged[item.state.id] = presented
+                    c.pendingRoutePresentations[item.state.id] = presented
+                    overlays.append(overlay)
+                }
+                if !overlays.isEmpty {
+                    mapView.addOverlays(overlays, level: .aboveLabels)
+                    #if DEBUG
+                    PerformanceDiagnostics.count("MapKit.polyline.create", by: overlays.count)
+                    PerformanceDiagnostics.count("MapKit.overlays.add", by: overlays.count)
+                    PerformanceDiagnostics.count("MapKit.overlayBatches")
+                    c.diagnosticMutationCount += overlays.count
+                    #endif
+                }
+                let elapsed = (CACurrentMediaTime() - started) * 1_000
+                #if DEBUG
+                PerformanceDiagnostics.recordDuration(
+                    "MapKit.overlayBatch.mainThread", milliseconds: elapsed, mainThread: true)
+                #endif
+                offset = end
+                batchSize = MapPresentationBatchPolicy.nextBatchSize(
+                    previous: batchSize, elapsedMilliseconds: elapsed)
+                if offset < stagedDesired.count { await Task.yield() }
+            }
+
+            guard !Task.isCancelled, c.routePresentationGeneration == generation else { return }
+            let obsolete = (removedIDs.union(changedIDs)).compactMap {
+                c.routePresentations[$0]?.overlay
+            }
+            UIView.performWithoutAnimation {
+                if !obsolete.isEmpty { mapView.removeOverlays(obsolete) }
+                for overlay in obsolete {
+                    c.overlayStyles.removeValue(forKey: ObjectIdentifier(overlay))
+                }
+
+                var next: [String: PresentedRoute] = [:]
+                next.reserveCapacity(desired.count)
+                for item in desired {
+                    if let replacement = staged[item.state.id] {
+                        next[item.state.id] = replacement
+                    } else if var existing = c.routePresentations[item.state.id] {
+                        existing.visible = item.visible
+                        next[item.state.id] = existing
+                    }
+                }
+                c.routePresentations = next
+                c.routeOrder = desired.map(\.state.id)
+                c.reorderDataOverlays(on: mapView)
+                for route in next.values {
+                    c.pendingRouteOverlayIDs.remove(ObjectIdentifier(route.overlay))
+                    mapView.renderer(for: route.overlay)?.alpha = route.visible ? 1 : 0
+                }
+                c.pendingRoutePresentations.removeAll()
+            }
+            #if DEBUG
+            PerformanceDiagnostics.count("MapKit.overlays.remove", by: obsolete.count)
+            c.diagnosticMutationCount += obsolete.count
+            #endif
+            c.routePresentationTask = nil
+            completion()
+            appLog.info("[Map] 增量提交：新增=\(diff.added.count) 变更=\(diff.changed.count) 删除=\(diff.removed.count) 保留=\(diff.unchanged.count)")
+        }
     }
 
     private func setWorkoutLinesVisible(_ visible: Bool, on mapView: MKMapView,
@@ -1275,7 +1432,14 @@ struct FootprintMapView: UIViewRepresentable {
         }
     }
 
-    private func addTrackLines(_ mapView: MKMapView, context c: MapCoordinator) {
+    private func replaceTrackLines(_ mapView: MKMapView, context c: MapCoordinator) {
+        let removed = mapView.overlays.filter { c.tag(of: $0) == 1 || c.tag(of: $0) == 2 }
+        for overlay in removed { c.overlayStyles.removeValue(forKey: ObjectIdentifier(overlay)) }
+        #if DEBUG
+        PerformanceDiagnostics.count("MapKit.overlays.remove", by: removed.count)
+        c.diagnosticMutationCount += removed.count
+        #endif
+        if !removed.isEmpty { mapView.removeOverlays(removed) }
         guard track.count >= 2 else { return }
         addProfessionalLine(track, alpha: 1, width: 4, tag: 1, to: mapView, context: c)
     }
@@ -1323,6 +1487,13 @@ private final class ReviewPhotoHighlightAnnotation: NSObject, MKAnnotation {
     init(coordinate: CLLocationCoordinate2D) { self.coordinate = coordinate }
 }
 
+struct PresentedRoute {
+    let state: MapRoutePresentationState
+    let overlay: MKPolyline
+    let style: ProfessionalLineStyle
+    var visible: Bool
+}
+
 final class MapCoordinator: NSObject, MKMapViewDelegate {
     var parent: FootprintMapView
     var lastContentToken = -1
@@ -1335,6 +1506,12 @@ final class MapCoordinator: NSObject, MKMapViewDelegate {
     var lastCamera: MapCameraCommand = .none
     var lastRegionTime = Date.distantPast
     var overlayStyles: [ObjectIdentifier: ProfessionalLineStyle] = [:]
+    var routePresentations: [String: PresentedRoute] = [:]
+    var routeOrder: [String] = []
+    var pendingRoutePresentations: [String: PresentedRoute] = [:]
+    var pendingRouteOverlayIDs: Set<ObjectIdentifier> = []
+    var routePresentationGeneration = 0
+    var routePresentationTask: Task<Void, Never>?
     /// 标记画布（点 + 照片聚合）
     var canvas: MarkerCanvasView?
     /// 原生足迹点覆盖层，与 MapKit 底图共用变换。
@@ -1352,6 +1529,46 @@ final class MapCoordinator: NSObject, MKMapViewDelegate {
     init(_ parent: FootprintMapView) { self.parent = parent }
 
     func tag(of overlay: MKOverlay) -> Int { overlayStyles[ObjectIdentifier(overlay)]?.tag ?? -1 }
+
+    func cancelPendingRoutePresentation(on mapView: MKMapView) {
+        routePresentationTask?.cancel()
+        routePresentationTask = nil
+        routePresentationGeneration += 1
+        let overlays = pendingRoutePresentations.values.map(\.overlay)
+        if !overlays.isEmpty {
+            mapView.removeOverlays(overlays)
+            #if DEBUG
+            PerformanceDiagnostics.count("MapKit.overlays.remove", by: overlays.count)
+            diagnosticMutationCount += overlays.count
+            #endif
+        }
+        for overlay in overlays {
+            let identifier = ObjectIdentifier(overlay)
+            overlayStyles.removeValue(forKey: identifier)
+            pendingRouteOverlayIDs.remove(identifier)
+        }
+        pendingRoutePresentations.removeAll()
+    }
+
+    /// 只交换现存 data overlay 的槽位，使 route → live track → dots 的历史绘制顺序不变。
+    func reorderDataOverlays(on mapView: MKMapView) {
+        let orderedRoutes = routeOrder.compactMap { routePresentations[$0]?.overlay as MKOverlay? }
+        let tracks = mapView.overlays.filter { tag(of: $0) == 1 || tag(of: $0) == 2 }
+        let dots = dotsOverlay.map { [$0 as MKOverlay] } ?? []
+        let desired = orderedRoutes + tracks + dots
+        let desiredIDs = Set(desired.map { ObjectIdentifier($0) })
+        var actual = mapView.overlays
+        let slots = actual.indices.filter { desiredIDs.contains(ObjectIdentifier(actual[$0])) }
+        guard slots.count == desired.count else { return }
+        for (desiredOffset, targetIndex) in slots.enumerated() {
+            let wanted = ObjectIdentifier(desired[desiredOffset])
+            guard ObjectIdentifier(actual[targetIndex]) != wanted,
+                  let currentIndex = actual.firstIndex(where: { ObjectIdentifier($0) == wanted })
+            else { continue }
+            mapView.exchangeOverlay(at: currentIndex, withOverlayAt: targetIndex)
+            actual.swapAt(currentIndex, targetIndex)
+        }
+    }
 
     func updateReviewHighlight(on mapView: MKMapView, coordinate: CLLocationCoordinate2D?) {
         guard let coordinate else {
@@ -1397,9 +1614,17 @@ final class MapCoordinator: NSObject, MKMapViewDelegate {
         if overlay is MKPolyline {
             let style = overlayStyles[ObjectIdentifier(overlay)]
                 ?? .make(alpha: 0.6, width: 2, tag: 0)
-            return ProfessionalPolylineRenderer(
+            let renderer = ProfessionalPolylineRenderer(
                 polyline: overlay as! MKPolyline,
                 style: style, themeColor: parent.themeColor)
+            if pendingRouteOverlayIDs.contains(ObjectIdentifier(overlay)) {
+                renderer.alpha = 0
+            } else if style.tag == 0 {
+                renderer.alpha = parent.showLines ? 1 : 0
+            } else if style.tag == 3 {
+                renderer.alpha = parent.showWorkouts ? 1 : 0
+            }
+            return renderer
         }
         return MKOverlayRenderer(overlay: overlay)
     }

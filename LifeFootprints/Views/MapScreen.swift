@@ -5,10 +5,46 @@ import UIKit
 
 /// 一条足迹折线（按频次着色）
 struct RouteLine: Identifiable {
-    let id = UUID()
+    /// 跨 SwiftUI / MapKit 更新保持稳定；内容变化由 `contentFingerprint` 单独判断。
+    let id: String
     let coords: [CLLocationCoordinate2D]
     let freq: Int
     let isWorkout: Bool
+
+    let contentFingerprint: UInt64
+
+    init(coords: [CLLocationCoordinate2D], freq: Int, isWorkout: Bool,
+         stableID: String? = nil) {
+        self.coords = coords
+        self.freq = freq
+        self.isWorkout = isWorkout
+        self.id = stableID ?? Self.fallbackID(coords: coords, isWorkout: isWorkout)
+        self.contentFingerprint = Self.fingerprint(coords: coords, freq: freq,
+                                                   isWorkout: isWorkout)
+    }
+
+    private static func fallbackID(coords: [CLLocationCoordinate2D],
+                                   isWorkout: Bool) -> String {
+        guard let first = coords.first else { return "\(isWorkout ? "workout" : "auto"):empty" }
+        return "\(isWorkout ? "workout" : "auto"):\(first.latitude.bitPattern):\(first.longitude.bitPattern)"
+    }
+
+    private static func fingerprint(coords: [CLLocationCoordinate2D], freq: Int,
+                                    isWorkout: Bool) -> UInt64 {
+        var value: UInt64 = 14_695_981_039_346_656_037
+        func mix(_ component: UInt64) {
+            value ^= component
+            value &*= 1_099_511_628_211
+        }
+        mix(UInt64(freq))
+        mix(isWorkout ? 1 : 0)
+        mix(UInt64(coords.count))
+        for coordinate in coords {
+            mix(coordinate.latitude.bitPattern)
+            mix(coordinate.longitude.bitPattern)
+        }
+        return value
+    }
 }
 
 /// 点模式下的足迹点（带频次：密度=去得多频繁）
@@ -312,7 +348,7 @@ struct MapScreen: View {
     nonisolated private static func makeRoutes(from vis: [FootprintSnapshot], workout: Bool) -> [RouteLine] {
         let buckets = freqBuckets(of: vis)
         var lines: [RouteLine] = []
-        var current: [(coords: CLLocationCoordinate2D, freq: Int)] = []
+        var current: [(snapshot: FootprintSnapshot, coords: CLLocationCoordinate2D, freq: Int)] = []
         var prev: FootprintSnapshot?
 
         func flush() {
@@ -322,7 +358,13 @@ struct MapScreen: View {
                 return
             }
             let avg = current.map { $0.freq }.reduce(0, +) / current.count
-            lines.append(RouteLine(coords: current.map { $0.coords }, freq: avg, isWorkout: workout))
+            let first = current[0].snapshot
+            let identity = first.segmentID ?? first.trajectoryID ?? first.sessionID
+                ?? first.originalPointID
+                ?? "\(Int64((first.t.timeIntervalSince1970 * 1_000).rounded()))"
+            let stableID = "\(workout ? "workout" : "auto"):\(identity):\(Int64((first.t.timeIntervalSince1970 * 1_000).rounded()))"
+            lines.append(RouteLine(coords: current.map { $0.coords }, freq: avg,
+                                   isWorkout: workout, stableID: stableID))
             current = []
         }
 
@@ -337,7 +379,7 @@ struct MapScreen: View {
                     flush()
                 }
             }
-            current.append((CLLocationCoordinate2D(latitude: s.lat, longitude: s.lon),
+            current.append((s, CLLocationCoordinate2D(latitude: s.lat, longitude: s.lon),
                             freq(of: s, buckets: buckets)))
             prev = s
         }
