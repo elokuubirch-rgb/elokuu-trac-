@@ -49,6 +49,63 @@ final class TrajectoryAndHealthTests: XCTestCase {
         XCTAssertNil(TrajectoryResolutionCache.shared.value)
     }
 
+    func testPersistentTrajectoryCacheRequiresExactRevisionAndRoundTrips() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PersistentTrajectoryCacheTests.\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = PersistentTrajectoryCache(
+            fileURL: directory.appendingPathComponent("resolution.plist"))
+        let resolution = sampleResolution()
+
+        XCTAssertTrue(cache.save(resolution, dataRevision: 41))
+        XCTAssertEqual(cache.load(dataRevision: 41), resolution)
+        XCTAssertNil(cache.load(dataRevision: 42))
+    }
+
+    @MainActor
+    func testRepositoryRestartUsesPersistentCacheWithoutRawFetch() throws {
+        let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+        let container = try ModelContainer(
+            for: FootprintPoint.self, WorkoutRecord.self,
+            WorkoutRouteRecord.self, WorkoutRoutePoint.self,
+            configurations: configuration)
+        let context = ModelContext(container)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let workoutID = "persistent-workout"
+        context.insert(WorkoutRecord(
+            healthKitUUID: workoutID, workoutType: "walking",
+            startDate: base, endDate: base.addingTimeInterval(60),
+            duration: 60, distanceMeters: 100, caloriesKCal: 10,
+            elevationGain: 0, routeAvailable: true, routeSyncState: .available))
+        for index in 0..<3 {
+            context.insert(WorkoutRoutePoint(
+                workoutID: workoutID, latitude: 31 + Double(index) * 0.0001,
+                longitude: 121, altitude: 10,
+                timestamp: base.addingTimeInterval(Double(index) * 30),
+                routeID: "route", segmentIndex: 0, pointIndex: index,
+                horizontalAccuracy: 5))
+        }
+        try context.save()
+
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PersistentTrajectoryRestartTests.\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = PersistentTrajectoryCache(
+            fileURL: directory.appendingPathComponent("resolution.plist"))
+        let repository = TrajectoryRepository(container: container, persistentCache: cache)
+        let first = try repository.loadResolved()
+        XCTAssertEqual(first.points.count, 3)
+
+        TrajectoryResolutionCache.shared.invalidate()
+        for point in try context.fetch(FetchDescriptor<WorkoutRoutePoint>()) {
+            context.delete(point)
+        }
+        try context.save() // test-only：不 bump revision，用来证明 restart hit 不读取 raw。
+
+        let restarted = TrajectoryRepository(container: container, persistentCache: cache)
+        XCTAssertEqual(try restarted.loadResolved(), first)
+    }
+
     func testTemporalPruningPerformanceForDisjointHistory() {
         let base = Date(timeIntervalSince1970: 1_700_000_000)
         let samples = (0..<1_000).flatMap { trajectoryIndex in
@@ -188,6 +245,20 @@ final class TrajectoryAndHealthTests: XCTestCase {
             accumulator.append(value, globalIndex: index)
         }
         XCTAssertEqual(accumulator.finish(), expected)
+    }
+
+    private func sampleResolution() -> TrajectoryResolution {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let samples = (0..<3).map { index in
+            TrajectorySample(
+                id: "cache-p\(index)", source: .healthWorkout,
+                sourceIdentifier: "cache", sessionID: "cache", routeID: "route",
+                activityType: "walking",
+                latitude: 31 + Double(index) * 0.0001, longitude: 121,
+                timestamp: base.addingTimeInterval(Double(index) * 30),
+                horizontalAccuracy: 5)
+        }
+        return TrajectoryConflictResolver.resolve(TrajectoryBuilder.build(samples: samples))
     }
 
     @MainActor

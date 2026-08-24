@@ -71,6 +71,15 @@
 
 阶段证据：Build Passed；Xcode unit 10/10 Passed，其中 streaming accumulator 与旧 builder 等价测试 Passed，20,005 点跨页 repository 测试 Passed（1 条 trajectory、1 segment、20,005 点完整且末点 index=20,004）；Core 139/139 Passed；地图三缩放级 UI 回归 1/1 Passed；`git diff --check` Passed。623,384 点真机 after 数据：Not measured，待最终真机复测。
 
+### Commit 05 — add revisioned persistent trajectory cache
+
+- 新增可删除、可重建的 binary plist 派生缓存；schema、geometry presentation version 与持久 trajectory revision 必须完全一致才允许命中。
+- 缓存包含 trajectory/session/segment/source/start/end、canonical geometry、quality/confidence、conflicts、suppression 与 resolver compared-pair metadata；raw SwiftData 仍是唯一事实来源。
+- canonical point 只序列化一次，trajectory segment 与 resolved point 通过下标引用，避免缓存文件重复存储 623k 点几何。
+- 同 revision 冷启动 persistent hit 直接恢复完整 `TrajectoryResolution`，跳过 SwiftData raw fetch、TrajectoryBuilder 与 ConflictResolver；构建期间 revision 改变则不写入陈旧缓存。
+
+阶段证据：Build Passed；Xcode unit 12/12 Passed（含 exact-revision round-trip、revision mismatch miss、模拟重启后删除 raw 仍命中缓存）；Core 139/139 Passed；地图三缩放级 UI 回归 1/1 Passed；`git diff --check` Passed。
+
 ## 3. Before / After
 
 待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。

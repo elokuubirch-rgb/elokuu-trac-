@@ -4,7 +4,14 @@ import SwiftData
 /// SwiftData 只负责提供原始记录；轨迹会话、分段和质量全部由领域 Builder 生成。
 struct TrajectoryRepository {
     let container: ModelContainer
+    let persistentCache: PersistentTrajectoryCache
     private static let routePointBatchSize = 20_000
+
+    init(container: ModelContainer,
+         persistentCache: PersistentTrajectoryCache = .shared) {
+        self.container = container
+        self.persistentCache = persistentCache
+    }
 
     func load() throws -> [Trajectory] {
         let context = ModelContext(container)
@@ -175,14 +182,21 @@ struct TrajectoryRepository {
 
     func loadResolved() throws -> TrajectoryResolution {
         try DatabaseHeavyWorkGate.withExclusiveAccess("TrajectoryRepository.loadResolved") {
-            if let cached = TrajectoryResolutionCache.shared.value {
+            let revision = DataRevisionStore.snapshot().trajectory
+            if let cached = TrajectoryResolutionCache.shared.value(for: revision) {
             #if DEBUG
-            PerformanceDiagnostics.event("TrajectoryResolutionCache.hit")
+            PerformanceDiagnostics.event(
+                "TrajectoryResolutionCache.hit", metadata: "revision=\(revision)")
             #endif
             return cached
             }
+            if let cached = persistentCache.load(dataRevision: revision) {
+                TrajectoryResolutionCache.shared.store(cached, for: revision)
+                return cached
+            }
             #if DEBUG
-            PerformanceDiagnostics.event("TrajectoryResolutionCache.miss")
+            PerformanceDiagnostics.event(
+                "TrajectoryResolutionCache.miss", metadata: "revision=\(revision)")
             let trajectories = try load()
             let resolution = PerformanceDiagnostics.measure(
                 "TrajectoryConflictResolver", metadata: "trajectories=\(trajectories.count)") {
@@ -193,7 +207,17 @@ struct TrajectoryRepository {
             #else
             let resolution = TrajectoryConflictResolver.resolve(try load())
             #endif
-            TrajectoryResolutionCache.shared.value = resolution
+            // 若构建期间数据发生变化，结果仍可供当前调用返回，但绝不能标记成新 revision 的缓存。
+            guard DataRevisionStore.snapshot().trajectory == revision else {
+                #if DEBUG
+                PerformanceDiagnostics.event(
+                    "PersistentTrajectoryCache.skipSave",
+                    metadata: "reason=revisionChanged initial=\(revision)")
+                #endif
+                return resolution
+            }
+            TrajectoryResolutionCache.shared.store(resolution, for: revision)
+            _ = persistentCache.save(resolution, dataRevision: revision)
             return resolution
         }
     }
@@ -204,6 +228,7 @@ final class TrajectoryResolutionCache: @unchecked Sendable {
     static let shared = TrajectoryResolutionCache()
     private let lock = NSLock()
     private var stored: TrajectoryResolution?
+    private var storedRevision: Int?
     private var lastInvalidatedRevision: Int?
 
     var value: TrajectoryResolution? {
@@ -217,19 +242,38 @@ final class TrajectoryResolutionCache: @unchecked Sendable {
             #endif
         }
         set {
+            let revision = newValue == nil ? nil : DataRevisionStore.snapshot().trajectory
             #if DEBUG
             PerformanceDiagnostics.measure("TrajectoryResolutionCache.lock.set") {
-                lock.withLock { stored = newValue }
+                lock.withLock {
+                    stored = newValue
+                    storedRevision = revision
+                }
             }
             #else
-            lock.withLock { stored = newValue }
+            lock.withLock {
+                stored = newValue
+                storedRevision = revision
+            }
             #endif
+        }
+    }
+
+    func value(for revision: Int) -> TrajectoryResolution? {
+        lock.withLock { storedRevision == revision ? stored : nil }
+    }
+
+    func store(_ resolution: TrajectoryResolution, for revision: Int) {
+        lock.withLock {
+            stored = resolution
+            storedRevision = revision
         }
     }
 
     func invalidate() {
         lock.withLock {
             stored = nil
+            storedRevision = nil
             lastInvalidatedRevision = nil
         }
     }
@@ -239,6 +283,7 @@ final class TrajectoryResolutionCache: @unchecked Sendable {
         lock.withLock {
             guard lastInvalidatedRevision != revision else { return }
             stored = nil
+            storedRevision = nil
             lastInvalidatedRevision = revision
             #if DEBUG
             PerformanceDiagnostics.count("TrajectoryResolutionCache.invalidate")

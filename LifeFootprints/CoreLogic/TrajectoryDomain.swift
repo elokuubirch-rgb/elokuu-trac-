@@ -7,7 +7,7 @@ public enum TrajectorySource: String, Codable, Sendable {
     case inferred
 }
 
-public struct TrajectoryPoint: Equatable, Sendable {
+public struct TrajectoryPoint: Codable, Equatable, Sendable {
     public let id: String
     public let latitude: Double
     public let longitude: Double
@@ -33,7 +33,7 @@ public struct TrajectoryPoint: Equatable, Sendable {
     }
 }
 
-public struct TrajectoryQuality: Equatable, Sendable {
+public struct TrajectoryQuality: Codable, Equatable, Sendable {
     public let pointCount: Int
     public let duration: TimeInterval
     public let maximumGap: TimeInterval

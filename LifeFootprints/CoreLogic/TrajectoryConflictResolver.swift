@@ -26,7 +26,7 @@ public struct TrajectoryConflictConfiguration: Equatable, Sendable {
     }
 }
 
-public struct TrajectoryConflict: Equatable, Sendable {
+public struct TrajectoryConflict: Codable, Equatable, Sendable {
     public let winnerTrajectoryID: String
     public let suppressedTrajectoryID: String
     public let startTime: Date
