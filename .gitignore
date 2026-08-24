@@ -15,6 +15,7 @@ xcuserdata/
 # Local backups and generated test artifacts
 .backups/
 测试截图/
+PerformanceArtifacts/*.xcresult/
 
 # Local secrets
 .env

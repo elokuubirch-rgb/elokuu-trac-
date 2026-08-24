@@ -11,6 +11,9 @@ struct StatsScreen: View {
     /// 密集区域聚类：后台重算后缓存，body 零重活（P0）。
     @State private var cachedClusters: [(lat: Double, lon: Double, count: Int)] = []
     @State private var clustersGeneration = 0
+    #if DEBUG
+    @State private var diagnosticSettingsPresented = false
+    #endif
 
     private var theme: AppTheme { AppTheme(rawValue: themeRaw) ?? .crimson }
     private var stats: FootprintStats { cachedStats }
@@ -19,6 +22,9 @@ struct StatsScreen: View {
     private var currentYear: Int { Calendar.current.component(.year, from: Date()) }
 
     var body: some View {
+        #if DEBUG
+        let _ = PerformanceDiagnostics.event("StatsScreen.body")
+        #endif
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
@@ -55,23 +61,53 @@ struct StatsScreen: View {
                     }
                 }
             }
+            #if DEBUG
+            .navigationDestination(isPresented: $diagnosticSettingsPresented) {
+                SettingsScreen()
+            }
+            #endif
         }
         .preferredColorScheme(.dark)
         .background(Color(uiColor: .systemBackground).ignoresSafeArea())
         .onAppear {
             #if DEBUG
+            PerformanceDiagnostics.event("StatsScreen.onAppear")
             MapDebugLog.log("StatsScreen onAppear（挂载）")
             #endif
             refreshCache()
         }
         .onChange(of: isActive) { _, active in
+            #if DEBUG
+            PerformanceDiagnostics.event("StatsScreen.isActiveChanged",
+                                           metadata: active ? "active" : "inactive")
+            #endif
             if active { scheduleClustersRebuild() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
             refreshCache()
         }
         .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
+            #if DEBUG
+            PerformanceDiagnostics.event("dataImported.receive.StatsScreen")
+            #endif
             refreshCache()
+        }
+        #if DEBUG
+        .onReceive(NotificationCenter.default.publisher(for: .performanceOpenSettings)) { _ in
+            guard PerformanceDiagnostics.isEnabled else { return }
+            PerformanceDiagnostics.beginTransition("Stats->Settings")
+            diagnosticSettingsPresented = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .performanceCloseSettings)) { _ in
+            guard PerformanceDiagnostics.isEnabled else { return }
+            PerformanceDiagnostics.beginTransition("Settings->Stats")
+            diagnosticSettingsPresented = false
+        }
+        #endif
+        .onDisappear {
+            #if DEBUG
+            PerformanceDiagnostics.event("StatsScreen.onDisappear")
+            #endif
         }
     }
 
@@ -132,12 +168,23 @@ struct StatsScreen: View {
     /// 134k 点的聚类在后台线程重算；统计页不可见时直接跳过。
     private func scheduleClustersRebuild() {
         guard isActive else { return }
+        #if DEBUG
+        PerformanceDiagnostics.count("StatsCluster.rebuild.started")
+        #endif
         clustersGeneration += 1
         let generation = clustersGeneration
         let source = snapshots
         Task.detached(priority: .utility) {
+            #if DEBUG
+            let result = PerformanceDiagnostics.measure(
+                "StatsCluster.generation", metadata: "snapshots=\(source.count)") {
+                    let pts = source.map { (lat: $0.lat, lon: $0.lon) }
+                    return GeoMath.topClusters(pts, topN: 5)
+                }
+            #else
             let pts = source.map { (lat: $0.lat, lon: $0.lon) }
             let result = GeoMath.topClusters(pts, topN: 5)
+            #endif
             await MainActor.run {
                 guard generation == self.clustersGeneration else { return }
                 self.cachedClusters = result

@@ -893,6 +893,22 @@ struct FootprintMapView: UIViewRepresentable {
 
     func updateUIView(_ mapView: MKMapView, context: Context) {
         let c = context.coordinator
+        #if DEBUG
+        let diagnosticStarted = CACurrentMediaTime()
+        let mutationsBeforeUpdate = c.diagnosticMutationCount
+        PerformanceDiagnostics.event("FootprintMapView.updateUIView")
+        defer {
+            PerformanceDiagnostics.recordDuration(
+                "FootprintMapView.updateUIView",
+                milliseconds: (CACurrentMediaTime() - diagnosticStarted) * 1_000,
+                mainThread: true)
+            if c.diagnosticMutationCount == mutationsBeforeUpdate {
+                PerformanceDiagnostics.count("MapKit.updateUIView.noMutation")
+            } else {
+                PerformanceDiagnostics.count("MapKit.updateUIView.withMutation")
+            }
+        }
+        #endif
         c.parent = self
         c.updateReviewHighlight(on: mapView, coordinate: highlightedPhoto)
 
@@ -971,6 +987,10 @@ struct FootprintMapView: UIViewRepresentable {
             let isSatellite = mapType == "satellite"
             c.dimLayer?.isHidden = !isSatellite
             if let previous = c.baseTileOverlay {
+                #if DEBUG
+                PerformanceDiagnostics.count("MapKit.overlays.remove")
+                c.diagnosticMutationCount += 1
+                #endif
                 mapView.removeOverlay(previous)
                 c.baseTileOverlay = nil
             }
@@ -985,6 +1005,10 @@ struct FootprintMapView: UIViewRepresentable {
                 tiles.minimumZ = 0
                 tiles.maximumZ = 20
                 c.baseTileOverlay = tiles
+                #if DEBUG
+                PerformanceDiagnostics.count("MapKit.overlays.add")
+                c.diagnosticMutationCount += 1
+                #endif
                 mapView.addOverlay(tiles, level: .aboveRoads)
 
             } else if mapType.hasPrefix("custom:"), let customSource {
@@ -994,6 +1018,10 @@ struct FootprintMapView: UIViewRepresentable {
                 mapView.preferredConfiguration = config
                 let tiles = ConfiguredTileOverlay(source: customSource)
                 c.baseTileOverlay = tiles
+                #if DEBUG
+                PerformanceDiagnostics.count("MapKit.overlays.add")
+                c.diagnosticMutationCount += 1
+                #endif
                 mapView.addOverlay(tiles, level: .aboveRoads)
             } else if isSatellite {
                 mapView.preferredConfiguration = MKImageryMapConfiguration()
@@ -1016,15 +1044,39 @@ struct FootprintMapView: UIViewRepresentable {
         // 3) 实时轨迹（每次定位更新增量重建）
         if track.count != c.lastTrackCount {
             c.lastTrackCount = track.count
-            mapView.removeOverlays(mapView.overlays.filter { c.tag(of: $0) == 1 || c.tag(of: $0) == 2 })
+            let removed = mapView.overlays.filter { c.tag(of: $0) == 1 || c.tag(of: $0) == 2 }
+            #if DEBUG
+            PerformanceDiagnostics.count("MapKit.overlays.remove", by: removed.count)
+            c.diagnosticMutationCount += removed.count
+            #endif
+            mapView.removeOverlays(removed)
             addTrackLines(mapView, context: c)
         }
     }
 
     /// 全量重建：线层 + 实时轨迹（点/照片走画布；数据版本/月份变化时）
     private func rebuildAll(_ mapView: MKMapView, context c: MapCoordinator) {
+        #if DEBUG
+        let rebuildStarted = CACurrentMediaTime()
+        defer {
+            PerformanceDiagnostics.recordDuration(
+                "MapKit.fullRebuild.mainThread",
+                milliseconds: (CACurrentMediaTime() - rebuildStarted) * 1_000,
+                mainThread: true)
+        }
+        PerformanceDiagnostics.count("MapPresentation.logicalRouteCount",
+                                     by: routes.count + workoutRoutes.count)
+        PerformanceDiagnostics.count("MapPresentation.expectedPolylineCount",
+                                     by: (routes.count + workoutRoutes.count) * 3)
+        #endif
         // 等高线瓦片是底图，数据重建时不应被清理。
-        mapView.removeOverlays(mapView.overlays.filter { !($0 is MKTileOverlay) })
+        let removed = mapView.overlays.filter { !($0 is MKTileOverlay) }
+        #if DEBUG
+        PerformanceDiagnostics.count("MapKit.fullRebuild.calls")
+        PerformanceDiagnostics.count("MapKit.overlays.remove", by: removed.count)
+        c.diagnosticMutationCount += removed.count
+        #endif
+        mapView.removeOverlays(removed)
         c.dotsOverlay = nil
         c.overlayStyles.removeAll()
         rebuildLinesOnly(mapView, context: c)
@@ -1037,12 +1089,20 @@ struct FootprintMapView: UIViewRepresentable {
 
     private func replaceDotsOverlay(on mapView: MKMapView, context c: MapCoordinator) {
         if let old = c.dotsOverlay {
+            #if DEBUG
+            PerformanceDiagnostics.count("MapKit.overlays.remove")
+            c.diagnosticMutationCount += 1
+            #endif
             mapView.removeOverlay(old)
             c.dotsOverlay = nil
         }
         guard showDots, !dots.isEmpty else { return }
         let overlay = FootprintDotsOverlay(dots: dots)
         c.dotsOverlay = overlay
+        #if DEBUG
+        PerformanceDiagnostics.count("MapKit.overlays.add")
+        c.diagnosticMutationCount += 1
+        #endif
         mapView.addOverlay(overlay, level: .aboveLabels)
     }
 
@@ -1053,22 +1113,51 @@ struct FootprintMapView: UIViewRepresentable {
                                          full: Bool = false) {
         let existing = mapView.annotations.compactMap { $0 as? PhotoClusterAnnotation }
         guard showPhotos else {
-            if !existing.isEmpty { mapView.removeAnnotations(existing) }
+            if !existing.isEmpty {
+                #if DEBUG
+                PerformanceDiagnostics.count("MapKit.annotations.remove", by: existing.count)
+                c.diagnosticMutationCount += existing.count
+                #endif
+                mapView.removeAnnotations(existing)
+            }
             return
         }
         if full {
-            if !existing.isEmpty { mapView.removeAnnotations(existing) }
-            mapView.addAnnotations(markers.map(PhotoClusterAnnotation.init(cluster:)))
+            if !existing.isEmpty {
+                #if DEBUG
+                PerformanceDiagnostics.count("MapKit.annotations.remove", by: existing.count)
+                c.diagnosticMutationCount += existing.count
+                #endif
+                mapView.removeAnnotations(existing)
+            }
+            let added = markers.map(PhotoClusterAnnotation.init(cluster:))
+            #if DEBUG
+            PerformanceDiagnostics.count("MapKit.annotations.add", by: added.count)
+            c.diagnosticMutationCount += added.count
+            #endif
+            mapView.addAnnotations(added)
             c.updatePhotoMarkerSizes(on: mapView)
             return
         }
         let wantedIDs = Set(markers.map(\.id))
         let toRemove = existing.filter { !wantedIDs.contains($0.cluster.id) }
-        if !toRemove.isEmpty { mapView.removeAnnotations(toRemove) }
+        if !toRemove.isEmpty {
+            #if DEBUG
+            PerformanceDiagnostics.count("MapKit.annotations.remove", by: toRemove.count)
+            c.diagnosticMutationCount += toRemove.count
+            #endif
+            mapView.removeAnnotations(toRemove)
+        }
         let existingIDs = Set(existing.map(\.cluster.id))
         let toAdd = markers.filter { !existingIDs.contains($0.id) }
             .map(PhotoClusterAnnotation.init(cluster:))
-        if !toAdd.isEmpty { mapView.addAnnotations(toAdd) }
+        if !toAdd.isEmpty {
+            #if DEBUG
+            PerformanceDiagnostics.count("MapKit.annotations.add", by: toAdd.count)
+            c.diagnosticMutationCount += toAdd.count
+            #endif
+            mapView.addAnnotations(toAdd)
+        }
         c.updatePhotoMarkerSizes(on: mapView)
     }
 
@@ -1076,6 +1165,10 @@ struct FootprintMapView: UIViewRepresentable {
     private func rebuildLinesOnly(_ mapView: MKMapView, context c: MapCoordinator) {
         let olds = mapView.overlays.filter { c.tag(of: $0) == 0 }
         for o in olds { c.overlayStyles.removeValue(forKey: ObjectIdentifier(o)) }
+        #if DEBUG
+        PerformanceDiagnostics.count("MapKit.overlays.remove", by: olds.count)
+        c.diagnosticMutationCount += olds.count
+        #endif
         mapView.removeOverlays(olds)
         let last = routes.count - 1
         for (i, route) in routes.enumerated() {
@@ -1119,18 +1212,33 @@ struct FootprintMapView: UIViewRepresentable {
                                      context c: MapCoordinator) {
         guard coordinates.count >= 2 else { return }
         let casing = MKPolyline(coordinates: coordinates, count: coordinates.count)
+        #if DEBUG
+        PerformanceDiagnostics.count("MapKit.polyline.create")
+        PerformanceDiagnostics.count("MapKit.overlays.add")
+        c.diagnosticMutationCount += 1
+        #endif
         c.overlayStyles[ObjectIdentifier(casing)] = MapLineStyle(
             alpha: tag == 0 ? 0.34 : min(0.82, 0.5 + alpha * 0.3),
             width: tag == 0 ? width + 2.4 : width + 4.2, tag: tag, tone: .casing)
         mapView.addOverlay(casing, level: .aboveLabels)
 
         let glow = MKPolyline(coordinates: coordinates, count: coordinates.count)
+        #if DEBUG
+        PerformanceDiagnostics.count("MapKit.polyline.create")
+        PerformanceDiagnostics.count("MapKit.overlays.add")
+        c.diagnosticMutationCount += 1
+        #endif
         c.overlayStyles[ObjectIdentifier(glow)] = MapLineStyle(
             alpha: tag == 0 ? 0.05 : 0.12 + alpha * 0.08,
             width: tag == 0 ? width + 4 : width + 8, tag: tag, tone: .glow)
         mapView.addOverlay(glow, level: .aboveLabels)
 
         let core = MKPolyline(coordinates: coordinates, count: coordinates.count)
+        #if DEBUG
+        PerformanceDiagnostics.count("MapKit.polyline.create")
+        PerformanceDiagnostics.count("MapKit.overlays.add")
+        c.diagnosticMutationCount += 1
+        #endif
         c.overlayStyles[ObjectIdentifier(core)] = MapLineStyle(
             alpha: tag == 0 ? min(alpha, 0.52) : max(alpha, 0.82),
             width: tag == 0 ? min(width, 2.0) : max(width, 2.8), tag: tag, tone: .theme)
@@ -1186,6 +1294,9 @@ final class MapCoordinator: NSObject, MKMapViewDelegate {
     var baseTileOverlay: MKTileOverlay?
     var lastMapConfigurationKey = ""
     private var reviewHighlight: ReviewPhotoHighlightAnnotation?
+    #if DEBUG
+    var diagnosticMutationCount = 0
+    #endif
 
     init(_ parent: FootprintMapView) { self.parent = parent }
 
@@ -1193,16 +1304,32 @@ final class MapCoordinator: NSObject, MKMapViewDelegate {
 
     func updateReviewHighlight(on mapView: MKMapView, coordinate: CLLocationCoordinate2D?) {
         guard let coordinate else {
-            if let old = reviewHighlight { mapView.removeAnnotation(old) }
+            if let old = reviewHighlight {
+                #if DEBUG
+                PerformanceDiagnostics.count("MapKit.annotations.remove")
+                diagnosticMutationCount += 1
+                #endif
+                mapView.removeAnnotation(old)
+            }
             reviewHighlight = nil
             return
         }
         if let old = reviewHighlight,
            abs(old.coordinate.latitude - coordinate.latitude) < 0.000001,
            abs(old.coordinate.longitude - coordinate.longitude) < 0.000001 { return }
-        if let old = reviewHighlight { mapView.removeAnnotation(old) }
+        if let old = reviewHighlight {
+            #if DEBUG
+            PerformanceDiagnostics.count("MapKit.annotations.remove")
+            diagnosticMutationCount += 1
+            #endif
+            mapView.removeAnnotation(old)
+        }
         let annotation = ReviewPhotoHighlightAnnotation(coordinate: coordinate)
         reviewHighlight = annotation
+        #if DEBUG
+        PerformanceDiagnostics.count("MapKit.annotations.add")
+        diagnosticMutationCount += 1
+        #endif
         mapView.addAnnotation(annotation)
         mapView.selectAnnotation(annotation, animated: true)
     }

@@ -65,6 +65,9 @@ struct LifeFootprintsApp: App {
     }
 
     var body: some Scene {
+        #if DEBUG
+        let _ = PerformanceDiagnostics.event("LifeFootprintsApp.body")
+        #endif
         WindowGroup {
             Group {
                 if onboarded {

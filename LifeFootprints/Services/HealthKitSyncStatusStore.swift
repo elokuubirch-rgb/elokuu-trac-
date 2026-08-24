@@ -77,6 +77,9 @@ enum HealthKitSyncStatusStore {
     }
 
     private static func notify() {
+        #if DEBUG
+        PerformanceDiagnostics.event("HealthKit.syncState.publish")
+        #endif
         NotificationCenter.default.post(name: .healthKitSyncStatusChanged, object: nil)
     }
 }

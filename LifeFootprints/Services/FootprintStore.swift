@@ -42,6 +42,10 @@ enum FootprintStore {
                 bg.insert(FootprintPoint(draft: draft))
                 try? bg.save()
                 await MainActor.run {
+                    #if DEBUG
+                    PerformanceDiagnostics.event("dataImported.post.FootprintStore.backgroundDraft")
+                    PerformanceDiagnostics.count("dataImported.post.total")
+                    #endif
                     NotificationCenter.default.post(name: .dataImported, object: nil)
                 }
                 continuation.resume(returning: true)
@@ -110,6 +114,10 @@ enum FootprintStore {
                 if added > 0 {
                     // 数据变化 → 地图重载（替代主线程 @Query 监听）
                     await MainActor.run {
+                        #if DEBUG
+                        PerformanceDiagnostics.event("dataImported.post.FootprintStore.importDrafts")
+                        PerformanceDiagnostics.count("dataImported.post.total")
+                        #endif
                         NotificationCenter.default.post(name: .dataImported, object: nil)
                     }
                 }
@@ -151,6 +159,10 @@ enum FootprintStore {
         let all = (try? context.fetch(FetchDescriptor<FootprintPoint>())) ?? []
         for p in all { context.delete(p) }
         try? context.save()
+        #if DEBUG
+        PerformanceDiagnostics.event("dataImported.post.FootprintStore.deleteAll")
+        PerformanceDiagnostics.count("dataImported.post.total")
+        #endif
         NotificationCenter.default.post(name: .dataImported, object: nil)
     }
 

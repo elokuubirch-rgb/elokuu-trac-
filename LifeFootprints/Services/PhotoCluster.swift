@@ -97,6 +97,9 @@ struct ClusterIndex {
         var bBuckets: [String: ClusterCell] = [:]
         var sBuckets: [String: ClusterCell] = [:]
         var siBuckets: [String: ClusterCell] = [:]
+        #if DEBUG
+        var photoMatchingMilliseconds = 0.0
+        #endif
 
         func add(_ cell: inout [String: ClusterCell], _ key: String, _ r: PhotoRecord,
                  lat: Double, lon: Double,
@@ -142,9 +145,17 @@ struct ClusterIndex {
 
             // 精细级坐标：轨迹吸附（<50m 精确绑定 / ≤300m 吸附到最近轨迹点 /
             // 无 GPS 按拍摄时间插值）——照片标记落在线路附近
-            let snapResult = snapPhotoToTrailResult(lat: r.latitude, lon: r.longitude,
-                                                    time: r.timestamp.timeIntervalSince1970,
-                                                    trails: trails)
+            #if DEBUG
+            let matchingStarted = PerformanceDiagnostics.isEnabled ? CACurrentMediaTime() : 0
+            #endif
+            let snapResult = snapPhotoToTrailResult(
+                lat: r.latitude, lon: r.longitude,
+                time: r.timestamp.timeIntervalSince1970, trails: trails)
+            #if DEBUG
+            if PerformanceDiagnostics.isEnabled {
+                photoMatchingMilliseconds += (CACurrentMediaTime() - matchingStarted) * 1_000
+            }
+            #endif
             onSnap?(snapResult)
             let snapped = (snapResult.lat, snapResult.lon)
             let attachedToRoute = snapResult.kind != .kept
@@ -212,6 +223,10 @@ struct ClusterIndex {
         func modeName(_ cell: ClusterCell) -> String {
             cell.nameCounts.max { $0.value < $1.value }?.key ?? "附近"
         }
+        #if DEBUG
+        PerformanceDiagnostics.recordDuration(
+            "TrailIndex.photoMatching", milliseconds: photoMatchingMilliseconds)
+        #endif
         return ClusterIndex(
             province: cluster(pBuckets, level: .province) { key, _ in key },
             city: cluster(cBuckets, level: .city) { key, _ in

@@ -19,6 +19,9 @@ final class HealthKitSyncCoordinator {
     func restoreIfEnabled(container: ModelContainer) {
         guard UserDefaults.standard.bool(forKey: Self.automaticSyncEnabledKey),
               HKHealthStore.isHealthDataAvailable() else { return }
+        #if DEBUG
+        PerformanceDiagnostics.event("HealthKit.restoreIfEnabled")
+        #endif
         activate(container: container)
     }
 
@@ -70,6 +73,10 @@ final class HealthKitSyncCoordinator {
             return 0
         }
         isSyncing = true
+        #if DEBUG
+        PerformanceDiagnostics.event("HealthKit.sync.start",
+                                     metadata: forceFull ? "full" : "incremental")
+        #endif
         HealthKitSyncStatusStore.markStarted()
         let added: Int
         if forceFull {
@@ -81,6 +88,9 @@ final class HealthKitSyncCoordinator {
                 forcePendingRetry: forcePendingRetry, progress: progress)
         }
         isSyncing = false
+        #if DEBUG
+        PerformanceDiagnostics.event("HealthKit.sync.finish", metadata: "added=\(added)")
+        #endif
         if needsAnotherSync {
             needsAnotherSync = false
             Task { _ = await synchronize(forceFull: false, forcePendingRetry: true) }
@@ -93,6 +103,10 @@ final class HealthKitSyncCoordinator {
         let types: [HKSampleType] = [HKObjectType.workoutType(), HKSeriesType.workoutRoute()]
         for type in types {
             let query = HKObserverQuery(sampleType: type, predicate: nil) { [weak self] _, completion, error in
+                #if DEBUG
+                PerformanceDiagnostics.event("HealthKit.observer.callback",
+                                             metadata: String(describing: type))
+                #endif
                 if let error {
                     appLog.error("[Health] Observer失败: \(error.localizedDescription)")
                     Task { @MainActor in

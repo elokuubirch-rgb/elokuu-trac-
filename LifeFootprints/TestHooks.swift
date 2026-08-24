@@ -17,6 +17,7 @@ import SwiftData
 ///   FP_HOLD_LOGO=1                 自动截图时将 Logo 过渡保持 3 秒
 ///   FP_LANGUAGE=zh-Hans|zh-Hant|en|fr  初始应用语言
 ///   FP_SEED_CUSTOM_MAP=1           注入并选中测试瓦片源（验证冷启动恢复）
+///   FP_PERF_VISUAL_SEED=1          注入确定性轨迹，供性能修复前后地图视觉回归
 ///   FP_MAP=standard|satellite|topographic  初始地图源
 ///   FP_PITCH=0...70                初始地图俯角
 ///   FP_PHOTO_TOGGLE=1              快速关闭/开启照片图层回归测试
@@ -52,6 +53,59 @@ enum TestHooks {
     static var startPitch: Double? { env["FP_PITCH"].flatMap(Double.init) }
     static var seedCustomMap: Bool { env["FP_SEED_CUSTOM_MAP"] == "1" }
     static var tabCycle: Bool { env["FP_TAB_CYCLE"] == "1" }
+    static var performanceAutoCycle: Bool { env["FP_PERF_AUTO_CYCLE"] == "1" }
+    static var performanceVisualSeed: Bool { env["FP_PERF_VISUAL_SEED"] == "1" }
+
+    /// 性能专项的确定性地图夹具。坐标、顺序和来源固定，确保优化前后的截图可逐像素比较。
+    /// 仅 DEBUG 环境变量可触发，不进入正式业务路径。
+    @MainActor
+    static func seedPerformanceVisualData(into context: ModelContext) {
+        let origin = (lat: 31.2304, lon: 121.4737)
+        let started = Date(timeIntervalSince1970: 1_753_948_800) // 2025-08-01 UTC
+        var drafts: [FootprintDraft] = []
+
+        for route in 0..<4 {
+            for point in 0..<48 {
+                let phase = Double(point) / 47
+                let lat = origin.lat + Double(route - 1) * 0.006
+                    + phase * 0.018
+                    + sin(phase * .pi * 2) * (0.0015 + Double(route) * 0.0003)
+                let lon = origin.lon - 0.018
+                    + phase * 0.036
+                    + cos(phase * .pi * 2 + Double(route)) * 0.0018
+                let timestamp = started
+                    .addingTimeInterval(Double(route) * 86_400 + Double(point) * 60)
+                drafts.append(FootprintDraft(latitude: lat, longitude: lon,
+                                             timestamp: timestamp,
+                                             source: FootprintSource.gps.rawValue))
+            }
+        }
+        _ = FootprintStore.importDrafts(drafts, into: context)
+
+        let workoutID = "performance-visual-workout"
+        let workoutStart = started.addingTimeInterval(8 * 86_400)
+        context.insert(WorkoutRecord(
+            healthKitUUID: workoutID, workoutType: "walking",
+            startDate: workoutStart, endDate: workoutStart.addingTimeInterval(3_000),
+            duration: 3_000, distanceMeters: 4_800, caloriesKCal: 280,
+            elevationGain: 35, routeAvailable: true, routeSyncState: .available))
+        let routeID = "performance-visual-route"
+        context.insert(WorkoutRouteRecord(routeID: routeID, workoutID: workoutID,
+                                          sourceIdentifier: "performance-visual"))
+        for point in 0..<52 {
+            let phase = Double(point) / 51
+            context.insert(WorkoutRoutePoint(
+                workoutID: workoutID,
+                latitude: origin.lat - 0.012 + phase * 0.025 + sin(phase * .pi) * 0.003,
+                longitude: origin.lon - 0.02 + phase * 0.04,
+                altitude: 12 + sin(phase * .pi * 4) * 8,
+                timestamp: workoutStart.addingTimeInterval(Double(point) * 55),
+                routeID: routeID, segmentIndex: 0, pointIndex: point,
+                horizontalAccuracy: 5, sourceIdentifier: "performance-visual"))
+        }
+        try? context.save()
+        appLog.info("[Seed] 注入性能视觉回归轨迹 \(drafts.count + 52) 点")
+    }
 
     /// 启动时注入一组模拟足迹：覆盖 2025-01 ~ 2026-08 的 8 条路线，
     /// 常走路线更密（多次往返），与原型一致

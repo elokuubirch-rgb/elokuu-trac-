@@ -1,0 +1,39 @@
+# LifeFootprints 真机性能专项修复报告
+
+日期：2026-08-24  
+代码事实基线：`5ea8e01`  
+性能基线：`PERFORMANCE_AUDIT_REPORT_2026-08-23.md`  
+约束：performance-only；不得改变产品功能、业务语义、导航、布局、视觉样式、轨迹视觉参数或地图照片 UI
+
+## 1. Current HEAD Re-Audit（修改前）
+
+以下结论来自当前 `5ea8e01` 源码，而不是沿用旧行号。
+
+| 指定问题 | 当前 HEAD 结论 |
+| --- | --- |
+| 1. WorkoutRoutePoint / Trajectory 读取入口 | `TrajectoryRepository.load()` 无范围 fetch 全部 `WorkoutRoutePoint`；`MapScreen.loadSnapshots()` 在 repository 失败时还有一次全表 fallback fetch。HealthKit 删除和 legacy backfill 也会扫描路线点。 |
+| 2. 地图消费的数据层 | 地图不直接把 SwiftData Model 交给 MapKit。Raw Model 经 `TrajectoryRepository` → Trajectory Domain → Conflict Resolution → `FootprintSnapshot` → `RouteLine`，最终转成 MapKit geometry。普通 FootprintPoint 另有一次全量 Snapshot 构建。 |
+| 3. Data revision | 没有持久数据 revision。只有 `reloadVersion`、`derivedVersion` 等进程内 UI token，不能判断 raw data 是否真正改变。 |
+| 4. Persistent trajectory cache | 没有。`TrajectoryResolutionCache` 只在内存中保存一个 `TrajectoryResolution`，App 重启必 miss。 |
+| 5. TrailIndex 时间查询 | 仍然存在 `segments.filter { a.t <= photoTime <= b.t }`，每张照片最坏扫描全部 segment。 |
+| 6. 一条逻辑路线的 overlay | 仍然创建 casing / glow / core 三个独立 `MKPolyline` 和三个 overlay。 |
+| 7. HealthKit 空增量 | 仍会进入 `importChanges`、执行 legacy backfill、保存 context、发送 `.dataImported`；Map 随后无条件 invalidate trajectory cache。 |
+| 8. Legacy Route Migration | `backfillLegacyRouteBoundaries` 仍位于每次 `importChanges` 的同步热路径，并全量读取缺失 routeID 的历史点。 |
+| 9. Stats 重算 | `onAppear`、`isActive=true`、`mapSnapshotReady`、`.dataImported` 都会触发 `scheduleClustersRebuild()`；没有 revision cache，也没有 single-flight。 |
+| 10. Map full rebuild | `contentToken` 变化会调用 `rebuildAll`，移除全部非瓦片 overlay，清空 style 表，再同步 add 全部三层路线；没有 route diff 或 batch。 |
+
+当前已经成立、无需重做的优化：
+
+- 三个主页面常驻；Tab 切换不会重复执行 Map `onAppear` 或 Location `.task`。
+- `updateUIView` 在 content token 未变化时已有低成本分支，旧审计中 88/89 次没有 MapKit 数据 mutation。
+- 照片 annotation 在普通 marker token 变化时已经按 cluster ID 做增删差分。
+- Trajectory、TrailIndex 和 PhotoCluster 主要计算已在后台执行；当前问题是工作量与最终主线程 presentation，而不是缺少 `Task.detached`。
+- `TrajectoryResolutionCache` 的 `NSLock` 已证明不是瓶颈，本轮不优化。
+
+## 2. 修改记录
+
+待各 performance commit 完成后更新。
+
+## 3. Before / After
+
+待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。

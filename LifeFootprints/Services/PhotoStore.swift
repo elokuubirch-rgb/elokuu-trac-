@@ -95,6 +95,10 @@ enum PhotoStore {
         }
         try? context.save()
         invalidateIndex()
+        #if DEBUG
+        PerformanceDiagnostics.event("dataImported.post.PhotoStore.hide")
+        PerformanceDiagnostics.count("dataImported.post.total")
+        #endif
         NotificationCenter.default.post(name: .dataImported, object: nil)
     }
 
@@ -159,6 +163,10 @@ enum PhotoStore {
                 if added > 0 {
                     await MainActor.run {
                         invalidateIndex()
+                        #if DEBUG
+                        PerformanceDiagnostics.event("dataImported.post.PhotoStore.upsert")
+                        PerformanceDiagnostics.count("dataImported.post.total")
+                        #endif
                         NotificationCenter.default.post(name: .dataImported, object: nil)
                     }
                 }

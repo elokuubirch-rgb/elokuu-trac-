@@ -62,17 +62,36 @@ enum HealthKitService {
                                        progress: @escaping @Sendable (String) -> Void) async -> Int {
         let previousAnchor = HealthKitAnchorStore.load()
         do {
+            #if DEBUG
+            let changes = try await PerformanceDiagnostics.measureAsync(
+                "HealthKit.anchoredSync") {
+                    try await fetchWorkoutChanges(store: store, anchor: previousAnchor)
+                }
+            #else
             let changes = try await fetchWorkoutChanges(store: store, anchor: previousAnchor)
+            #endif
             let pendingIDs = pendingWorkoutIDs(
                 in: container, forceRetry: forcePendingRetry)
             let changedIDs = Set(changes.workouts.map(\.uuid))
             let retryIDs = pendingIDs.subtracting(changedIDs)
             let retries = retryIDs.isEmpty
                 ? [] : try await fetchWorkouts(store: store, ids: retryIDs)
+            #if DEBUG
+            PerformanceDiagnostics.count("HealthKit.routeRetry.workouts", by: retries.count)
+            #endif
             let all = Dictionary(uniqueKeysWithValues:
                 (changes.workouts + retries).map { ($0.uuid, $0) }).values.sorted {
                     $0.startDate < $1.startDate
                 }
+            #if DEBUG
+            PerformanceDiagnostics.count("HealthKit.changeSet.workouts", by: all.count)
+            PerformanceDiagnostics.count("HealthKit.changeSet.deleted",
+                                         by: changes.deleted.count)
+            if all.isEmpty, changes.deleted.isEmpty {
+                PerformanceDiagnostics.count("HealthKit.emptyChangeSet")
+                PerformanceDiagnostics.event("HealthKit.emptyChangeSet")
+            }
+            #endif
             guard let added = await importChanges(
                 workouts: all, deletedWorkoutIDs: Set(changes.deleted.map(\.uuid)),
                 store: store, container: container, progress: progress) else {
@@ -214,6 +233,10 @@ enum HealthKitService {
             appLog.error("[Health] 保存失败: \(error.localizedDescription)")
             return nil
         }
+        #if DEBUG
+        PerformanceDiagnostics.event("dataImported.post.HealthKit")
+        PerformanceDiagnostics.count("dataImported.post.total")
+        #endif
         NotificationCenter.default.post(name: .dataImported, object: nil)
         appLog.info("[Health] 独立 Workout Route 导入：新增 \(addedRoutes) 条")
         return addedRoutes

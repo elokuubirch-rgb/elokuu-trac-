@@ -4,6 +4,10 @@ import SwiftData
 extension Notification.Name {
     static let mapSnapshotReady = Notification.Name("mapSnapshotReady")
     static let reviewPhotoLocationRequested = Notification.Name("reviewPhotoLocationRequested")
+    #if DEBUG
+    static let performanceOpenSettings = Notification.Name("performanceOpenSettings")
+    static let performanceCloseSettings = Notification.Name("performanceCloseSettings")
+    #endif
 }
 
 enum AppTab: Int, Hashable {
@@ -98,6 +102,7 @@ struct MainTabView: View {
 
     init() {
         #if DEBUG
+        PerformanceDiagnostics.event("MainTabView.init")
         _navigation = State(initialValue: AppNavigationCoordinator(
             selectedTab: AppTab(rawValue: TestHooks.startTab ?? 0) ?? .map))
         #else
@@ -106,6 +111,9 @@ struct MainTabView: View {
     }
 
     var body: some View {
+        #if DEBUG
+        let _ = PerformanceDiagnostics.event("MainTabView.body")
+        #endif
         ZStack(alignment: .bottom) {
             // P0 性能：三个主页面全部常驻（KEEP ALIVE）。切换 Tab 只改变绘制层级与
             // 命中测试，绝不销毁页面 —— 地图实例、回顾会话、统计缓存跨 Tab 存活。
@@ -143,10 +151,16 @@ struct MainTabView: View {
                 while await RegionService.geocodeNextBatch(in: context) > 0 {
                     batches += 1
                     if batches % 5 == 0 {
+                        #if DEBUG
+                        PerformanceDiagnostics.event("photoRegionsUpdated.post.batch")
+                        #endif
                         NotificationCenter.default.post(name: .photoRegionsUpdated, object: nil)
                     }
                 }
                 if batches > 0 {
+                    #if DEBUG
+                    PerformanceDiagnostics.event("photoRegionsUpdated.post.final")
+                    #endif
                     NotificationCenter.default.post(name: .photoRegionsUpdated, object: nil)
                 }
             }
@@ -160,6 +174,58 @@ struct MainTabView: View {
                         appLog.info("[Test] 自动切 Tab → \(tab.rawValue)")
                     }
                 }
+                #endif
+            }
+            .task {
+                #if DEBUG
+                guard TestHooks.performanceAutoCycle else { return }
+                try? await Task.sleep(for: .seconds(8))
+                for _ in 0..<600 where SnapshotCache.clusterIndex == nil {
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+                PerformanceDiagnostics.event(
+                    "AUDIT_STEADY_STATE_BEGIN",
+                    metadata: "snapshots=\(SnapshotCache.pointSnapshots.count)|clustersReady=\(SnapshotCache.clusterIndex != nil)")
+
+                for iteration in 1...20 {
+                    PerformanceDiagnostics.event("AUDIT_SCENARIO",
+                                                 metadata: "map_stats_map|\(iteration)")
+                    withAnimation(.easeInOut(duration: 0.27)) {
+                        navigation.selectedTab = .statistics
+                    }
+                    try? await Task.sleep(for: .milliseconds(450))
+                    withAnimation(.easeInOut(duration: 0.27)) {
+                        navigation.selectedTab = .map
+                    }
+                    try? await Task.sleep(for: .milliseconds(450))
+                }
+
+                for iteration in 1...20 {
+                    PerformanceDiagnostics.event("AUDIT_SCENARIO",
+                                                 metadata: "map_settings_map|\(iteration)")
+                    navigation.selectedTab = .statistics
+                    try? await Task.sleep(for: .milliseconds(350))
+                    NotificationCenter.default.post(name: .performanceOpenSettings, object: nil)
+                    try? await Task.sleep(for: .milliseconds(450))
+                    NotificationCenter.default.post(name: .performanceCloseSettings, object: nil)
+                    try? await Task.sleep(for: .milliseconds(450))
+                    navigation.selectedTab = .map
+                    try? await Task.sleep(for: .milliseconds(350))
+                }
+
+                navigation.selectedTab = .statistics
+                try? await Task.sleep(for: .milliseconds(450))
+                for iteration in 1...20 {
+                    PerformanceDiagnostics.event("AUDIT_SCENARIO",
+                                                 metadata: "stats_settings_stats|\(iteration)")
+                    NotificationCenter.default.post(name: .performanceOpenSettings, object: nil)
+                    try? await Task.sleep(for: .milliseconds(450))
+                    NotificationCenter.default.post(name: .performanceCloseSettings, object: nil)
+                    try? await Task.sleep(for: .milliseconds(450))
+                }
+                PerformanceDiagnostics.event("AUDIT_SCENARIO_COMPLETE")
+                try? await Task.sleep(for: .seconds(2))
+                PerformanceDiagnostics.flush()
                 #endif
             }
 
@@ -200,11 +266,29 @@ struct MainTabView: View {
             launchDataReady = true
         }
         .onAppear {
+            #if DEBUG
+            PerformanceDiagnostics.event("MainTabView.onAppear")
+            #endif
             LocationService.shared.restoreBackgroundMonitoring()
             LocationService.shared.setAppActive(true)
         }
         .onChange(of: scenePhase) { _, phase in
             LocationService.shared.setAppActive(phase == .active)
+        }
+        .onChange(of: navigation.selectedTab) { oldTab, newTab in
+            #if DEBUG
+            PerformanceDiagnostics.tabSelectionChanged(from: oldTab.rawValue,
+                                                       to: newTab.rawValue)
+            DispatchQueue.main.async {
+                PerformanceDiagnostics.tabFirstFrameCommitted(tab: newTab.rawValue)
+            }
+            #endif
+        }
+        .onDisappear {
+            #if DEBUG
+            PerformanceDiagnostics.event("MainTabView.onDisappear")
+            PerformanceDiagnostics.flush()
+            #endif
         }
     }
 
@@ -233,12 +317,16 @@ struct MainTabView: View {
 
     private func applyTestHooks() {
         #if DEBUG
-        guard TestHooks.seedSample || TestHooks.importCSV || TestHooks.seedPhotos || TestHooks.seedCustomMap else { return }
+        guard TestHooks.seedSample || TestHooks.importCSV || TestHooks.seedPhotos
+                || TestHooks.seedCustomMap || TestHooks.performanceVisualSeed else { return }
         let hasData = (try? context.fetchCount(FetchDescriptor<FootprintPoint>())) ?? 0
         let photoCount = (try? context.fetchCount(FetchDescriptor<PhotoRecord>())) ?? 0
         // 种子数据只在空库时注入；CSV 导入自带去重，可重复调用
         if TestHooks.seedSample, hasData == 0 {
             TestHooks.seedSampleData(into: context)
+        }
+        if TestHooks.performanceVisualSeed, hasData == 0 {
+            TestHooks.seedPerformanceVisualData(into: context)
         }
         if TestHooks.seedPhotos, photoCount == 0 {
             TestHooks.seedPhotoData(into: context)

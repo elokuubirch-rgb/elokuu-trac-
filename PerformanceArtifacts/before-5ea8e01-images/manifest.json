@@ -1,0 +1,35 @@
+[
+  {
+    "attachments" : [
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "BEB4E72A-8B9D-4778-BB76-D02E0DD04C4D",
+        "deviceName" : "iPhone 17 Pro",
+        "exportedFileName" : "3891C6CD-685C-4874-A0C5-012FC4B0EBCA.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "map-reference-far_0_C1EFF8CF-71A6-4EBA-B5D8-BB34EA5D1975.png",
+        "timestamp" : 1787570193.002
+      },
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "BEB4E72A-8B9D-4778-BB76-D02E0DD04C4D",
+        "deviceName" : "iPhone 17 Pro",
+        "exportedFileName" : "4C42A6C4-C877-4B95-A212-143D1CD40550.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "map-reference-near_0_3DF2F5D9-8E2F-45A3-B21F-3D83B75F2AFC.png",
+        "timestamp" : 1787570190.592
+      },
+      {
+        "configurationName" : "Test Scheme Action",
+        "deviceId" : "BEB4E72A-8B9D-4778-BB76-D02E0DD04C4D",
+        "deviceName" : "iPhone 17 Pro",
+        "exportedFileName" : "509B1023-15B9-4DCF-A603-79049F71A8F6.png",
+        "isAssociatedWithFailure" : false,
+        "suggestedHumanReadableName" : "map-reference-fit_0_70316EE8-0401-4166-A842-9C1057126BF2.png",
+        "timestamp" : 1787570185.83
+      }
+    ],
+    "testIdentifier" : "PerformanceAuditUITests/testMapVisualRegressionReference()",
+    "testIdentifierURL" : "test://com.apple.xcode/LifeFootprints/LifeFootprintsUITests/PerformanceAuditUITests/testMapVisualRegressionReference"
+  }
+]

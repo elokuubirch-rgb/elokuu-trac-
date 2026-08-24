@@ -65,6 +65,9 @@ struct ReviewTabView: View {
     private var theme: AppTheme { AppTheme(rawValue: themeRaw) ?? .crimson }
 
     var body: some View {
+        #if DEBUG
+        let _ = PerformanceDiagnostics.event("ReviewTabView.body")
+        #endif
         ZStack(alignment: .topLeading) {
             switch mode {
             case .overview:
@@ -113,6 +116,7 @@ struct ReviewTabView: View {
         }
         .onAppear {
             #if DEBUG
+            PerformanceDiagnostics.event("ReviewTabView.onAppear")
             MapDebugLog.log("ReviewTabView onAppear（挂载）")
             #endif
             // 即使根协调器保留了旧 session，初始界面也始终是中性总览。
@@ -123,6 +127,9 @@ struct ReviewTabView: View {
             prepareSessionIfNeeded()
         }
         .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
+            #if DEBUG
+            PerformanceDiagnostics.event("dataImported.receive.ReviewTabView")
+            #endif
             // 数据入库只在总览态幂等刷新；正在浏览照片组时绝不打断，也不重洗当前 Session。
             guard case .overview = mode else { return }
             prepareSessionIfNeeded()

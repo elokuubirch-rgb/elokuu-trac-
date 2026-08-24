@@ -95,6 +95,14 @@ struct MapScreen: View {
     @State private var isLoading = false
     @State private var reloadTask: Task<Void, Never>?
 
+    init(chromeHidden: Binding<Bool>, navigation: AppNavigationCoordinator) {
+        #if DEBUG
+        PerformanceDiagnostics.event("MapScreen.init")
+        #endif
+        _chromeHidden = chromeHidden
+        _navigation = Bindable(wrappedValue: navigation)
+    }
+
     private var theme: AppTheme { AppTheme(rawValue: themeRaw) ?? .crimson }
     private var activeCustomSource: CustomMapSource? {
         guard mapTypeRaw.hasPrefix("custom:"),
@@ -177,9 +185,19 @@ struct MapScreen: View {
         let startedAt = CACurrentMediaTime()
         #endif
         Task.detached(priority: .userInitiated) {
+            #if DEBUG
+            let layers = PerformanceDiagnostics.measure(
+                "CanonicalTrajectory.generation",
+                metadata: "snapshots=\(snapshots.count)") {
+                    Self.computeDerivedLayers(
+                        snapshots: snapshots, cutoff: cutoff, scope: scope,
+                        showLines: showLines, showWorkouts: showWorkouts)
+                }
+            #else
             let layers = Self.computeDerivedLayers(
                 snapshots: snapshots, cutoff: cutoff, scope: scope,
                 showLines: showLines, showWorkouts: showWorkouts)
+            #endif
             #if DEBUG
             let ms = (CACurrentMediaTime() - startedAt) * 1000
             #endif
@@ -223,6 +241,21 @@ struct MapScreen: View {
                 filtered, autoSourceVisible: showLines).sorted { $0.t < $1.t },
             workout: true)
 
+        #if DEBUG
+        let logicalTrajectoryCount = Set(filtered.compactMap(\.trajectoryID)).count
+        let trajectorySegmentCount = Set(filtered.compactMap(\.segmentID)).count
+        let renderedRoutes = layers.routes + layers.workoutRoutes
+        let renderedPointCount = renderedRoutes.reduce(0) { $0 + $1.coords.count }
+        PerformanceDiagnostics.count("renderGeometry.rawPointCount", by: filtered.count)
+        PerformanceDiagnostics.count("renderGeometry.renderPointCount", by: renderedPointCount)
+        PerformanceDiagnostics.count("MapPresentation.logicalTrajectoryCount",
+                                     by: logicalTrajectoryCount)
+        PerformanceDiagnostics.count("MapPresentation.trajectorySegmentCount",
+                                     by: trajectorySegmentCount)
+        PerformanceDiagnostics.count("MapPresentation.renderedGeometryCount",
+                                     by: renderedRoutes.count)
+        #endif
+
         let dotSnapshots = MapLayerSemantics.footprintDots(
             visible, workoutSourceVisible: showWorkouts)
         let buckets = freqBuckets(of: dotSnapshots)
@@ -234,6 +267,26 @@ struct MapScreen: View {
         }
         layers.dots = dots
         return layers
+    }
+
+    nonisolated private static func snapshot(
+        from resolved: ResolvedTrajectoryPoint
+    ) -> FootprintSnapshot {
+        let source: String
+        switch resolved.source {
+        case .healthWorkout: source = FootprintSource.health.rawValue
+        case .coreLocation: source = FootprintSource.gps.rawValue
+        case .imported: source = FootprintSource.csv.rawValue
+        case .inferred: source = FootprintSource.manual.rawValue
+        }
+        return FootprintSnapshot(
+            lat: resolved.point.latitude, lon: resolved.point.longitude,
+            t: resolved.point.timestamp, source: source,
+            trajectoryID: resolved.trajectoryID, sessionID: resolved.sessionID,
+            segmentID: resolved.segmentID,
+            isSuppressedDuplicate: resolved.suppressedByTrajectoryID != nil,
+            suppressedBySource: resolved.suppressedBySource?.rawValue,
+            originalPointID: resolved.point.id)
     }
 
     /// 频次表（每次构建一次，调用方持有）
@@ -356,6 +409,7 @@ struct MapScreen: View {
 
     var body: some View {
         #if DEBUG
+        let _ = PerformanceDiagnostics.event("MapScreen.body")
         let _ = bodyDiag.tick()
         #endif
         ZStack(alignment: .top) {
@@ -388,6 +442,9 @@ struct MapScreen: View {
                 onDoubleTap: toggleChrome)
             .ignoresSafeArea(edges: .all)
             .onAppear {
+                #if DEBUG
+                PerformanceDiagnostics.event("MapScreen.mapView.onAppear")
+                #endif
                 // 仅首次出现时定位到数据全貌（防止每次切回标签页都跳镜头）
                 if !hasPositioned {
                     cameraCommand = .region(autoRegion, animated: false)
@@ -396,9 +453,18 @@ struct MapScreen: View {
                 MapDebugLog.log("onAppear: location=\(String(describing: LocationService.shared.location?.coordinate.latitude)) 快照=\(pointSnapshots.count) 标记=\(clusterMarkers.count)")
                 #endif
             }
-            .task { LocationService.shared.start() }
+            .task {
+                #if DEBUG
+                PerformanceDiagnostics.event("MapScreen.task.locationStart")
+                #endif
+                LocationService.shared.start()
+            }
             .onReceive(NotificationCenter.default.publisher(for: .photoRegionsUpdated)) { _ in
                 // 逆地理有进展 → 重载快照，照片标记渐进出现
+                #if DEBUG
+                PerformanceDiagnostics.event("photoRegionsUpdated.receive.MapScreen")
+                PerformanceDiagnostics.count("MapScreen.reload.requested")
+                #endif
                 scheduleReload()
             }
 
@@ -544,6 +610,9 @@ struct MapScreen: View {
         }
 
         .onAppear {
+            #if DEBUG
+            PerformanceDiagnostics.event("MapScreen.onAppear")
+            #endif
             let loadedSources = MapSourceStore.load()
             customMapSources = loadedSources
             // 内置专业等高线已下架；旧版本若停留在该图层，平滑回退标准地图。
@@ -580,6 +649,10 @@ struct MapScreen: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
             // 足迹/照片入库完成 → 重载快照（替代主线程 @Query 监听）
+            #if DEBUG
+            PerformanceDiagnostics.event("dataImported.receive.MapScreen")
+            PerformanceDiagnostics.count("MapScreen.reload.requested")
+            #endif
             TrajectoryResolutionCache.shared.invalidate()
             scheduleReload()
         }
@@ -592,6 +665,11 @@ struct MapScreen: View {
                !loadedSources.contains(where: { $0.id == selectedID }) {
                 mapTypeRaw = "standard"
             }
+        }
+        .onDisappear {
+            #if DEBUG
+            PerformanceDiagnostics.event("MapScreen.onDisappear")
+            #endif
         }
     }
 
@@ -829,6 +907,10 @@ struct MapScreen: View {
     private func loadSnapshots() {
         guard !isLoading else { return }
         isLoading = true
+        #if DEBUG
+        PerformanceDiagnostics.event("MapScreen.loadSnapshots.start")
+        PerformanceDiagnostics.count("MapScreen.rebuild.started")
+        #endif
         let container = context.container
         let selectedScope = timeScope
         Task.detached(priority: .userInitiated) {
@@ -836,10 +918,27 @@ struct MapScreen: View {
             pointContext.autosaveEnabled = false
 
             // 阶段 1：只读取足迹，先让地图可交互；照片聚合随后渐进出现。
+            #if DEBUG
+            let ptRows = PerformanceDiagnostics.measure(
+                "SwiftData.footprint.fetch") {
+                    (try? pointContext.fetch(FetchDescriptor<FootprintPoint>(
+                        sortBy: [SortDescriptor(\.timestamp)]))) ?? []
+                }
+            let snaps: [FootprintSnapshot] = PerformanceDiagnostics.measure(
+                "FootprintSnapshot.build", metadata: "rows=\(ptRows.count)") {
+                    ptRows.map {
+                        let id = TrajectorySampleIdentity.footprint(
+                            source: $0.sourceRaw, latitude: $0.latitude,
+                            longitude: $0.longitude, timestamp: $0.timestamp)
+                        return FootprintSnapshot(lat: $0.latitude, lon: $0.longitude,
+                                                 t: $0.timestamp, source: $0.sourceRaw,
+                                                 originalPointID: id)
+                    }
+                }
+            #else
             let ptRows = (try? pointContext.fetch(FetchDescriptor<FootprintPoint>(
                 sortBy: [SortDescriptor(\.timestamp)]))) ?? []
-            let snaps: [FootprintSnapshot] = ptRows
-                .map {
+            let snaps: [FootprintSnapshot] = ptRows.map {
                     let id = TrajectorySampleIdentity.footprint(
                         source: $0.sourceRaw, latitude: $0.latitude,
                         longitude: $0.longitude, timestamp: $0.timestamp)
@@ -847,29 +946,35 @@ struct MapScreen: View {
                                              t: $0.timestamp, source: $0.sourceRaw,
                                              originalPointID: id)
                 }
+            #endif
             let trajectoryResolution = try? TrajectoryRepository(container: container).loadResolved()
+            #if DEBUG
+            PerformanceDiagnostics.count("Dataset.footprintRows", by: ptRows.count)
+            #endif
             let trajectorySnaps: [FootprintSnapshot]
             if let trajectoryResolution {
-                trajectorySnaps = trajectoryResolution.points.map { resolved in
-                    let source: String
-                    switch resolved.source {
-                    case .healthWorkout: source = FootprintSource.health.rawValue
-                    case .coreLocation: source = FootprintSource.gps.rawValue
-                    case .imported: source = FootprintSource.csv.rawValue
-                    case .inferred: source = FootprintSource.manual.rawValue
+                #if DEBUG
+                trajectorySnaps = PerformanceDiagnostics.measure(
+                    "ResolvedSnapshot.build",
+                    metadata: "points=\(trajectoryResolution.points.count)") {
+                        trajectoryResolution.points.map { resolved in
+                            Self.snapshot(from: resolved)
+                        }
                     }
-                    return FootprintSnapshot(
-                        lat: resolved.point.latitude, lon: resolved.point.longitude,
-                        t: resolved.point.timestamp, source: source,
-                        trajectoryID: resolved.trajectoryID, sessionID: resolved.sessionID,
-                        segmentID: resolved.segmentID,
-                        isSuppressedDuplicate: resolved.suppressedByTrajectoryID != nil,
-                        suppressedBySource: resolved.suppressedBySource?.rawValue,
-                        originalPointID: resolved.point.id)
-                }
+                #else
+                trajectorySnaps = trajectoryResolution.points.map { Self.snapshot(from: $0) }
+                #endif
             } else {
+                #if DEBUG
+                let workoutRows = PerformanceDiagnostics.measure(
+                    "SwiftData.routePoint.fallbackFetch") {
+                        (try? pointContext.fetch(FetchDescriptor<WorkoutRoutePoint>(
+                            sortBy: [SortDescriptor(\.timestamp)]))) ?? []
+                    }
+                #else
                 let workoutRows = (try? pointContext.fetch(FetchDescriptor<WorkoutRoutePoint>(
                     sortBy: [SortDescriptor(\.timestamp)]))) ?? []
+                #endif
                 let workoutSnaps = workoutRows.map {
                     FootprintSnapshot(lat: $0.latitude, lon: $0.longitude, t: $0.timestamp,
                                       source: FootprintSource.health.rawValue,
@@ -911,12 +1016,31 @@ struct MapScreen: View {
 
             let snapCount = snaps.count
             await MainActor.run {
+                #if DEBUG
+                let mainCommitStarted = CACurrentMediaTime()
+                defer {
+                    PerformanceDiagnostics.recordDuration(
+                        "MapScreen.phase1.mainCommit",
+                        milliseconds: (CACurrentMediaTime() - mainCommitStarted) * 1_000,
+                        mainThread: true)
+                }
+                #endif
                 reloadVersion += 1
+                #if DEBUG
+                SnapshotCache.pointSnapshots = PerformanceDiagnostics.measure(
+                    "FootprintSnapshot.sort.cache") { displaySnaps.sorted { $0.t < $1.t } }
+                #else
                 SnapshotCache.pointSnapshots = displaySnaps.sorted { $0.t < $1.t }
+                #endif
                 SnapshotCache.monthStarts = months
                 SnapshotCache.stats = completedStats
                 SnapshotCache.dataRegion = region
+                #if DEBUG
+                pointSnapshots = PerformanceDiagnostics.measure(
+                    "FootprintSnapshot.sort.state") { displaySnaps.sorted { $0.t < $1.t } }
+                #else
                 pointSnapshots = displaySnaps.sorted { $0.t < $1.t }
+                #endif
                 monthStarts = months
                 statsCache = completedStats
                 dataRegion = region
@@ -935,6 +1059,9 @@ struct MapScreen: View {
                     cameraCommand = .region(region ?? autoRegion, animated: false)
                 }
                 withAnimation(.easeOut(duration: 0.3)) { ready = true }
+                #if DEBUG
+                PerformanceDiagnostics.event("mapSnapshotReady.post.MapScreen")
+                #endif
                 NotificationCenter.default.post(name: .mapSnapshotReady, object: nil)
                 appLog.info("[Load] 首屏快照就绪：足迹\(snapCount)，照片聚合转入后台")
             }
@@ -942,9 +1069,17 @@ struct MapScreen: View {
             // 阶段 2：照片索引不再阻塞 Logo 消失和地图首屏。
             let photoContext = ModelContext(container)
             photoContext.autosaveEnabled = false
+            #if DEBUG
+            let allPhotoRows = PerformanceDiagnostics.measure("SwiftData.photo.fetch") {
+                (try? photoContext.fetch(FetchDescriptor<PhotoRecord>())) ?? []
+            }
+            #else
             let allPhotoRows = (try? photoContext.fetch(FetchDescriptor<PhotoRecord>())) ?? []
+            #endif
             let phRows = allPhotoRows.filter { selectedScope.contains($0.timestamp) }
             #if DEBUG
+            PerformanceDiagnostics.count("Dataset.photoRows", by: allPhotoRows.count)
+            PerformanceDiagnostics.count("Dataset.filteredPhotoRows", by: phRows.count)
             let photoRowTotal = phRows.count
             let photoRegionTotal = phRows.filter { $0.regionState == 1 }.count
             #else
@@ -982,8 +1117,28 @@ struct MapScreen: View {
                                       segmentID: $0.segmentID)
                 }
             }
+            #if DEBUG
+            let trailIndex = PerformanceDiagnostics.measure(
+                "TrailIndex.build", metadata: "points=\(trailPoints.count)") {
+                    TrailIndex(points: trailPoints)
+                }
+            #else
             let trailIndex = TrailIndex(points: trailPoints)
+            #endif
             var snapExact = 0, snapSnap = 0, snapInterp = 0, snapKept = 0
+            #if DEBUG
+            let clIndex = PerformanceDiagnostics.measure(
+                "PhotoCluster.generation", metadata: "photos=\(phRows.count)") {
+                    ClusterIndex.build(records: phRows, trails: trailIndex, onSnap: { r in
+                        switch r.kind {
+                        case .exact: snapExact += 1
+                        case .snapped: snapSnap += 1
+                        case .interpolated: snapInterp += 1
+                        case .kept: snapKept += 1
+                        }
+                    })
+                }
+            #else
             let clIndex = ClusterIndex.build(records: phRows, trails: trailIndex, onSnap: { r in
                 switch r.kind {
                 case .exact: snapExact += 1
@@ -992,6 +1147,7 @@ struct MapScreen: View {
                 case .kept: snapKept += 1
                 }
             })
+            #endif
             let clProvince = clIndex.province.count
             let clCity = clIndex.city.count
             let clDistrict = clIndex.district.count
@@ -1005,6 +1161,15 @@ struct MapScreen: View {
             appLog.info("[Load] 照片聚合就绪：省\(clProvince)/市\(clCity)/区\(clDistrict)/点\(clSpot)")
 
             await MainActor.run {
+                #if DEBUG
+                let mainCommitStarted = CACurrentMediaTime()
+                defer {
+                    PerformanceDiagnostics.recordDuration(
+                        "MapScreen.phase2.mainCommit",
+                        milliseconds: (CACurrentMediaTime() - mainCommitStarted) * 1_000,
+                        mainThread: true)
+                }
+                #endif
                 // 照片聚合索引不改变派生图层（点/线由 phase 1 数据驱动），
                 // 不再 bump reloadVersion，避免每次加载触发两轮无意义重算。
                 SnapshotCache.clusterIndex = clIndex
@@ -1024,6 +1189,9 @@ struct MapScreen: View {
                 }
                 #endif
                 isLoading = false
+                #if DEBUG
+                PerformanceDiagnostics.event("MapScreen.loadSnapshots.complete")
+                #endif
                 applyTestHooks(markerCount: clusterMarkers.count, sliderMax: count)
             }
         }
@@ -1032,9 +1200,15 @@ struct MapScreen: View {
     /// 数据变化后防抖重载
     private func scheduleReload() {
         reloadTask?.cancel()
+        #if DEBUG
+        PerformanceDiagnostics.count("MapScreen.reload.debounceScheduled")
+        #endif
         reloadTask = Task {
             try? await Task.sleep(nanoseconds: 900_000_000)
             guard !Task.isCancelled else { return }
+            #if DEBUG
+            PerformanceDiagnostics.count("MapScreen.reload.debounceFired")
+            #endif
             loadSnapshots()
         }
     }

@@ -27,6 +27,9 @@ struct SettingsScreen: View {
     @State private var healthStatus = HealthKitSyncSnapshot.empty
 
     var body: some View {
+        #if DEBUG
+        let _ = PerformanceDiagnostics.event("SettingsScreen.body")
+        #endif
         NavigationStack {
             List {
                 Section("数据来源") {
@@ -275,21 +278,39 @@ struct SettingsScreen: View {
             }
         }
         .preferredColorScheme(.dark)
-        .onAppear(perform: refreshSourceCounts)
+        .onAppear {
+            #if DEBUG
+            PerformanceDiagnostics.event("SettingsScreen.onAppear")
+            PerformanceDiagnostics.endTransition("Stats->Settings")
+            #endif
+            refreshSourceCounts()
+        }
         .onAppear(perform: refreshHealthStatus)
         .onAppear { customMapSources = MapSourceStore.load() }
         .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
             refreshSourceCounts()
         }
         .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
+            #if DEBUG
+            PerformanceDiagnostics.event("dataImported.receive.SettingsScreen")
+            #endif
             refreshSourceCounts()
             refreshHealthStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: .healthKitSyncStatusChanged)) { _ in
+            #if DEBUG
+            PerformanceDiagnostics.event("HealthKit.status.receive.SettingsScreen")
+            #endif
             refreshHealthStatus()
         }
         .onReceive(NotificationCenter.default.publisher(for: .mapSourcesChanged)) { _ in
             customMapSources = MapSourceStore.load()
+        }
+        .onDisappear {
+            #if DEBUG
+            PerformanceDiagnostics.event("SettingsScreen.onDisappear")
+            PerformanceDiagnostics.endTransition("Settings->Stats")
+            #endif
         }
     }
 
@@ -398,7 +419,13 @@ struct SettingsScreen: View {
     }
 
     private func refreshHealthStatus() {
+        #if DEBUG
+        healthStatus = PerformanceDiagnostics.measure("Settings.healthStatus.refresh") {
+            HealthKitSyncStatusStore.snapshot(container: context.container)
+        }
+        #else
         healthStatus = HealthKitSyncStatusStore.snapshot(container: context.container)
+        #endif
     }
 
     private func exportCSV() {
@@ -406,8 +433,22 @@ struct SettingsScreen: View {
     }
 
     private func refreshSourceCounts() {
+        #if DEBUG
+        let result = PerformanceDiagnostics.measure(
+            "Settings.sourceCounts", metadata: "snapshots=\(SnapshotCache.pointSnapshots.count)") {
+                Self.sourceCounts(from: SnapshotCache.pointSnapshots)
+            }
+        #else
+        let result = Self.sourceCounts(from: SnapshotCache.pointSnapshots)
+        #endif
+        sourceCounts = result
+    }
+
+    private static func sourceCounts(
+        from points: [FootprintSnapshot]
+    ) -> (photo: Int, csv: Int, manual: Int, gps: Int, health: Int) {
         var result = (photo: 0, csv: 0, manual: 0, gps: 0, health: 0)
-        for point in SnapshotCache.pointSnapshots {
+        for point in points {
             switch point.source {
             case FootprintSource.photo.rawValue: result.photo += 1
             case FootprintSource.csv.rawValue: result.csv += 1
@@ -417,7 +458,7 @@ struct SettingsScreen: View {
             default: break
             }
         }
-        sourceCounts = result
+        return result
     }
 
     private func handleImport(_ result: Result<[URL], Error>) {
