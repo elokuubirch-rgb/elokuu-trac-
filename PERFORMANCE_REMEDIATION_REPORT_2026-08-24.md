@@ -80,6 +80,14 @@
 
 阶段证据：Build Passed；Xcode unit 12/12 Passed（含 exact-revision round-trip、revision mismatch miss、模拟重启后删除 raw 仍命中缓存）；Core 139/139 Passed；地图三缩放级 UI 回归 1/1 Passed；`git diff --check` Passed。
 
+### Commit 06 — collapse three-stroke map overlay amplification
+
+- 每条逻辑路线从 3 个 `MKPolyline` / overlay / renderer 降为 1 个；单个 `ProfessionalPolylineRenderer` 共享一份 map-point geometry，并按 MapKit `zoomScale` 以原始 point 线宽完成三次 stroke。
+- casing / glow / core 的颜色、alpha、线宽、round cap、round join、overlay level 与路线间绘制顺序保持不变；轨迹开关仍只切 renderer alpha。
+- 900 条逻辑路线的 presentation 对象由 2,700 个 polyline/overlay 降至 900 个，不减少任何路线或坐标。
+
+阶段证据：Build Passed；Xcode unit 13/13 Passed（含 900 logical routes → 900 overlays 与三层原始 style 参数断言）；Core 139/139 Passed；同一 iPhone 17 Pro 模拟器、同一 seeded dataset 的 fit / near / far 三缩放级 UI 回归 1/1 Passed，并逐图核验路线完整性、线宽、casing、glow、core 与照片锚点无可感知变化；`git diff --check` Passed。
+
 ## 3. Before / After
 
 待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。

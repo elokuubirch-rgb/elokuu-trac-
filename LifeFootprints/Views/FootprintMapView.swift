@@ -808,16 +808,91 @@ final class FootprintDotsRenderer: MKOverlayRenderer {
     }
 }
 
-// MARK: - 折线样式表（MKPolyline 无法携带属性，用标识映射）
+// MARK: - 专业路线 overlay（一条逻辑路线只创建一个 MKPolyline）
 
-struct MapLineStyle {
-    var alpha: CGFloat
-    var width: CGFloat
-    var tag: Int   // 0=历史轨迹线 1=实时轨迹光晕 2=实时轨迹实线
-    var tone: Tone = .theme
+struct MapLineStrokeStyle: Equatable {
+    let alpha: CGFloat
+    let width: CGFloat
+    let tone: Tone
 
-    enum Tone {
+    enum Tone: Equatable {
         case casing, glow, theme
+    }
+}
+
+struct ProfessionalLineStyle: Equatable {
+    let tag: Int // 0=历史轨迹，1=实时轨迹，3=Health workout
+    let casing: MapLineStrokeStyle
+    let glow: MapLineStrokeStyle
+    let core: MapLineStrokeStyle
+
+    static func make(alpha: CGFloat, width: CGFloat, tag: Int) -> Self {
+        Self(
+            tag: tag,
+            casing: MapLineStrokeStyle(
+                alpha: tag == 0 ? 0.34 : min(0.82, 0.5 + alpha * 0.3),
+                width: tag == 0 ? width + 2.4 : width + 4.2,
+                tone: .casing),
+            glow: MapLineStrokeStyle(
+                alpha: tag == 0 ? 0.05 : 0.12 + alpha * 0.08,
+                width: tag == 0 ? width + 4 : width + 8,
+                tone: .glow),
+            core: MapLineStrokeStyle(
+                alpha: tag == 0 ? min(alpha, 0.52) : max(alpha, 0.82),
+                width: tag == 0 ? min(width, 2.0) : max(width, 2.8),
+                tone: .theme))
+    }
+}
+
+enum MapOverlayAmplificationPolicy {
+    static func polylineCount(forLogicalRouteCount count: Int) -> Int { count }
+}
+
+/// 一个 overlay / 一份 map-point geometry / 一个 renderer；按 MapKit zoomScale
+/// 把原始 point 线宽换算到绘图坐标，依次绘制 casing、glow、core。
+final class ProfessionalPolylineRenderer: MKOverlayPathRenderer {
+    private let polyline: MKPolyline
+    private let style: ProfessionalLineStyle
+    private let themeColor: UIColor
+
+    init(polyline: MKPolyline, style: ProfessionalLineStyle, themeColor: UIColor) {
+        self.polyline = polyline
+        self.style = style
+        self.themeColor = themeColor
+        super.init(overlay: polyline)
+    }
+
+    override func createPath() {
+        guard polyline.pointCount >= 2 else { return }
+        let mapPoints = polyline.points()
+        let routePath = CGMutablePath()
+        routePath.move(to: point(for: mapPoints[0]))
+        for index in 1..<polyline.pointCount {
+            routePath.addLine(to: point(for: mapPoints[index]))
+        }
+        path = routePath
+    }
+
+    override func draw(_ mapRect: MKMapRect, zoomScale: MKZoomScale,
+                       in context: CGContext) {
+        guard let routePath = path else { return }
+        for stroke in [style.casing, style.glow, style.core] {
+            context.saveGState()
+            // MKOverlayPathRenderer 的 path stroke 以中心线两侧展开；换算自原先
+            // MKPolylineRenderer.lineWidth，style 中的用户可见宽度参数保持原值。
+            lineWidth = stroke.width / 2
+            lineCap = .round
+            lineJoin = .round
+            switch stroke.tone {
+            case .casing:
+                strokeColor = UIColor.black.withAlphaComponent(stroke.alpha)
+            case .glow, .theme:
+                strokeColor = themeColor.withAlphaComponent(stroke.alpha)
+            }
+            applyStrokeProperties(to: context, atZoomScale: zoomScale)
+            strokePath(routePath, in: context)
+            context.restoreGState()
+        }
     }
 }
 
@@ -962,9 +1037,7 @@ struct FootprintMapView: UIViewRepresentable {
             }
             if showLines != c.lastShowLines {
                 c.lastShowLines = showLines
-                // 真实数据下每条路线包含描边/光晕/主线三个 overlay。
-                // 开关时若整批删除再创建会产生巨大瞬时内存峰值，
-                // 只切换已有 renderer 的 alpha，即时且不分配新路线。
+                // 一个 renderer 内保留描边/光晕/主线三次 stroke；开关只改 alpha。
                 setHistoricalLinesVisible(showLines, on: mapView, context: c)
             }
             if showWorkouts != c.lastShowWorkouts {
@@ -1067,7 +1140,8 @@ struct FootprintMapView: UIViewRepresentable {
         PerformanceDiagnostics.count("MapPresentation.logicalRouteCount",
                                      by: routes.count + workoutRoutes.count)
         PerformanceDiagnostics.count("MapPresentation.expectedPolylineCount",
-                                     by: (routes.count + workoutRoutes.count) * 3)
+                                     by: MapOverlayAmplificationPolicy.polylineCount(
+                                        forLogicalRouteCount: routes.count + workoutRoutes.count))
         #endif
         // 等高线瓦片是底图，数据重建时不应被清理。
         let removed = mapView.overlays.filter { !($0 is MKTileOverlay) }
@@ -1206,43 +1280,20 @@ struct FootprintMapView: UIViewRepresentable {
         addProfessionalLine(track, alpha: 1, width: 4, tag: 1, to: mapView, context: c)
     }
 
-    /// 专业运动地图三层轨迹：深色隔离描边、克制光晕、清晰主题色核心。
+    /// 专业运动地图三次 stroke：视觉参数与顺序不变，但只创建一个 MKPolyline/overlay。
     private func addProfessionalLine(_ coordinates: [CLLocationCoordinate2D], alpha: CGFloat,
                                      width: CGFloat, tag: Int, to mapView: MKMapView,
                                      context c: MapCoordinator) {
         guard coordinates.count >= 2 else { return }
-        let casing = MKPolyline(coordinates: coordinates, count: coordinates.count)
+        let polyline = MKPolyline(coordinates: coordinates, count: coordinates.count)
         #if DEBUG
         PerformanceDiagnostics.count("MapKit.polyline.create")
         PerformanceDiagnostics.count("MapKit.overlays.add")
         c.diagnosticMutationCount += 1
         #endif
-        c.overlayStyles[ObjectIdentifier(casing)] = MapLineStyle(
-            alpha: tag == 0 ? 0.34 : min(0.82, 0.5 + alpha * 0.3),
-            width: tag == 0 ? width + 2.4 : width + 4.2, tag: tag, tone: .casing)
-        mapView.addOverlay(casing, level: .aboveLabels)
-
-        let glow = MKPolyline(coordinates: coordinates, count: coordinates.count)
-        #if DEBUG
-        PerformanceDiagnostics.count("MapKit.polyline.create")
-        PerformanceDiagnostics.count("MapKit.overlays.add")
-        c.diagnosticMutationCount += 1
-        #endif
-        c.overlayStyles[ObjectIdentifier(glow)] = MapLineStyle(
-            alpha: tag == 0 ? 0.05 : 0.12 + alpha * 0.08,
-            width: tag == 0 ? width + 4 : width + 8, tag: tag, tone: .glow)
-        mapView.addOverlay(glow, level: .aboveLabels)
-
-        let core = MKPolyline(coordinates: coordinates, count: coordinates.count)
-        #if DEBUG
-        PerformanceDiagnostics.count("MapKit.polyline.create")
-        PerformanceDiagnostics.count("MapKit.overlays.add")
-        c.diagnosticMutationCount += 1
-        #endif
-        c.overlayStyles[ObjectIdentifier(core)] = MapLineStyle(
-            alpha: tag == 0 ? min(alpha, 0.52) : max(alpha, 0.82),
-            width: tag == 0 ? min(width, 2.0) : max(width, 2.8), tag: tag, tone: .theme)
-        mapView.addOverlay(core, level: .aboveLabels)
+        c.overlayStyles[ObjectIdentifier(polyline)] = .make(
+            alpha: alpha, width: width, tag: tag)
+        mapView.addOverlay(polyline, level: .aboveLabels)
     }
 
     /// 与 SwiftUI 版一致的频次样式
@@ -1283,7 +1334,7 @@ final class MapCoordinator: NSObject, MKMapViewDelegate {
     var lastTrackCount = -1
     var lastCamera: MapCameraCommand = .none
     var lastRegionTime = Date.distantPast
-    var overlayStyles: [ObjectIdentifier: MapLineStyle] = [:]
+    var overlayStyles: [ObjectIdentifier: ProfessionalLineStyle] = [:]
     /// 标记画布（点 + 照片聚合）
     var canvas: MarkerCanvasView?
     /// 原生足迹点覆盖层，与 MapKit 底图共用变换。
@@ -1344,18 +1395,11 @@ final class MapCoordinator: NSObject, MKMapViewDelegate {
             return FootprintDotsRenderer(overlay: dots, color: parent.themeColor)
         }
         if overlay is MKPolyline {
-            let style = overlayStyles[ObjectIdentifier(overlay)] ?? MapLineStyle(alpha: 0.6, width: 2, tag: 0)
-            let r = MKPolylineRenderer(polyline: overlay as! MKPolyline)
-            switch style.tone {
-            case .casing:
-                r.strokeColor = UIColor.black.withAlphaComponent(style.alpha)
-            case .glow, .theme:
-                r.strokeColor = parent.themeColor.withAlphaComponent(style.alpha)
-            }
-            r.lineWidth = style.width
-            r.lineCap = .round
-            r.lineJoin = .round
-            return r
+            let style = overlayStyles[ObjectIdentifier(overlay)]
+                ?? .make(alpha: 0.6, width: 2, tag: 0)
+            return ProfessionalPolylineRenderer(
+                polyline: overlay as! MKPolyline,
+                style: style, themeColor: parent.themeColor)
         }
         return MKOverlayRenderer(overlay: overlay)
     }

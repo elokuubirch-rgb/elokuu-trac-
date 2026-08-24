@@ -62,6 +62,28 @@ final class TrajectoryAndHealthTests: XCTestCase {
         XCTAssertNil(cache.load(dataRevision: 42))
     }
 
+    func testProfessionalLineUsesOneOverlayAndPreservesThreeStrokeParameters() {
+        let historical = ProfessionalLineStyle.make(alpha: 0.8, width: 2.6, tag: 0)
+        XCTAssertEqual(MapOverlayAmplificationPolicy.polylineCount(forLogicalRouteCount: 900), 900)
+        XCTAssertEqual(historical.casing.alpha, 0.34, accuracy: 0.0001)
+        XCTAssertEqual(historical.casing.width, 5.0, accuracy: 0.0001)
+        XCTAssertEqual(historical.casing.tone, .casing)
+        XCTAssertEqual(historical.glow.alpha, 0.05, accuracy: 0.0001)
+        XCTAssertEqual(historical.glow.width, 6.6, accuracy: 0.0001)
+        XCTAssertEqual(historical.glow.tone, .glow)
+        XCTAssertEqual(historical.core.alpha, 0.52, accuracy: 0.0001)
+        XCTAssertEqual(historical.core.width, 2.0, accuracy: 0.0001)
+        XCTAssertEqual(historical.core.tone, .theme)
+
+        let workout = ProfessionalLineStyle.make(alpha: 1, width: 4.2, tag: 3)
+        XCTAssertEqual(workout.casing.alpha, 0.8, accuracy: 0.0001)
+        XCTAssertEqual(workout.casing.width, 8.4, accuracy: 0.0001)
+        XCTAssertEqual(workout.glow.alpha, 0.2, accuracy: 0.0001)
+        XCTAssertEqual(workout.glow.width, 12.2, accuracy: 0.0001)
+        XCTAssertEqual(workout.core.alpha, 1, accuracy: 0.0001)
+        XCTAssertEqual(workout.core.width, 4.2, accuracy: 0.0001)
+    }
+
     @MainActor
     func testRepositoryRestartUsesPersistentCacheWithoutRawFetch() throws {
         let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
