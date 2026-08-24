@@ -61,6 +61,16 @@
 
 阶段验证：Build Passed；Xcode unit 8/8 Passed（含 3 点/2 segment 迁移及二次 no-op）；Core 139/139 Passed；地图三缩放级 UI 回归 1/1 Passed；`git diff --check` Passed。
 
+### Commit 04 — optimize trajectory persistence read path
+
+- `TrajectoryRepository` 不再一次性 fetch 全部 `WorkoutRoutePoint`；改为按 timestamp、20,000 点一页读取，每页使用独立 `ModelContext`。
+- 新的 streaming accumulator 直接从单页 SwiftData model 构造最终 `TrajectoryPoint` / session / route / segment，避免同时常驻 raw `@Model`、`TrajectorySample` 与 `TrajectoryPoint` 三份 623k 数组。
+- activity type、trajectory/session/route/segment ID、断层规则、quality/confidence 与旧 `TrajectoryBuilder` 逐字段等价。
+- repository 失败的地图 fallback 同样改为分页，不保留第二条全表 materialization 路径。
+- HealthKit 删除按目标 workout 查询，移除删除路径的无条件 route-point 全表 fetch。
+
+阶段证据：Build Passed；Xcode unit 10/10 Passed，其中 streaming accumulator 与旧 builder 等价测试 Passed，20,005 点跨页 repository 测试 Passed（1 条 trajectory、1 segment、20,005 点完整且末点 index=20,004）；Core 139/139 Passed；地图三缩放级 UI 回归 1/1 Passed；`git diff --check` Passed。623,384 点真机 after 数据：Not measured，待最终真机复测。
+
 ## 3. Before / After
 
 待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。

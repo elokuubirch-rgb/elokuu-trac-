@@ -146,4 +146,83 @@ final class TrajectoryAndHealthTests: XCTestCase {
         XCTAssertTrue(second.alreadyComplete)
         XCTAssertEqual(second.migratedPoints, 0)
     }
+
+    func testStreamingWorkoutAccumulatorMatchesCanonicalBuilder() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let values = [
+            WorkoutRoutePointValue(workoutID: "a", routeID: "a-1", latitude: 31,
+                                   longitude: 121, altitude: 10, timestamp: base,
+                                   horizontalAccuracy: 5, speed: 1, course: 20),
+            WorkoutRoutePointValue(workoutID: "b", routeID: "b-1", latitude: 32,
+                                   longitude: 120, altitude: 20,
+                                   timestamp: base.addingTimeInterval(10),
+                                   horizontalAccuracy: nil, speed: nil, course: nil),
+            WorkoutRoutePointValue(workoutID: "a", routeID: "a-1", latitude: 31.001,
+                                   longitude: 121.001, altitude: 11,
+                                   timestamp: base.addingTimeInterval(30),
+                                   horizontalAccuracy: 7, speed: 1, course: 30),
+            WorkoutRoutePointValue(workoutID: "a", routeID: "a-2", latitude: 31.002,
+                                   longitude: 121.002, altitude: 12,
+                                   timestamp: base.addingTimeInterval(40),
+                                   horizontalAccuracy: 8, speed: 1, course: 40),
+            WorkoutRoutePointValue(workoutID: "a", routeID: "a-1", latitude: 31.003,
+                                   longitude: 121.003, altitude: 13,
+                                   timestamp: base.addingTimeInterval(3_000),
+                                   horizontalAccuracy: 9, speed: 1, course: 50),
+        ]
+        let activities = ["a": "walking", "b": "cycling"]
+        let samples = values.enumerated().map { index, value in
+            TrajectorySample(
+                id: "workout:\(value.workoutID):\(Int64((value.timestamp.timeIntervalSince1970 * 1_000).rounded())):\(index)",
+                source: .healthWorkout, sourceIdentifier: value.workoutID,
+                sessionID: value.workoutID, routeID: value.routeID,
+                activityType: activities[value.workoutID],
+                latitude: value.latitude, longitude: value.longitude,
+                timestamp: value.timestamp, altitude: value.altitude,
+                horizontalAccuracy: value.horizontalAccuracy,
+                speed: value.speed, course: value.course)
+        }
+        let expected = TrajectoryBuilder.build(samples: samples)
+        let accumulator = WorkoutTrajectoryAccumulator(activityByWorkout: activities)
+        for (index, value) in values.enumerated() {
+            accumulator.append(value, globalIndex: index)
+        }
+        XCTAssertEqual(accumulator.finish(), expected)
+    }
+
+    @MainActor
+    func testRepositoryReadsWorkoutPointsAcrossPageBoundary() throws {
+        let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+        let container = try ModelContainer(
+            for: FootprintPoint.self, WorkoutRecord.self,
+            WorkoutRouteRecord.self, WorkoutRoutePoint.self,
+            configurations: configuration)
+        let context = ModelContext(container)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let workoutID = "paged-workout"
+        let routeID = "paged-route"
+        context.insert(WorkoutRecord(
+            healthKitUUID: workoutID, workoutType: "walking",
+            startDate: base, endDate: base.addingTimeInterval(20_005),
+            duration: 20_005, distanceMeters: 20_005, caloriesKCal: 100,
+            elevationGain: 0, routeAvailable: true, routeSyncState: .available))
+        context.insert(WorkoutRouteRecord(routeID: routeID, workoutID: workoutID))
+        for index in 0..<20_005 {
+            context.insert(WorkoutRoutePoint(
+                workoutID: workoutID,
+                latitude: 31 + Double(index) * 0.000001,
+                longitude: 121, altitude: 10,
+                timestamp: base.addingTimeInterval(Double(index)),
+                routeID: routeID, segmentIndex: 0, pointIndex: index,
+                horizontalAccuracy: 5))
+        }
+        try context.save()
+
+        let health = try TrajectoryRepository(container: container).load()
+            .filter { $0.source == .healthWorkout }
+        XCTAssertEqual(health.count, 1)
+        XCTAssertEqual(health[0].segments.count, 1)
+        XCTAssertEqual(health[0].segments[0].points.count, 20_005)
+        XCTAssertTrue(health[0].segments[0].points.last?.id.hasSuffix(":20004") == true)
+    }
 }

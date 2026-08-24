@@ -127,20 +127,26 @@ enum HealthKitService {
         var routeInsertedOrUpdated = false
         var routeDeleted = false
         if !deletedStrings.isEmpty {
-            for row in (try? context.fetch(FetchDescriptor<WorkoutRoutePoint>())) ?? []
-            where deletedStrings.contains(row.workoutID) {
-                context.delete(row)
-                routeDeleted = true
+            for deletedID in deletedStrings {
+                let targetID = deletedID
+                for row in (try? context.fetch(FetchDescriptor<WorkoutRoutePoint>(
+                    predicate: #Predicate { $0.workoutID == targetID }))) ?? [] {
+                    context.delete(row)
+                    routeDeleted = true
+                }
             }
-            for row in (try? context.fetch(FetchDescriptor<WorkoutRouteRecord>())) ?? []
-            where deletedStrings.contains(row.workoutID) {
-                context.delete(row)
-                routeDeleted = true
-            }
-            for row in (try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? []
-            where deletedStrings.contains(row.healthKitUUID) {
-                context.delete(row)
-                workoutDeleted = true
+            for deletedID in deletedStrings {
+                let targetID = deletedID
+                for row in (try? context.fetch(FetchDescriptor<WorkoutRouteRecord>(
+                    predicate: #Predicate { $0.workoutID == targetID }))) ?? [] {
+                    context.delete(row)
+                    routeDeleted = true
+                }
+                for row in (try? context.fetch(FetchDescriptor<WorkoutRecord>(
+                    predicate: #Predicate { $0.healthKitUUID == targetID }))) ?? [] {
+                    context.delete(row)
+                    workoutDeleted = true
+                }
             }
         }
 

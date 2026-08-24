@@ -4,6 +4,7 @@ import SwiftData
 /// SwiftData 只负责提供原始记录；轨迹会话、分段和质量全部由领域 Builder 生成。
 struct TrajectoryRepository {
     let container: ModelContainer
+    private static let routePointBatchSize = 20_000
 
     func load() throws -> [Trajectory] {
         let context = ModelContext(container)
@@ -38,18 +39,12 @@ struct TrajectoryRepository {
                 predicate: #Predicate { $0.sourceRaw == "gps" || $0.sourceRaw == "csv" },
                 sortBy: [SortDescriptor(\.timestamp)]))
         }
-        let workoutRows = try PerformanceDiagnostics.measure("SwiftData.workoutRoutePoint.fetch") {
-            try context.fetch(FetchDescriptor<WorkoutRoutePoint>(
-                sortBy: [SortDescriptor(\.timestamp)]))
-        }
         let workouts = try PerformanceDiagnostics.measure("SwiftData.workout.fetch") {
             try context.fetch(FetchDescriptor<WorkoutRecord>())
         }
         #else
         let footprintRows = try context.fetch(FetchDescriptor<FootprintPoint>(
             predicate: #Predicate { $0.sourceRaw == "gps" || $0.sourceRaw == "csv" },
-            sortBy: [SortDescriptor(\.timestamp)]))
-        let workoutRows = try context.fetch(FetchDescriptor<WorkoutRoutePoint>(
             sortBy: [SortDescriptor(\.timestamp)]))
         let workouts = try context.fetch(FetchDescriptor<WorkoutRecord>())
         #endif
@@ -75,28 +70,107 @@ struct TrajectoryRepository {
                 sessionID: sessionID, latitude: sample.latitude,
                 longitude: sample.longitude, timestamp: sample.timestamp)
         }
-        let workoutSamples = workoutRows.enumerated().map { index, row in
-            TrajectorySample(
-                id: "workout:\(row.workoutID):\(Int64((row.timestamp.timeIntervalSince1970 * 1_000).rounded())):\(index)",
-                source: .healthWorkout, sourceIdentifier: row.workoutID,
-                sessionID: row.workoutID, routeID: row.routeID,
-                activityType: activityByWorkout[row.workoutID],
-                latitude: row.latitude, longitude: row.longitude, timestamp: row.timestamp,
-                altitude: row.altitude, horizontalAccuracy: row.horizontalAccuracy,
-                speed: row.speed, course: row.course)
-        }
+        let workoutResult = try loadWorkoutTrajectories(activityByWorkout: activityByWorkout)
+        let workoutTrajectories = workoutResult.trajectories
         #if DEBUG
-        let trajectories = PerformanceDiagnostics.measure(
-            "TrajectoryBuilder", metadata: "samples=\(autoSamples.count + importedSamples.count + workoutSamples.count)") {
-                TrajectoryBuilder.build(samples: autoSamples + importedSamples + workoutSamples)
+        let footprintTrajectories = PerformanceDiagnostics.measure(
+            "TrajectoryBuilder.footprints",
+            metadata: "samples=\(autoSamples.count + importedSamples.count)") {
+                TrajectoryBuilder.build(samples: autoSamples + importedSamples)
             }
+        let trajectories = (footprintTrajectories + workoutTrajectories)
+            .sorted { $0.startTime < $1.startTime }
         PerformanceDiagnostics.count("Dataset.trajectorySamples",
-                                     by: autoSamples.count + importedSamples.count + workoutSamples.count)
+                                     by: autoSamples.count + importedSamples.count + workoutResult.rowCount)
         PerformanceDiagnostics.count("Dataset.trajectories", by: trajectories.count)
         return trajectories
         #else
-        return TrajectoryBuilder.build(samples: autoSamples + importedSamples + workoutSamples)
+        return (TrajectoryBuilder.build(samples: autoSamples + importedSamples)
+                + workoutTrajectories).sorted { $0.startTime < $1.startTime }
         #endif
+    }
+
+    private func loadWorkoutTrajectories(
+        activityByWorkout: [String: String]
+    ) throws -> (trajectories: [Trajectory], rowCount: Int) {
+        let accumulator = WorkoutTrajectoryAccumulator(activityByWorkout: activityByWorkout)
+        var offset = 0
+        var batchCount = 0
+        #if DEBUG
+        let started = CFAbsoluteTimeGetCurrent()
+        #endif
+        while true {
+            let pageContext = ModelContext(container)
+            pageContext.autosaveEnabled = false
+            var descriptor = FetchDescriptor<WorkoutRoutePoint>(
+                sortBy: [SortDescriptor(\.timestamp)])
+            descriptor.fetchLimit = Self.routePointBatchSize
+            descriptor.fetchOffset = offset
+            #if DEBUG
+            let rows = try PerformanceDiagnostics.measure(
+                "SwiftData.workoutRoutePoint.fetch.batch",
+                metadata: "offset=\(offset) limit=\(Self.routePointBatchSize)") {
+                    try pageContext.fetch(descriptor)
+                }
+            #else
+            let rows = try pageContext.fetch(descriptor)
+            #endif
+            guard !rows.isEmpty else { break }
+            autoreleasepool {
+                for (localIndex, row) in rows.enumerated() {
+                    accumulator.append(WorkoutRoutePointValue(
+                        workoutID: row.workoutID, routeID: row.routeID,
+                        latitude: row.latitude, longitude: row.longitude,
+                        altitude: row.altitude, timestamp: row.timestamp,
+                        horizontalAccuracy: row.horizontalAccuracy,
+                        speed: row.speed, course: row.course),
+                        globalIndex: offset + localIndex)
+                }
+            }
+            offset += rows.count
+            batchCount += 1
+            #if DEBUG
+            PerformanceDiagnostics.count("SwiftData.workoutRoutePoint.fetch.batchCount")
+            PerformanceDiagnostics.count("SwiftData.workoutRoutePoint.fetch.batchModelsMaterialized",
+                                         by: rows.count)
+            #endif
+            if rows.count < Self.routePointBatchSize { break }
+        }
+        #if DEBUG
+        PerformanceDiagnostics.recordDuration(
+            "SwiftData.workoutRoutePoint.fetch.pagedTotal",
+            milliseconds: (CFAbsoluteTimeGetCurrent() - started) * 1_000)
+        PerformanceDiagnostics.count("Dataset.workoutRoutePointRows.loaded", by: offset)
+        PerformanceDiagnostics.event("WorkoutTrajectoryAccumulator.finish",
+                                     metadata: "rows=\(offset) batches=\(batchCount)")
+        #endif
+        return (accumulator.finish(), offset)
+    }
+
+    /// Repository 失败时的语义保真 fallback；仍分页，绝不一次物化全库 @Model。
+    func loadWorkoutSnapshotsFallback() throws -> [FootprintSnapshot] {
+        var result: [FootprintSnapshot] = []
+        var offset = 0
+        while true {
+            let pageContext = ModelContext(container)
+            var descriptor = FetchDescriptor<WorkoutRoutePoint>(
+                sortBy: [SortDescriptor(\.timestamp)])
+            descriptor.fetchLimit = Self.routePointBatchSize
+            descriptor.fetchOffset = offset
+            let rows = try pageContext.fetch(descriptor)
+            guard !rows.isEmpty else { break }
+            result.reserveCapacity(result.count + rows.count)
+            result.append(contentsOf: rows.map {
+                FootprintSnapshot(
+                    lat: $0.latitude, lon: $0.longitude, t: $0.timestamp,
+                    source: FootprintSource.health.rawValue,
+                    trajectoryID: "health:\($0.workoutID)", sessionID: $0.workoutID,
+                    segmentID: "\($0.routeID ?? "legacy:\($0.workoutID)"):\($0.segmentIndex ?? 0)")
+            })
+            offset += rows.count
+            if rows.count < Self.routePointBatchSize { break }
+        }
+        return result
     }
 
     func loadResolved() throws -> TrajectoryResolution {

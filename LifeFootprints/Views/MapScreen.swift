@@ -970,23 +970,8 @@ struct MapScreen: View {
                 trajectorySnaps = trajectoryResolution.points.map { Self.snapshot(from: $0) }
                 #endif
             } else {
-                #if DEBUG
-                let workoutRows = PerformanceDiagnostics.measure(
-                    "SwiftData.routePoint.fallbackFetch") {
-                        (try? pointContext.fetch(FetchDescriptor<WorkoutRoutePoint>(
-                            sortBy: [SortDescriptor(\.timestamp)]))) ?? []
-                    }
-                #else
-                let workoutRows = (try? pointContext.fetch(FetchDescriptor<WorkoutRoutePoint>(
-                    sortBy: [SortDescriptor(\.timestamp)]))) ?? []
-                #endif
-                let workoutSnaps = workoutRows.map {
-                    FootprintSnapshot(lat: $0.latitude, lon: $0.longitude, t: $0.timestamp,
-                                      source: FootprintSource.health.rawValue,
-                                      trajectoryID: "health:\($0.workoutID)",
-                                      sessionID: $0.workoutID,
-                                      segmentID: "\($0.routeID ?? "legacy:\($0.workoutID)"):\($0.segmentIndex ?? 0)")
-                }
+                let workoutSnaps = (try? TrajectoryRepository(container: container)
+                    .loadWorkoutSnapshotsFallback()) ?? []
                 trajectorySnaps = snaps.filter { $0.source == FootprintSource.gps.rawValue }
                     + workoutSnaps
             }
