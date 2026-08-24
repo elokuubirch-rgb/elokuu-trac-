@@ -121,7 +121,6 @@ enum HealthKitService {
                                       store: HKHealthStore, container: ModelContainer,
                                       progress: @escaping @Sendable (String) -> Void) async -> Int? {
         let context = ModelContext(container)
-        backfillLegacyRouteBoundaries(in: context)
         let deletedStrings = Set(deletedWorkoutIDs.map(\.uuidString))
         var workoutInsertedOrUpdated = false
         var workoutDeleted = false
@@ -391,40 +390,6 @@ enum HealthKitService {
             }
             store.execute(routeQuery)
         }
-    }
-
-    /// 旧库只有 workoutID。将旧点归入稳定的 legacy Route，避免升级后重复导入。
-    private static func backfillLegacyRouteBoundaries(in context: ModelContext) {
-        let points = (try? context.fetch(FetchDescriptor<WorkoutRoutePoint>(
-            sortBy: [SortDescriptor(\.timestamp)]))) ?? []
-        let legacy = points.filter { $0.routeID == nil }
-        guard !legacy.isEmpty else { return }
-        let existingRouteIDs = Set(((try? context.fetch(FetchDescriptor<WorkoutRouteRecord>())) ?? [])
-            .map(\.routeID))
-        let workouts = Dictionary(uniqueKeysWithValues:
-            ((try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? []).map { ($0.healthKitUUID, $0) })
-        for (workoutID, rows) in Dictionary(grouping: legacy, by: \.workoutID) {
-            let routeID = "legacy:\(workoutID)"
-            if !existingRouteIDs.contains(routeID) {
-                context.insert(WorkoutRouteRecord(routeID: routeID, workoutID: workoutID))
-            }
-            let raw = rows.enumerated().map { index, point in
-                WorkoutRouteRawPoint(id: String(index), latitude: point.latitude,
-                                     longitude: point.longitude, timestamp: point.timestamp)
-            }
-            let metadata = Dictionary(uniqueKeysWithValues:
-                WorkoutRouteMetadata.assign(raw).map { ($0.id, $0) })
-            for (index, point) in rows.enumerated() {
-                point.routeID = routeID
-                point.segmentIndex = metadata[String(index)]?.segmentIndex
-                point.pointIndex = metadata[String(index)]?.pointIndex
-            }
-            if let workout = workouts[workoutID] {
-                workout.routeSyncState = .available
-                workout.routeAvailable = true
-            }
-        }
-        try? context.save()
     }
 
     private static func validMetric(_ value: Double) -> Double? {

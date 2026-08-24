@@ -98,6 +98,7 @@ struct MainTabView: View {
     @State private var launchDataReady = !SnapshotCache.pointSnapshots.isEmpty
     @State private var minimumLogoElapsed = false
     @State private var reviewImmersive = false
+    @State private var didScheduleLegacyRouteMigration = false
     /// Global Review 会话由根协调层持有，临时切到地图/统计时不会销毁。
 
     init() {
@@ -143,6 +144,14 @@ struct MainTabView: View {
             .tint(AppTheme(rawValue: themeRaw)?.color ?? .red)
             .preferredColorScheme(.dark)
             .onAppear(perform: applyTestHooks)
+            .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
+                guard !didScheduleLegacyRouteMigration else { return }
+                didScheduleLegacyRouteMigration = true
+                let container = context.container
+                Task.detached(priority: .utility) {
+                    _ = LegacyRouteMigration.runIfNeeded(container: container)
+                }
+            }
             .task {
                 // 照片行政区逆地理：常驻逐批补齐（网格去重+限速退避），
                 // 完成后发通知让地图页重载快照 → 聚合标记渐进出现。

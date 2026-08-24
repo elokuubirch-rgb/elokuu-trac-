@@ -51,6 +51,16 @@
 | `git diff --check` | Passed |
 | 真机 HealthKit 空增量诊断 | Not measured（本阶段无已授权真机执行环境） |
 
+### Commit 03 — remove legacy migration from sync hot path
+
+- 从 `HealthKitService.importChanges` 移除 legacy 全表 backfill；正常 full/incremental sync 不再附带历史路线扫描。
+- 新迁移在首个 `mapSnapshotReady` 之后以 utility 后台任务启动，首屏地图不等待迁移。
+- 按 workout 独立事务处理，持久化 schema version 与 progress cursor；中断后由剩余 `routeID == nil` 数据恢复，完成后永久 no-op。
+- migration 与 trajectory cold build 通过后台重任务 gate 互斥；并使同一进程的并发 trajectory build 在 gate 内复查内存缓存，复用已完成结果。
+- 全部批次完成后只发布一次 trajectory revision，避免逐 workout 刷新地图。
+
+阶段验证：Build Passed；Xcode unit 8/8 Passed（含 3 点/2 segment 迁移及二次 no-op）；Core 139/139 Passed；地图三缩放级 UI 回归 1/1 Passed；`git diff --check` Passed。
+
 ## 3. Before / After
 
 待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。

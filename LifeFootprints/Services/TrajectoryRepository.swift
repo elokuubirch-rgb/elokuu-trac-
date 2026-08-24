@@ -100,26 +100,28 @@ struct TrajectoryRepository {
     }
 
     func loadResolved() throws -> TrajectoryResolution {
-        if let cached = TrajectoryResolutionCache.shared.value {
+        try DatabaseHeavyWorkGate.withExclusiveAccess("TrajectoryRepository.loadResolved") {
+            if let cached = TrajectoryResolutionCache.shared.value {
             #if DEBUG
             PerformanceDiagnostics.event("TrajectoryResolutionCache.hit")
             #endif
             return cached
-        }
-        #if DEBUG
-        PerformanceDiagnostics.event("TrajectoryResolutionCache.miss")
-        let trajectories = try load()
-        let resolution = PerformanceDiagnostics.measure(
-            "TrajectoryConflictResolver", metadata: "trajectories=\(trajectories.count)") {
-                TrajectoryConflictResolver.resolve(trajectories)
             }
-        PerformanceDiagnostics.count("Dataset.trajectoryConflicts",
-                                     by: resolution.conflicts.count)
-        #else
-        let resolution = TrajectoryConflictResolver.resolve(try load())
-        #endif
-        TrajectoryResolutionCache.shared.value = resolution
-        return resolution
+            #if DEBUG
+            PerformanceDiagnostics.event("TrajectoryResolutionCache.miss")
+            let trajectories = try load()
+            let resolution = PerformanceDiagnostics.measure(
+                "TrajectoryConflictResolver", metadata: "trajectories=\(trajectories.count)") {
+                    TrajectoryConflictResolver.resolve(trajectories)
+                }
+            PerformanceDiagnostics.count("Dataset.trajectoryConflicts",
+                                         by: resolution.conflicts.count)
+            #else
+            let resolution = TrajectoryConflictResolver.resolve(try load())
+            #endif
+            TrajectoryResolutionCache.shared.value = resolution
+            return resolution
+        }
     }
 }
 

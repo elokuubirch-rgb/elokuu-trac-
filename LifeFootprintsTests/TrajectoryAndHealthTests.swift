@@ -1,4 +1,5 @@
 import XCTest
+import SwiftData
 @testable import LifeFootprints
 
 final class TrajectoryAndHealthTests: XCTestCase {
@@ -101,5 +102,48 @@ final class TrajectoryAndHealthTests: XCTestCase {
         XCTAssertEqual(routeChange.current.photo, initial.photo)
         XCTAssertEqual(routeChange.current.place, initial.place)
         XCTAssertEqual(routeChange.current.stats, initial.stats + 2)
+    }
+
+    @MainActor
+    func testLegacyRouteMigrationIsOneTimeAndPreservesBoundaries() throws {
+        let configuration = ModelConfiguration(isStoredInMemoryOnly: true)
+        let container = try ModelContainer(
+            for: WorkoutRecord.self, WorkoutRouteRecord.self, WorkoutRoutePoint.self,
+            configurations: configuration)
+        let context = ModelContext(container)
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        let workoutID = "legacy-workout"
+        context.insert(WorkoutRecord(
+            healthKitUUID: workoutID, workoutType: "walking",
+            startDate: base, endDate: base.addingTimeInterval(4_000),
+            duration: 4_000, distanceMeters: 1_000, caloriesKCal: 100,
+            elevationGain: 0, routeAvailable: false))
+        for (index, offset) in [0.0, 30.0, 3_000.0].enumerated() {
+            context.insert(WorkoutRoutePoint(
+                workoutID: workoutID, latitude: 31 + Double(index) * 0.0001,
+                longitude: 121, altitude: 10,
+                timestamp: base.addingTimeInterval(offset)))
+        }
+        try context.save()
+
+        let suite = "LegacyRouteMigrationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let first = LegacyRouteMigration.runIfNeeded(
+            container: container, defaults: defaults, publishRevision: false)
+        XCTAssertEqual(first.migratedWorkouts, 1)
+        XCTAssertEqual(first.migratedPoints, 3)
+
+        let migrated = try context.fetch(FetchDescriptor<WorkoutRoutePoint>(
+            sortBy: [SortDescriptor(\.timestamp)]))
+        XCTAssertEqual(migrated.map(\.routeID), Array(repeating: "legacy:\(workoutID)", count: 3))
+        XCTAssertEqual(migrated.map(\.segmentIndex), [0, 0, 1])
+        XCTAssertEqual(migrated.map(\.pointIndex), [0, 1, 0])
+        XCTAssertEqual(try context.fetchCount(FetchDescriptor<WorkoutRouteRecord>()), 1)
+
+        let second = LegacyRouteMigration.runIfNeeded(
+            container: container, defaults: defaults, publishRevision: false)
+        XCTAssertTrue(second.alreadyComplete)
+        XCTAssertEqual(second.migratedPoints, 0)
     }
 }
