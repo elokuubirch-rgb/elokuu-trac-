@@ -160,6 +160,64 @@ private struct TrailSegment {
     let b: TrailPoint
 }
 
+public struct TrailIndexQueryStats: Equatable, Sendable {
+    public let totalSegmentCount: Int
+    public let indexedCandidateCount: Int
+    public let containingCandidateCount: Int
+}
+
+/// 时间有序 interval lookup。所有可插值 segment 的跨度都不超过 maxSpan，
+/// 因此包含 timestamp 的 segment 必然从 [timestamp - maxSpan, timestamp] 开始。
+/// 两次二分后只检查这个有界窗口，不再为每张照片扫描全部 segment。
+private struct TrailSegmentTimeIndex {
+    private struct Entry {
+        let start: TimeInterval
+        let end: TimeInterval
+        let segmentIndex: Int
+    }
+
+    private let entries: [Entry]
+    private let maximumSpan: TimeInterval
+
+    init(segments: [TrailSegment], maximumSpan: TimeInterval) {
+        self.maximumSpan = maximumSpan
+        entries = segments.enumerated().map {
+            Entry(start: $0.element.a.t, end: $0.element.b.t, segmentIndex: $0.offset)
+        }.sorted {
+            if $0.start != $1.start { return $0.start < $1.start }
+            return $0.segmentIndex < $1.segmentIndex
+        }
+    }
+
+    func candidates(containing time: TimeInterval) -> (indices: [Int], indexedCount: Int) {
+        let lower = lowerBound(for: time - maximumSpan)
+        let upper = upperBound(for: time)
+        guard lower < upper else { return ([], 0) }
+        let window = entries[lower..<upper]
+        return (window.compactMap { $0.end >= time ? $0.segmentIndex : nil }, window.count)
+    }
+
+    private func lowerBound(for time: TimeInterval) -> Int {
+        var low = 0
+        var high = entries.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if entries[mid].start < time { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+
+    private func upperBound(for time: TimeInterval) -> Int {
+        var low = 0
+        var high = entries.count
+        while low < high {
+            let mid = low + (high - low) / 2
+            if entries[mid].start <= time { low = mid + 1 } else { high = mid }
+        }
+        return low
+    }
+}
+
 fileprivate struct TrailLocationMatch {
     let lat: Double
     let lon: Double
@@ -175,10 +233,13 @@ fileprivate struct TrailLocationMatch {
 /// - 网格哈希（0.002°≈220m）找最近轨迹点（精确 <50m / 吸附 ≤300m）
 /// - 时间序列二分插值（无 GPS 照片按拍摄时间定位）
 public struct TrailIndex {
+    private static let maximumInterpolationSpan: TimeInterval = 7_200
+
     public let points: [TrailPoint]
     private let grid: [String: [Int]]
     private let segments: [TrailSegment]
     private let segmentGrid: [String: [Int]]
+    private let segmentTimeIndex: TrailSegmentTimeIndex
 
     public init(points: [TrailPoint]) {
         self.points = points.sorted { $0.t < $1.t }
@@ -204,7 +265,7 @@ public struct TrailIndex {
                     let a = ordered[i], b = ordered[i + 1]
                     guard a.sharesBoundary(with: b) else { continue }
                     let dt = b.t - a.t
-                    guard dt > 0, dt <= 7200 else { continue }
+                    guard dt > 0, dt <= Self.maximumInterpolationSpan else { continue }
                     let distance = GeoMath.distanceMeters(from: (a.lat, a.lon), to: (b.lat, b.lon))
                     let plausibleDistance = min(20_000, max(2_000, dt * 15))
                     guard distance <= plausibleDistance else { continue }
@@ -226,6 +287,8 @@ public struct TrailIndex {
         }
         self.segments = builtSegments
         self.segmentGrid = builtGrid
+        self.segmentTimeIndex = TrailSegmentTimeIndex(
+            segments: builtSegments, maximumSpan: Self.maximumInterpolationSpan)
     }
 
     /// 0.002° 网格 key
@@ -314,20 +377,39 @@ public struct TrailIndex {
         return (match.lat, match.lon)
     }
 
-    fileprivate func interpolateMatch(at time: TimeInterval) -> TrailLocationMatch? {
+    fileprivate func interpolateMatch(
+        at time: TimeInterval,
+        onQuery: ((TrailIndexQueryStats) -> Void)? = nil
+    ) -> TrailLocationMatch? {
         guard points.count >= 2 else { return nil }
         guard let first = points.first, let last = points.last else { return nil }
         if time <= first.t { return locationMatch(at: first) }
         if time >= last.t { return locationMatch(at: last) }
 
-        // 多条轨迹可在时间上重叠。只在同一领域 Segment 内插值，优先高置信度候选。
-        let candidates = segments.filter { $0.a.t <= time && time <= $0.b.t }
-        guard let segment = candidates.max(by: {
-            min($0.a.confidence, $0.b.confidence) < min($1.a.confidence, $1.b.confidence)
-        }) else { return nil }
+        // 多条轨迹可在时间上重叠。只在同一领域 Segment 内插值，优先高置信度候选；
+        // 置信度相同时继续选择原 segments 中最早的候选，保持旧 filter + max 语义。
+        let query = segmentTimeIndex.candidates(containing: time)
+        onQuery?(TrailIndexQueryStats(
+            totalSegmentCount: segments.count,
+            indexedCandidateCount: query.indexedCount,
+            containingCandidateCount: query.indices.count))
+        let candidates = query.indices
+        var selectedIndex: Int?
+        var selectedConfidence = -Double.infinity
+        for index in candidates {
+            let segment = segments[index]
+            let confidence = min(segment.a.confidence, segment.b.confidence)
+            if confidence > selectedConfidence ||
+                (confidence == selectedConfidence && index < (selectedIndex ?? .max)) {
+                selectedIndex = index
+                selectedConfidence = confidence
+            }
+        }
+        guard let selectedIndex else { return nil }
+        let segment = segments[selectedIndex]
         guard segment.a.sharesBoundary(with: segment.b) else { return nil }
         let span = segment.b.t - segment.a.t
-        guard span > 0, span <= 7200 else { return nil }
+        guard span > 0, span <= Self.maximumInterpolationSpan else { return nil }
         let k = (time - segment.a.t) / span
         return TrailLocationMatch(
             lat: segment.a.lat + (segment.b.lat - segment.a.lat) * k,
@@ -337,6 +419,15 @@ public struct TrailIndex {
             sessionID: segment.a.sessionID,
             segmentID: segment.a.segmentID,
             confidence: min(segment.a.confidence, segment.b.confidence))
+    }
+
+    /// 供性能回归与 signpost 汇总使用；不会改变匹配结果。
+    public func interpolationQueryStats(at time: TimeInterval) -> TrailIndexQueryStats {
+        let query = segmentTimeIndex.candidates(containing: time)
+        return TrailIndexQueryStats(
+            totalSegmentCount: segments.count,
+            indexedCandidateCount: query.indexedCount,
+            containingCandidateCount: query.indices.count)
     }
 
     private func locationMatch(at point: TrailPoint) -> TrailLocationMatch {
@@ -391,12 +482,14 @@ public struct TrailSnapResult: Equatable, Sendable {
 /// 3) 回退：时间位置过远 → 投影到空间最近路段（≤500m）
 /// 4) 时间插值：无有效 GPS → 按拍摄时间在轨迹上插值（带 2h 间隙保护）
 public func snapPhotoToTrailResult(lat: Double, lon: Double, time: TimeInterval,
-                                   trails: TrailIndex?) -> TrailSnapResult {
+                                   trails: TrailIndex?,
+                                   onTemporalQuery: ((TrailIndexQueryStats) -> Void)? = nil)
+    -> TrailSnapResult {
     guard let trails else { return TrailSnapResult(kind: .kept, lat: lat, lon: lon) }
     let valid = GeoMath.isValid(latitude: lat, longitude: lon)
     if valid {
         // 按拍摄时间取轨迹位置：同一段线路上不同时刻的照片落在不同位置
-        if let p = trails.interpolateMatch(at: time) {
+        if let p = trails.interpolateMatch(at: time, onQuery: onTemporalQuery) {
             let d = GeoMath.distanceMeters(from: (lat, lon), to: (p.lat, p.lon))
             if d <= 60 { return matchResult(.exact, p, distance: d, photoTime: time) }
             if d <= 500 { return matchResult(.snapped, p, distance: d, photoTime: time) }
@@ -411,7 +504,7 @@ public func snapPhotoToTrailResult(lat: Double, lon: Double, time: TimeInterval,
         return TrailSnapResult(kind: .kept, lat: lat, lon: lon)
     }
     // 无有效 GPS → 时间插值（间隙保护：跨线路不定位）
-    if let p = trails.interpolateMatch(at: time) {
+    if let p = trails.interpolateMatch(at: time, onQuery: onTemporalQuery) {
         return matchResult(.interpolated, p, distance: nil, photoTime: time)
     }
     return TrailSnapResult(kind: .kept, lat: lat, lon: lon)

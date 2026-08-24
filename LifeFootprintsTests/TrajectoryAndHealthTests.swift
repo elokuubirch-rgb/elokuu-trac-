@@ -173,6 +173,58 @@ final class TrajectoryAndHealthTests: XCTestCase {
         }
     }
 
+    func testTrailIndexTemporalLookupPreservesOverlapPriorityAndBoundaries() {
+        let index = TrailIndex(points: [
+            TrailPoint(lat: 31, lon: 121, t: 1_000, source: .coreLocation,
+                       trajectoryID: "auto", sessionID: "auto", segmentID: "a",
+                       confidence: 0.6),
+            TrailPoint(lat: 31.001, lon: 121.001, t: 1_100, source: .coreLocation,
+                       trajectoryID: "auto", sessionID: "auto", segmentID: "a",
+                       confidence: 0.6),
+            TrailPoint(lat: 32, lon: 122, t: 1_000, source: .healthWorkout,
+                       trajectoryID: "health", sessionID: "health", segmentID: "h",
+                       confidence: 0.95),
+            TrailPoint(lat: 32.002, lon: 122.002, t: 1_100, source: .healthWorkout,
+                       trajectoryID: "health", sessionID: "health", segmentID: "h",
+                       confidence: 0.95)
+        ])
+
+        let result = snapPhotoToTrailResult(lat: 999, lon: 999, time: 1_050, trails: index)
+        XCTAssertEqual(result.kind, .interpolated)
+        XCTAssertEqual(result.source, .healthWorkout)
+        XCTAssertEqual(result.trajectoryID, "health")
+        XCTAssertEqual(result.sessionID, "health")
+        XCTAssertEqual(result.segmentID, "h")
+        XCTAssertEqual(result.lat, 32.001, accuracy: 0.000_001)
+        XCTAssertEqual(result.lon, 122.001, accuracy: 0.000_001)
+        XCTAssertEqual(result.confidence, 0.95, accuracy: 0.000_001)
+        XCTAssertEqual(result.timeDelta, 0)
+    }
+
+    func testTrailIndexTemporalLookupDoesNotScanAllSegments() {
+        var points: [TrailPoint] = []
+        points.reserveCapacity(20_000)
+        for index in 0..<10_000 {
+            let start = Double(index * 30)
+            let latitude = 30 + Double(index % 100) * 0.000_01
+            let boundary = "segment-\(index)"
+            points.append(TrailPoint(
+                lat: latitude, lon: 120, t: start,
+                trajectoryID: boundary, sessionID: boundary, segmentID: boundary))
+            points.append(TrailPoint(
+                lat: latitude + 0.000_001, lon: 120.000_001, t: start + 10,
+                trajectoryID: boundary, sessionID: boundary, segmentID: boundary))
+        }
+        let index = TrailIndex(points: points)
+        let stats = index.interpolationQueryStats(at: 150_005)
+
+        XCTAssertEqual(stats.totalSegmentCount, 10_000)
+        XCTAssertEqual(stats.containingCandidateCount, 1)
+        XCTAssertLessThan(stats.indexedCandidateCount, 250)
+        XCTAssertLessThan(stats.indexedCandidateCount, stats.totalSegmentCount / 20)
+        XCTAssertNotNil(index.interpolate(at: 150_005))
+    }
+
     @MainActor
     func testRepositoryRestartUsesPersistentCacheWithoutRawFetch() throws {
         let configuration = ModelConfiguration(isStoredInMemoryOnly: true)

@@ -99,6 +99,10 @@ struct ClusterIndex {
         var siBuckets: [String: ClusterCell] = [:]
         #if DEBUG
         var photoMatchingMilliseconds = 0.0
+        var temporalQueryCount = 0
+        var temporalIndexedCandidates = 0
+        var temporalContainingCandidates = 0
+        var temporalAvoidedCandidates = 0
         #endif
 
         func add(_ cell: inout [String: ClusterCell], _ key: String, _ r: PhotoRecord,
@@ -148,13 +152,24 @@ struct ClusterIndex {
             #if DEBUG
             let matchingStarted = PerformanceDiagnostics.isEnabled ? CACurrentMediaTime() : 0
             #endif
+            #if DEBUG
             let snapResult = snapPhotoToTrailResult(
                 lat: r.latitude, lon: r.longitude,
-                time: r.timestamp.timeIntervalSince1970, trails: trails)
-            #if DEBUG
+                time: r.timestamp.timeIntervalSince1970, trails: trails,
+                onTemporalQuery: { stats in
+                    temporalQueryCount += 1
+                    temporalIndexedCandidates += stats.indexedCandidateCount
+                    temporalContainingCandidates += stats.containingCandidateCount
+                    temporalAvoidedCandidates += max(
+                        0, stats.totalSegmentCount - stats.indexedCandidateCount)
+                })
             if PerformanceDiagnostics.isEnabled {
                 photoMatchingMilliseconds += (CACurrentMediaTime() - matchingStarted) * 1_000
             }
+            #else
+            let snapResult = snapPhotoToTrailResult(
+                lat: r.latitude, lon: r.longitude,
+                time: r.timestamp.timeIntervalSince1970, trails: trails)
             #endif
             onSnap?(snapResult)
             let snapped = (snapResult.lat, snapResult.lon)
@@ -226,6 +241,13 @@ struct ClusterIndex {
         #if DEBUG
         PerformanceDiagnostics.recordDuration(
             "TrailIndex.photoMatching", milliseconds: photoMatchingMilliseconds)
+        PerformanceDiagnostics.count("TrailIndex.temporalQuery", by: temporalQueryCount)
+        PerformanceDiagnostics.count(
+            "TrailIndex.temporalIndexedCandidates", by: temporalIndexedCandidates)
+        PerformanceDiagnostics.count(
+            "TrailIndex.temporalContainingCandidates", by: temporalContainingCandidates)
+        PerformanceDiagnostics.count(
+            "TrailIndex.temporalAvoidedCandidates", by: temporalAvoidedCandidates)
         #endif
         return ClusterIndex(
             province: cluster(pBuckets, level: .province) { key, _ in key },

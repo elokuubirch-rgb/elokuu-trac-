@@ -134,6 +134,15 @@
 
 阶段证据：Build Passed；Xcode unit 18/18 Passed（含端点保持、独立误差复算、近距 raw、远距减点、屏幕误差 ≤0.25pt、常驻层级收益阈值）；Core 139/139 Passed；同一 seeded dataset 的 fit / near / far UI 回归 1/1 Passed，逐图对比 Commit 07 与修改前基线，路线完整性、远处曲线轮廓、三层 stroke、照片数量及锚点无可感知变化；`git diff --check` Passed。623,384 点真机 raw/render point count、LOD build 与 draw 耗时：Not measured，待最终真机复测。
 
+### Commit 09 — index trail matching by time
+
+- `TrailIndex.interpolateMatch` 不再对每张照片执行 `segments.filter`。构建 TrailIndex 时生成按 segment start 排序的不可变时间索引；查询用两次 binary search 定位 `[timestamp - 2h, timestamp]` 的必要窗口，再只检查窗口内的 end time，复杂度由每次 O(N) 改为 O(log N + K)。
+- 2h 窗口与原有最大可插值跨度完全相同，因此不会排除任何原先合法候选；候选选择继续按最低端点 confidence 的最大值，confidence 相同时按原 `segments` 顺序，保持旧 `filter + max` tie-break。
+- 原有 trajectoryID / sessionID / segmentID / source 边界、跨 gap 拒绝、首尾 clamp、坐标插值、confidence 与 timeDelta 未改变；空间 nearest-route grid fallback 未修改。
+- DEBUG 汇总新增 temporal query 次数、时间窗候选、实际包含候选和避免扫描的候选数，不在 Release 路径增加采样闭包。
+
+阶段证据：Build Passed；Xcode unit 20/20 Passed；其中 10,000 segment 回归查询仅进入 241 个必要时间窗候选、实际命中 1 个，并验证重叠来源仍选择相同高置信度 segment 及完整来源元数据；Core 139/139 Passed；fit / near / far 地图 UI 回归 1/1 Passed，照片锚点和轨迹视觉未变化；`git diff --check` Passed。623,384 点真机照片数量、候选总数与 matching 耗时：Not measured，待最终真机复测。
+
 ## 3. Before / After
 
 待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。
