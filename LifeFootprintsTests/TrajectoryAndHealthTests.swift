@@ -225,6 +225,35 @@ final class TrajectoryAndHealthTests: XCTestCase {
         XCTAssertNotNil(index.interpolate(at: 150_005))
     }
 
+    func testStatsClusterCacheBuildsOnceForConcurrentSameRevisionConsumers() async {
+        let cache = StatsClusterRevisionCache()
+        let key = StatsClusterCacheKey(
+            placeRevision: 17, trajectoryRevision: 23, snapshotGeneration: 4)
+        let snapshots = (0..<20_000).map { index in
+            FootprintSnapshot(
+                lat: 30 + Double(index % 100) * 0.000_1,
+                lon: 120 + Double(index % 80) * 0.000_1,
+                t: Date(timeIntervalSince1970: Double(index)))
+        }
+
+        let values = await withTaskGroup(of: [StatsDenseArea].self) { group in
+            for _ in 0..<20 {
+                group.addTask { await cache.value(for: key, snapshots: snapshots) }
+            }
+            var results: [[StatsDenseArea]] = []
+            for await result in group { results.append(result) }
+            return results
+        }
+
+        XCTAssertEqual(values.count, 20)
+        XCTAssertTrue(values.dropFirst().allSatisfy { $0 == values.first })
+        let firstBuildCount = await cache.diagnosticBuildCount()
+        XCTAssertEqual(firstBuildCount, 1)
+        _ = await cache.value(for: key, snapshots: snapshots)
+        let secondBuildCount = await cache.diagnosticBuildCount()
+        XCTAssertEqual(secondBuildCount, 1)
+    }
+
     @MainActor
     func testRepositoryRestartUsesPersistentCacheWithoutRawFetch() throws {
         let configuration = ModelConfiguration(isStoredInMemoryOnly: true)

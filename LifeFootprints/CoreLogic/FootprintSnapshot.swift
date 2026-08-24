@@ -1,7 +1,7 @@
 import Foundation
 
 /// 足迹点轻量快照：后台线程一次性物化，UI 只消费值类型（避免 SwiftData 主线程逐行 fault）
-public struct FootprintSnapshot: Equatable {
+public struct FootprintSnapshot: Equatable, Sendable {
     public let lat: Double
     public let lon: Double
     public let t: Date

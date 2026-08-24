@@ -9,15 +9,17 @@ struct StatsScreen: View {
     @State private var snapshots: [FootprintSnapshot] = []
     @State private var cachedStats = FootprintStats()
     /// 密集区域聚类：后台重算后缓存，body 零重活（P0）。
-    @State private var cachedClusters: [(lat: Double, lon: Double, count: Int)] = []
+    @State private var cachedClusters: [StatsDenseArea] = []
     @State private var clustersGeneration = 0
+    @State private var appliedClusterKey: StatsClusterCacheKey?
+    @State private var clusterConsumerTask: Task<Void, Never>?
     #if DEBUG
     @State private var diagnosticSettingsPresented = false
     #endif
 
     private var theme: AppTheme { AppTheme(rawValue: themeRaw) ?? .crimson }
     private var stats: FootprintStats { cachedStats }
-    private var clusters: [(lat: Double, lon: Double, count: Int)] { cachedClusters }
+    private var clusters: [StatsDenseArea] { cachedClusters }
 
     private var currentYear: Int { Calendar.current.component(.year, from: Date()) }
 
@@ -167,29 +169,35 @@ struct StatsScreen: View {
         scheduleClustersRebuild()
     }
 
-    /// 134k 点的聚类在后台线程重算；统计页不可见时直接跳过。
+    /// 聚类结果按持久数据 revision 复用；并发 consumer 共用同一个后台 task。
     private func scheduleClustersRebuild() {
         guard isActive else { return }
+        let revision = DataRevisionStore.snapshot()
+        let key = StatsClusterCacheKey(
+            placeRevision: revision.place,
+            trajectoryRevision: revision.trajectory,
+            snapshotGeneration: SnapshotCache.pointSnapshotGeneration)
+        guard appliedClusterKey != key else {
+            #if DEBUG
+            PerformanceDiagnostics.count("StatsCluster.screenReuse")
+            #endif
+            return
+        }
         #if DEBUG
-        PerformanceDiagnostics.count("StatsCluster.rebuild.started")
+        PerformanceDiagnostics.count("StatsCluster.consumer.started")
         #endif
         clustersGeneration += 1
         let generation = clustersGeneration
         let source = snapshots
-        Task.detached(priority: .utility) {
-            #if DEBUG
-            let result = PerformanceDiagnostics.measure(
-                "StatsCluster.generation", metadata: "snapshots=\(source.count)") {
-                    let pts = source.map { (lat: $0.lat, lon: $0.lon) }
-                    return GeoMath.topClusters(pts, topN: 5)
-                }
-            #else
-            let pts = source.map { (lat: $0.lat, lon: $0.lon) }
-            let result = GeoMath.topClusters(pts, topN: 5)
-            #endif
+        clusterConsumerTask?.cancel()
+        clusterConsumerTask = Task {
+            let result = await StatsClusterRevisionCache.shared.value(
+                for: key, snapshots: source)
+            guard !Task.isCancelled else { return }
             await MainActor.run {
                 guard generation == self.clustersGeneration else { return }
                 self.cachedClusters = result
+                self.appliedClusterKey = key
             }
         }
     }

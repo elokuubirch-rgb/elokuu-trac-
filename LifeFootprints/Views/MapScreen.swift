@@ -70,6 +70,8 @@ struct FootprintDot: Identifiable {
 /// 快照全局缓存：MapScreen 重建（切标签页）后立即显示上次数据，后台刷新无感
 enum SnapshotCache {
     static var pointSnapshots: [FootprintSnapshot] = []
+    /// 只在完成一份新的 point snapshot materialization 后递增。
+    static var pointSnapshotGeneration = 0
     static var clusterIndex: ClusterIndex?
     static var monthStarts: [Date] = []
     static var stats: FootprintStats = FootprintStats()
@@ -1074,6 +1076,7 @@ struct MapScreen: View {
                 #else
                 SnapshotCache.pointSnapshots = displaySnaps.sorted { $0.t < $1.t }
                 #endif
+                SnapshotCache.pointSnapshotGeneration += 1
                 SnapshotCache.monthStarts = months
                 SnapshotCache.stats = completedStats
                 SnapshotCache.dataRegion = region

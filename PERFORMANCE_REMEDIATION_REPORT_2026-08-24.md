@@ -143,6 +143,14 @@
 
 阶段证据：Build Passed；Xcode unit 20/20 Passed；其中 10,000 segment 回归查询仅进入 241 个必要时间窗候选、实际命中 1 个，并验证重叠来源仍选择相同高置信度 segment 及完整来源元数据；Core 139/139 Passed；fit / near / far 地图 UI 回归 1/1 Passed，照片锚点和轨迹视觉未变化；`git diff --check` Passed。623,384 点真机照片数量、候选总数与 matching 耗时：Not measured，待最终真机复测。
 
+### Commit 10 — cache stats by data revision
+
+- 密集区域结果以 `placeRevision + trajectoryRevision + pointSnapshotGeneration` 为 key。generation 只在一份新 point snapshot 完成物化时递增，用于区分启动期尚未加载与同持久 revision 已加载的状态；稳定数据下重复进入 Stats 直接复用。
+- `StatsClusterRevisionCache` actor 同时保存同 key 的 in-flight task，后来的 consumer await 已有任务；旧 revision 晚完成时不能覆盖更新 revision 的 completed cache。
+- 实际 `GeoMath.topClusters` 的输入、0.005° 默认 cell、topN=5、排序和输出数值不变；只把“页面激活即计算”改为“revision 未命中才计算”。Release 不安装诊断闭包。
+
+三组各 20 次 Simulator 导航审计 Passed（测试本身 332.960s，包含 XCUI 固定等待，不能作为 App 首帧耗时）：`StatsCluster.rebuild.started/generation=1`（基线 41）、`screenReuse=40`、Map snapshot/fetch/TrailIndex 各 1、Map rebuild 1、overlay add 仅首次 6/remove 0、89 次 `updateUIView` 中 88 次 no-mutation。App 内诊断的 Map→Stats 首个 SwiftUI frame 最大 0.169ms，Stats→Map 最大 0.051ms；seeded Simulator Stats build 0.210ms。阶段证据：Build Passed；Xcode unit 21/21 Passed（含 20 个同 revision 并发 consumer 仅 build 1 次及完成缓存复用）；Core 139/139 Passed；fit / near / far UI 回归 1/1 Passed；`git diff --check` Passed。真实大数据库首帧与 Stats build：Not measured，待最终真机复测。
+
 ## 3. Before / After
 
 待真机和自动化验收后更新；无法测量的指标将明确标记 `Not measured`。
