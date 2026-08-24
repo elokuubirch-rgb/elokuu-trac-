@@ -32,7 +32,24 @@
 
 ## 2. 修改记录
 
-待各 performance commit 完成后更新。
+### Commit 02 — suppress invalid trajectory invalidations
+
+- 新增持久、分域的 `trajectory / photo / place / stats` revision；只有成功提交且真实可见数据改变时递增。
+- 新增 `dataRevisionChanged` 精确通知；Map、Stats、Review、Settings 不再把 generic sync completion 当作数据变化。
+- HealthKit anchored query 的空增量在保存新 anchor 与同步成功状态后立即返回：不创建 `ModelContext`、不执行 migration、不保存 SwiftData、不发数据变化通知。
+- HealthKit summary-only 变化只改变 stats revision；route 增删或影响已有路线 presentation 的 activity type 变化才改变 trajectory revision。
+- trajectory 内存缓存失效按 revision 去重。
+
+阶段验证：
+
+| 项目 | 结果 |
+| --- | --- |
+| Build | Passed |
+| Xcode unit | 7/7 Passed（含 empty sync policy 与分域 revision 持久化） |
+| Core logic | 139/139 Passed |
+| 相关 UI | HealthKit 设置入口 1/1 Passed |
+| `git diff --check` | Passed |
+| 真机 HealthKit 空增量诊断 | Not measured（本阶段无已授权真机执行环境） |
 
 ## 3. Before / After
 

@@ -128,6 +128,7 @@ final class TrajectoryResolutionCache: @unchecked Sendable {
     static let shared = TrajectoryResolutionCache()
     private let lock = NSLock()
     private var stored: TrajectoryResolution?
+    private var lastInvalidatedRevision: Int?
 
     var value: TrajectoryResolution? {
         get {
@@ -150,5 +151,22 @@ final class TrajectoryResolutionCache: @unchecked Sendable {
         }
     }
 
-    func invalidate() { value = nil }
+    func invalidate() {
+        lock.withLock {
+            stored = nil
+            lastInvalidatedRevision = nil
+        }
+    }
+
+    /// 同一个持久 revision 即使被重复投递，也只执行一次失效。
+    func invalidate(for revision: Int) {
+        lock.withLock {
+            guard lastInvalidatedRevision != revision else { return }
+            stored = nil
+            lastInvalidatedRevision = revision
+            #if DEBUG
+            PerformanceDiagnostics.count("TrajectoryResolutionCache.invalidate")
+            #endif
+        }
+    }
 }

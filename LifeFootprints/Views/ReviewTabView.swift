@@ -126,9 +126,11 @@ struct ReviewTabView: View {
             onImmersiveChanged(false)
             prepareSessionIfNeeded()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .dataRevisionChanged)) { notification in
+            guard let change = notification.object as? DataRevisionChange,
+                  change.domains.contains(.photo) else { return }
             #if DEBUG
-            PerformanceDiagnostics.event("dataImported.receive.ReviewTabView")
+            PerformanceDiagnostics.event("dataRevision.receive.ReviewTabView")
             #endif
             // 数据入库只在总览态幂等刷新；正在浏览照片组时绝不打断，也不重洗当前 Session。
             guard case .overview = mode else { return }

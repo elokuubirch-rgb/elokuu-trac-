@@ -86,9 +86,11 @@ struct StatsScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
             refreshCache()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .dataRevisionChanged)) { notification in
+            guard let change = notification.object as? DataRevisionChange,
+                  !change.domains.intersection([.place, .trajectory]).isEmpty else { return }
             #if DEBUG
-            PerformanceDiagnostics.event("dataImported.receive.StatsScreen")
+            PerformanceDiagnostics.event("dataRevision.receive.StatsScreen")
             #endif
             refreshCache()
         }

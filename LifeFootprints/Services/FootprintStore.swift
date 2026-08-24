@@ -40,14 +40,12 @@ enum FootprintStore {
                     return
                 }
                 bg.insert(FootprintPoint(draft: draft))
-                try? bg.save()
-                await MainActor.run {
-                    #if DEBUG
-                    PerformanceDiagnostics.event("dataImported.post.FootprintStore.backgroundDraft")
-                    PerformanceDiagnostics.count("dataImported.post.total")
-                    #endif
-                    NotificationCenter.default.post(name: .dataImported, object: nil)
+                do { try bg.save() } catch {
+                    continuation.resume(returning: false)
+                    return
                 }
+                DataRevisionStore.commit([.trajectory, .place, .stats],
+                                         reason: "FootprintStore.backgroundDraft")
                 continuation.resume(returning: true)
             }
         }
@@ -62,6 +60,7 @@ enum FootprintStore {
             index.add(day: dayKey(p.timestamp), lat: p.latitude, lon: p.longitude)
         }
         var added = 0
+        var insertedTrajectory = false
         for d in drafts {
             guard GeoMath.isValid(latitude: d.latitude, longitude: d.longitude) else { continue }
             let day = dayKey(d.timestamp)
@@ -69,8 +68,16 @@ enum FootprintStore {
             index.add(day: day, lat: d.latitude, lon: d.longitude)
             context.insert(FootprintPoint(draft: d))
             added += 1
+            insertedTrajectory = insertedTrajectory
+                || d.source == FootprintSource.gps.rawValue
+                || d.source == FootprintSource.csv.rawValue
         }
-        try? context.save()
+        do { try context.save() } catch { return 0 }
+        if added > 0 {
+            var domains: DataRevisionDomains = [.place, .stats]
+            if insertedTrajectory { domains.insert(.trajectory) }
+            DataRevisionStore.commit(domains, reason: "FootprintStore.importDrafts")
+        }
         return added
     }
 
@@ -95,12 +102,16 @@ enum FootprintStore {
                     }
                 }
                 var added = 0
+                var insertedTrajectory = false
                 for d in drafts {
                     guard GeoMath.isValid(latitude: d.latitude, longitude: d.longitude) else { continue }
                     if dense {
                         // 密集路线：保持连续性，不做空间去重（点密度由点模式采样控制）
                         bg.insert(FootprintPoint(draft: d))
                         added += 1
+                        insertedTrajectory = insertedTrajectory
+                            || d.source == FootprintSource.gps.rawValue
+                            || d.source == FootprintSource.csv.rawValue
                         continue
                     }
                     let day = dayKey(d.timestamp)
@@ -108,18 +119,19 @@ enum FootprintStore {
                     index.add(day: day, lat: d.latitude, lon: d.longitude)
                     bg.insert(FootprintPoint(draft: d))
                     added += 1
+                    insertedTrajectory = insertedTrajectory
+                        || d.source == FootprintSource.gps.rawValue
+                        || d.source == FootprintSource.csv.rawValue
                 }
-                try? bg.save()
+                do { try bg.save() } catch {
+                    continuation.resume(returning: 0)
+                    return
+                }
                 appLog.info("[Import] 后台导入完成：\(drafts.count) 条 → 新增 \(added)（dense=\(dense)）")
                 if added > 0 {
-                    // 数据变化 → 地图重载（替代主线程 @Query 监听）
-                    await MainActor.run {
-                        #if DEBUG
-                        PerformanceDiagnostics.event("dataImported.post.FootprintStore.importDrafts")
-                        PerformanceDiagnostics.count("dataImported.post.total")
-                        #endif
-                        NotificationCenter.default.post(name: .dataImported, object: nil)
-                    }
+                    var domains: DataRevisionDomains = [.place, .stats]
+                    if insertedTrajectory { domains.insert(.trajectory) }
+                    DataRevisionStore.commit(domains, reason: "FootprintStore.importDraftsInBackground")
                 }
                 continuation.resume(returning: added)
             }
@@ -157,13 +169,16 @@ enum FootprintStore {
 
     static func deleteAll(in context: ModelContext) {
         let all = (try? context.fetch(FetchDescriptor<FootprintPoint>())) ?? []
+        guard !all.isEmpty else { return }
+        let affectedTrajectory = all.contains {
+            $0.sourceRaw == FootprintSource.gps.rawValue
+                || $0.sourceRaw == FootprintSource.csv.rawValue
+        }
         for p in all { context.delete(p) }
-        try? context.save()
-        #if DEBUG
-        PerformanceDiagnostics.event("dataImported.post.FootprintStore.deleteAll")
-        PerformanceDiagnostics.count("dataImported.post.total")
-        #endif
-        NotificationCenter.default.post(name: .dataImported, object: nil)
+        do { try context.save() } catch { return }
+        var domains: DataRevisionDomains = [.place, .stats]
+        if affectedTrajectory { domains.insert(.trajectory) }
+        DataRevisionStore.commit(domains, reason: "FootprintStore.deleteAll")
     }
 
     static func sourceCounts(of points: [FootprintPoint]) -> (photo: Int, csv: Int, manual: Int, gps: Int, health: Int) {

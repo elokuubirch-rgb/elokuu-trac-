@@ -92,6 +92,13 @@ enum HealthKitService {
                 PerformanceDiagnostics.event("HealthKit.emptyChangeSet")
             }
             #endif
+            // Anchor/同步状态仍正常推进，但空增量绝不能触碰 SwiftData、迁移或地图缓存。
+            if all.isEmpty, changes.deleted.isEmpty {
+                if let newAnchor = changes.newAnchor { HealthKitAnchorStore.save(newAnchor) }
+                HealthKitSyncStatusStore.markSucceeded()
+                appLog.info("[Health] 增量同步完成：无数据变化")
+                return 0
+            }
             guard let added = await importChanges(
                 workouts: all, deletedWorkoutIDs: Set(changes.deleted.map(\.uuid)),
                 store: store, container: container, progress: progress) else {
@@ -116,13 +123,26 @@ enum HealthKitService {
         let context = ModelContext(container)
         backfillLegacyRouteBoundaries(in: context)
         let deletedStrings = Set(deletedWorkoutIDs.map(\.uuidString))
+        var workoutInsertedOrUpdated = false
+        var workoutDeleted = false
+        var routeInsertedOrUpdated = false
+        var routeDeleted = false
         if !deletedStrings.isEmpty {
             for row in (try? context.fetch(FetchDescriptor<WorkoutRoutePoint>())) ?? []
-            where deletedStrings.contains(row.workoutID) { context.delete(row) }
+            where deletedStrings.contains(row.workoutID) {
+                context.delete(row)
+                routeDeleted = true
+            }
             for row in (try? context.fetch(FetchDescriptor<WorkoutRouteRecord>())) ?? []
-            where deletedStrings.contains(row.workoutID) { context.delete(row) }
+            where deletedStrings.contains(row.workoutID) {
+                context.delete(row)
+                routeDeleted = true
+            }
             for row in (try? context.fetch(FetchDescriptor<WorkoutRecord>())) ?? []
-            where deletedStrings.contains(row.healthKitUUID) { context.delete(row) }
+            where deletedStrings.contains(row.healthKitUUID) {
+                context.delete(row)
+                workoutDeleted = true
+            }
         }
 
         let count = workouts.count
@@ -140,12 +160,23 @@ enum HealthKitService {
             let record: WorkoutRecord
             if let existing = recordByID[workoutID] {
                 record = existing
-                record.workoutType = workoutTypeName(workout)
+                let nextWorkoutType = workoutTypeName(workout)
+                let summaryChanged = record.workoutType != nextWorkoutType
+                    || record.startDate != workout.startDate
+                    || record.endDate != workout.endDate
+                    || record.duration != workout.duration
+                    || record.distanceMeters != (workout.totalDistance?.doubleValue(for: .meter()) ?? 0)
+                    || record.caloriesKCal != (workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()) ?? 0)
+                let presentationChanged = record.workoutType != nextWorkoutType
+                    && workoutsWithRoutes.contains(workoutID)
+                record.workoutType = nextWorkoutType
                 record.startDate = workout.startDate
                 record.endDate = workout.endDate
                 record.duration = workout.duration
                 record.distanceMeters = workout.totalDistance?.doubleValue(for: .meter()) ?? 0
                 record.caloriesKCal = workout.totalEnergyBurned?.doubleValue(for: .kilocalorie()) ?? 0
+                workoutInsertedOrUpdated = workoutInsertedOrUpdated || summaryChanged
+                routeInsertedOrUpdated = routeInsertedOrUpdated || presentationChanged
                 // 已有可用路线已被 Route 实体覆盖时无需重复下载全部点。
                 if existing.routeSyncState == .available { continue }
             } else {
@@ -159,6 +190,7 @@ enum HealthKitService {
                     elevationGain: 0, routeAvailable: false, routeSyncState: .unknown)
                 context.insert(record)
                 recordByID[workoutID] = record
+                workoutInsertedOrUpdated = true
             }
             progress("正在读取路线 \(i + 1)/\(count)（\(label)）")
             record.routeLastCheckedAt = Date()
@@ -207,6 +239,7 @@ enum HealthKitService {
                 importedForWorkout += 1
                 existingRoutes.insert(route.routeID)
                 workoutsWithRoutes.insert(workoutID)
+                routeInsertedOrUpdated = true
                 appLog.info("[Health] \(label) Route \(route.routeID)：\(ordered.count) 点")
             }
             if workoutsWithRoutes.contains(workoutID) || routes.contains(where: { !$0.locations.isEmpty }) {
@@ -233,11 +266,12 @@ enum HealthKitService {
             appLog.error("[Health] 保存失败: \(error.localizedDescription)")
             return nil
         }
-        #if DEBUG
-        PerformanceDiagnostics.event("dataImported.post.HealthKit")
-        PerformanceDiagnostics.count("dataImported.post.total")
-        #endif
-        NotificationCenter.default.post(name: .dataImported, object: nil)
+        let domains = HealthSyncInvalidationPolicy.domains(
+            workoutInsertedOrUpdated: workoutInsertedOrUpdated,
+            workoutDeleted: workoutDeleted,
+            routeInsertedOrUpdated: routeInsertedOrUpdated,
+            routeDeleted: routeDeleted)
+        DataRevisionStore.commit(domains, reason: "HealthKit.importChanges")
         appLog.info("[Health] 独立 Workout Route 导入：新增 \(addedRoutes) 条")
         return addedRoutes
     }

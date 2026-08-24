@@ -647,13 +647,18 @@ struct MapScreen: View {
             }
             applyNavigationHighlight()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .dataRevisionChanged)) { notification in
             // 足迹/照片入库完成 → 重载快照（替代主线程 @Query 监听）
+            guard let change = notification.object as? DataRevisionChange,
+                  !change.domains.intersection([.trajectory, .place, .photo]).isEmpty else { return }
             #if DEBUG
-            PerformanceDiagnostics.event("dataImported.receive.MapScreen")
+            PerformanceDiagnostics.event("dataRevision.receive.MapScreen",
+                                           metadata: "domains=\(change.domains.rawValue)")
             PerformanceDiagnostics.count("MapScreen.reload.requested")
             #endif
-            TrajectoryResolutionCache.shared.invalidate()
+            if change.domains.contains(.trajectory) {
+                TrajectoryResolutionCache.shared.invalidate(for: change.current.trajectory)
+            }
             scheduleReload()
         }
         .onChange(of: navigation.mapPhotoHighlight) { _, _ in applyNavigationHighlight() }

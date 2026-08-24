@@ -93,13 +93,9 @@ enum PhotoStore {
         for record in allIncludingHidden(in: context) where ids.contains(record.localIdentifier) {
             context.delete(record)
         }
-        try? context.save()
+        do { try context.save() } catch { return }
         invalidateIndex()
-        #if DEBUG
-        PerformanceDiagnostics.event("dataImported.post.PhotoStore.hide")
-        PerformanceDiagnostics.count("dataImported.post.total")
-        #endif
-        NotificationCenter.default.post(name: .dataImported, object: nil)
+        DataRevisionStore.commit([.photo, .stats], reason: "PhotoStore.hide")
     }
 
     /// 请求读写权限并交由系统确认删除。iCloud 照片会同步到所有设备，系统会保留在“最近删除”。
@@ -137,8 +133,11 @@ enum PhotoStore {
             context.insert(record)
             added += 1
         }
-        try? context.save()
-        if added > 0 { invalidateIndex() }
+        do { try context.save() } catch { return 0 }
+        if added > 0 {
+            invalidateIndex()
+            DataRevisionStore.commit([.photo, .stats], reason: "PhotoStore.upsert")
+        }
         return added
     }
 
@@ -158,17 +157,16 @@ enum PhotoStore {
                                           timestamp: info.timestamp))
                     added += 1
                 }
-                try? bg.save()
+                do { try bg.save() } catch {
+                    continuation.resume(returning: 0)
+                    return
+                }
                 appLog.info("[Import] 照片后台入库：\(infos.count) 条 → 新增 \(added)")
                 if added > 0 {
                     await MainActor.run {
                         invalidateIndex()
-                        #if DEBUG
-                        PerformanceDiagnostics.event("dataImported.post.PhotoStore.upsert")
-                        PerformanceDiagnostics.count("dataImported.post.total")
-                        #endif
-                        NotificationCenter.default.post(name: .dataImported, object: nil)
                     }
+                    DataRevisionStore.commit([.photo, .stats], reason: "PhotoStore.upsertInBackground")
                 }
                 continuation.resume(returning: added)
             }

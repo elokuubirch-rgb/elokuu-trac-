@@ -290,9 +290,9 @@ struct SettingsScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
             refreshSourceCounts()
         }
-        .onReceive(NotificationCenter.default.publisher(for: .dataImported)) { _ in
+        .onReceive(NotificationCenter.default.publisher(for: .dataRevisionChanged)) { _ in
             #if DEBUG
-            PerformanceDiagnostics.event("dataImported.receive.SettingsScreen")
+            PerformanceDiagnostics.event("dataRevision.receive.SettingsScreen")
             #endif
             refreshSourceCounts()
             refreshHealthStatus()

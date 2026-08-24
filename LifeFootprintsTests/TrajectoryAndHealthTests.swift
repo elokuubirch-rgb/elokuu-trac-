@@ -72,4 +72,34 @@ final class TrajectoryAndHealthTests: XCTestCase {
             XCTAssertTrue(resolution.conflicts.isEmpty)
         }
     }
+
+    func testEmptyHealthSyncDoesNotInvalidateAnyDataDomain() {
+        let domains = HealthSyncInvalidationPolicy.domains(
+            workoutInsertedOrUpdated: false, workoutDeleted: false,
+            routeInsertedOrUpdated: false, routeDeleted: false)
+        XCTAssertTrue(domains.isEmpty)
+    }
+
+    func testRevisionsArePersistentAndDomainScoped() throws {
+        let suite = "DataRevisionTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let initial = DataRevisionStore.snapshot(defaults: defaults)
+        XCTAssertNil(DataRevisionStore.commit([], reason: "empty",
+                                              defaults: defaults, publish: false))
+        XCTAssertEqual(DataRevisionStore.snapshot(defaults: defaults), initial)
+
+        let statsChange = try XCTUnwrap(DataRevisionStore.commit(
+            [.stats], reason: "workout-summary", defaults: defaults, publish: false))
+        XCTAssertEqual(statsChange.current.trajectory, initial.trajectory)
+        XCTAssertEqual(statsChange.current.stats, initial.stats + 1)
+
+        let routeChange = try XCTUnwrap(DataRevisionStore.commit(
+            [.trajectory, .stats], reason: "route", defaults: defaults, publish: false))
+        XCTAssertEqual(routeChange.current.trajectory, initial.trajectory + 1)
+        XCTAssertEqual(routeChange.current.photo, initial.photo)
+        XCTAssertEqual(routeChange.current.place, initial.place)
+        XCTAssertEqual(routeChange.current.stats, initial.stats + 2)
+    }
 }
