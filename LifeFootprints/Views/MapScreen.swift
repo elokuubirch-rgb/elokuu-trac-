@@ -428,8 +428,9 @@ struct MapScreen: View {
         let lats = snaps.map { $0.lat }.sorted()
         let lons = snaps.map { $0.lon }.sorted()
         let lo = min(Int(Double(snaps.count) * 0.01), snaps.count / 2)
-        let hi = max(snaps.count - 1 - lo, lo + 1)
-        guard hi > lo else { return nil }
+        // 单点数据时原算法会得到 hi=1 并越界。把上界夹在最后一个合法下标；
+        // 两点及以上时结果与原百分位算法完全一致。
+        let hi = min(max(snaps.count - 1 - lo, lo + 1), snaps.count - 1)
         let minLat = lats[lo], maxLat = lats[hi]
         let minLon = lons[lo], maxLon = lons[hi]
         return MKCoordinateRegion(

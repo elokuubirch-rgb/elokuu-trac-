@@ -21,6 +21,34 @@ final class TrajectoryAndHealthTests: XCTestCase {
             [point], workoutSourceVisible: false), [point])
     }
 
+    func testBoundsRegionHandlesEmptyAndSinglePointSnapshots() throws {
+        XCTAssertNil(MapScreen.boundsRegion([]))
+
+        let point = FootprintSnapshot(
+            lat: 31.2304, lon: 121.4737,
+            t: Date(timeIntervalSince1970: 1_700_000_000))
+        let region = try XCTUnwrap(MapScreen.boundsRegion([point]))
+
+        XCTAssertEqual(region.center.latitude, point.lat, accuracy: 0.000_001)
+        XCTAssertEqual(region.center.longitude, point.lon, accuracy: 0.000_001)
+        XCTAssertEqual(region.span.latitudeDelta, 0.028, accuracy: 0.000_001)
+        XCTAssertEqual(region.span.longitudeDelta, 0.028, accuracy: 0.000_001)
+    }
+
+    func testBoundsRegionKeepsExistingPercentileBehaviorForMultiplePoints() throws {
+        let points = (0..<100).map { index in
+            FootprintSnapshot(
+                lat: Double(index), lon: Double(index) * 2,
+                t: Date(timeIntervalSince1970: Double(index)))
+        }
+        let region = try XCTUnwrap(MapScreen.boundsRegion(points))
+
+        XCTAssertEqual(region.center.latitude, 49.5, accuracy: 0.000_001)
+        XCTAssertEqual(region.center.longitude, 99, accuracy: 0.000_001)
+        XCTAssertEqual(region.span.latitudeDelta, 97 * 1.4, accuracy: 0.000_001)
+        XCTAssertEqual(region.span.longitudeDelta, 194 * 1.4, accuracy: 0.000_001)
+    }
+
     func testNoRouteRequiresAgeAndRepeatedConfirmation() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         let oldEnd = now.addingTimeInterval(-HealthRouteRetryPolicy.noRouteGracePeriod)
