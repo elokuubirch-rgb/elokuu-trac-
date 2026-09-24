@@ -19,6 +19,12 @@ struct PhotoAssetMetadata: Sendable {
 @MainActor
 enum PhotoThumbnailGenerator {
 
+    nonisolated static func clearLocalCache() {
+        let directory = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Thumbs", isDirectory: true)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
     /// 用 Photos 系统分类缩小候选池，不做尺寸猜测或人脸识别。
     nonisolated static func matchingIDs(_ localIDs: [String], filter: ReviewMediaFilter) -> [String] {
         guard filter != .all, !localIDs.isEmpty else { return localIDs }
@@ -81,7 +87,9 @@ enum PhotoThumbnailGenerator {
 
     /// 循环生成全部待生成缩略图（每 200 张一批，可中断续跑；App 生命周期内常驻）
     static func generateAllPending(in context: ModelContext) async {
+        guard let token = LocalImportCoordinator.shared.capture() else { return }
         while true {
+            guard LocalImportCoordinator.shared.isCurrent(token) else { return }
             let pending = PhotoStore.pendingThumbnails(in: context)
             guard !pending.isEmpty else { return }
             await generateBatch(pending, in: context)
@@ -99,6 +107,7 @@ enum PhotoThumbnailGenerator {
     }
 
     private static func generateBatch(_ pending: [PhotoRecord], in context: ModelContext) async {
+        guard let token = LocalImportCoordinator.shared.capture() else { return }
         let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Thumbs", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -107,6 +116,7 @@ enum PhotoThumbnailGenerator {
         for record in pending {
             // 批量生成：仅本地（iCloud 原图不触发下载，避免后台海量流量）
             if let image = await fetchThumbnail(localID: record.localIdentifier, allowNetwork: false) {
+                guard LocalImportCoordinator.shared.isCurrent(token) else { return }
                 let url = dir.appendingPathComponent("\(record.localIdentifier).jpg")
                 if let data = image.jpegData(compressionQuality: 0.75) {
                     try? data.write(to: url)
@@ -114,6 +124,7 @@ enum PhotoThumbnailGenerator {
                 }
             }
             // 无论本地是否有原图，都更新状态，避免死循环重试打爆内存与 CPU
+            guard LocalImportCoordinator.shared.isCurrent(token) else { return }
             record.thumbState = 1
             try? context.save()
             done += 1

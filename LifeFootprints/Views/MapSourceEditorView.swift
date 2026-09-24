@@ -8,6 +8,7 @@ struct MapSourceEditorView: View {
     @State private var minimumZoom = 0
     @State private var maximumZoom = 19
     @State private var attribution = ""
+    @State private var coordinateReferenceSystem: CoordinateReferenceSystem = .unknown
     @State private var validationMessage: String?
     @State private var inputNotice: String?
 
@@ -28,11 +29,16 @@ struct MapSourceEditorView: View {
                             .font(.caption)
                             .foregroundStyle(.green)
                     }
-                    Picker("坐标方案", selection: $scheme) {
+                    Picker("瓦片编号", selection: $scheme) {
                         Text("XYZ").tag(MapTileScheme.xyz)
                         Text("TMS").tag(MapTileScheme.tms)
                     }
                     .pickerStyle(.segmented)
+                    Picker("地图坐标基准", selection: $coordinateReferenceSystem) {
+                        Text("未知").tag(CoordinateReferenceSystem.unknown)
+                        Text("WGS-84").tag(CoordinateReferenceSystem.wgs84)
+                        Text("GCJ-02").tag(CoordinateReferenceSystem.gcj02)
+                    }
                 }
                 Section("缩放层级") {
                     Stepper("最小层级  \(minimumZoom)", value: $minimumZoom, in: 0...22)
@@ -69,7 +75,9 @@ struct MapSourceEditorView: View {
     private func save() {
         let source = CustomMapSource(name: name, urlTemplate: urlTemplate,
                                      scheme: scheme, minimumZoom: minimumZoom,
-                                     maximumZoom: maximumZoom, attribution: attribution)
+                                     maximumZoom: maximumZoom, attribution: attribution,
+                                     coordinateReferenceSystem: coordinateReferenceSystem == .unknown
+                                        ? nil : coordinateReferenceSystem)
         if let error = CustomMapSourceValidator.validationError(for: source) {
             validationMessage = error
             return

@@ -13,6 +13,11 @@ final class HealthKitSyncCoordinator {
     private var container: ModelContainer?
     private var isSyncing = false
     private var needsAnotherSync = false
+    private var didYieldToMapStartup = false
+    /// Retain the launch task for its entire lifetime. Creating two fire-and-forget
+    /// task futures here could let one future be torn down while its HealthKit/
+    /// SwiftData continuation was still completing on another executor.
+    private var activationTask: Task<Void, Never>?
 
     private init() {}
 
@@ -27,9 +32,19 @@ final class HealthKitSyncCoordinator {
 
     func activate(container: ModelContainer) {
         self.container = container
-        startObserversIfNeeded()
-        Task { await enableBackgroundDelivery() }
-        Task { _ = await synchronize(forceFull: false, forcePendingRetry: false) }
+        activationTask?.cancel()
+        activationTask = Task { [weak self] in
+            guard let self else { return }
+            // HKObserverQuery may invoke its update handler immediately when it is
+            // executed. Registering observers before this initial sync therefore
+            // creates two competing startup sync tasks. Finish the owned startup
+            // sync first, then install the long-lived observers.
+            await self.enableBackgroundDelivery()
+            guard !Task.isCancelled else { return }
+            _ = await self.synchronize(forceFull: false, forcePendingRetry: false)
+            guard !Task.isCancelled else { return }
+            self.startObserversIfNeeded()
+        }
     }
 
     func synchronizeManually(container: ModelContainer,
@@ -51,6 +66,8 @@ final class HealthKitSyncCoordinator {
     }
 
     func disableAutomaticSync() async {
+        activationTask?.cancel()
+        activationTask = nil
         for observer in observers { store.stop(observer) }
         observers.removeAll()
         let types: [HKObjectType] = [HKObjectType.workoutType(), HKSeriesType.workoutRoute()]
@@ -64,6 +81,16 @@ final class HealthKitSyncCoordinator {
         HealthKitSyncStatusStore.setEnabled(false)
     }
 
+    /// 完整清理前等待正在进行的本地同步收尾，避免 Reset 后旧任务再次写回模型。
+    func prepareForLocalDataReset() async {
+        await disableAutomaticSync()
+        while isSyncing {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        needsAnotherSync = false
+        container = nil
+    }
+
     @discardableResult
     private func synchronize(forceFull: Bool, forcePendingRetry: Bool,
                              progress: @escaping @Sendable (String) -> Void = { _ in }) async -> Int {
@@ -73,6 +100,19 @@ final class HealthKitSyncCoordinator {
             return 0
         }
         isSyncing = true
+        // Observer registration remains immediate. Give the launch preview a
+        // bounded head start before automatic maintenance starts using the store.
+        // Background-only launches have no map and resume after three seconds.
+        if !forceFull, !didYieldToMapStartup {
+            didYieldToMapStartup = true
+            for _ in 0..<30 {
+                let milestones = MapStartupDiagnostics.shared.snapshot()
+                if milestones[MapStartupMilestone.cachedContentReady.rawValue] != nil
+                    || milestones[MapStartupMilestone.visibleRegionFresh.rawValue] != nil { break }
+                do { try await Task.sleep(for: .milliseconds(100)) }
+                catch { isSyncing = false; return 0 }
+            }
+        }
         #if DEBUG
         PerformanceDiagnostics.event("HealthKit.sync.start",
                                      metadata: forceFull ? "full" : "incremental")
@@ -93,7 +133,10 @@ final class HealthKitSyncCoordinator {
         #endif
         if needsAnotherSync {
             needsAnotherSync = false
-            Task { _ = await synchronize(forceFull: false, forcePendingRetry: true) }
+            // Observer 在启动时可能由 Workout 与 Route 两个类型连续回调。
+            // 后续合并同步必须遵守持久退避时间；否则同一批 pending Workout
+            // 会在一次启动内被强制重试多轮，放大 HealthKit 查询与 SwiftData 写入。
+            Task { _ = await synchronize(forceFull: false, forcePendingRetry: false) }
         }
         return added
     }
@@ -117,7 +160,7 @@ final class HealthKitSyncCoordinator {
                 }
                 Task { @MainActor [weak self] in
                     if let self {
-                        _ = await self.synchronize(forceFull: false, forcePendingRetry: true)
+                        _ = await self.synchronize(forceFull: false, forcePendingRetry: false)
                     }
                     completion()
                 }

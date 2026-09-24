@@ -35,6 +35,7 @@ struct PhotoCluster: Identifiable {
     let thumbPath: String?
     /// 候选照片 id（随机抽选缩略图容错；spot 级含点击取图样例）
     let sampleIds: [String]?
+    var locationEvidence: String? = nil
 
     var coordinate: CLLocationCoordinate2D { CLLocationCoordinate2D(latitude: lat, longitude: lon) }
 }
@@ -55,6 +56,7 @@ private struct ClusterCell {
     /// 已经投影到真实轨迹的照片坐标。聚合完成后从中选择代表锚点，
     /// 避免弯曲路线的算术平均值落到路线外。
     var routeAnchors: [(latitude: Double, longitude: Double)] = []
+    var hasTimeInference = false
 }
 
 /// 四层聚合索引（后台一次性构建；含直辖市城市名规范化）
@@ -88,7 +90,9 @@ struct ClusterIndex {
     /// trails：轨迹索引（健康/记录路线）。精细级（点/单张）坐标经轨迹吸附，
     /// 让照片标记落在线路附近（方案 §4）；省市区级保持真实位置
     static func build(records: [PhotoRecord], trails: TrailIndex? = nil,
-                      onSnap: ((TrailSnapResult) -> Void)? = nil) -> ClusterIndex {
+                      associations: [String: TrailSnapResult] = [:],
+                      onSnap: ((TrailSnapResult) -> Void)? = nil,
+                      onAssociation: ((String, TrailSnapResult) -> Void)? = nil) -> ClusterIndex {
         let municipalities = Set(["北京市", "上海市", "天津市", "重庆市"])
         var pBuckets: [String: ClusterCell] = [:]
         var cBuckets: [String: ClusterCell] = [:]
@@ -97,6 +101,7 @@ struct ClusterIndex {
         var bBuckets: [String: ClusterCell] = [:]
         var sBuckets: [String: ClusterCell] = [:]
         var siBuckets: [String: ClusterCell] = [:]
+        var trailQueryContext = TrailSnapQueryContext()
         #if DEBUG
         var photoMatchingMilliseconds = 0.0
         var temporalQueryCount = 0
@@ -108,9 +113,10 @@ struct ClusterIndex {
         func add(_ cell: inout [String: ClusterCell], _ key: String, _ r: PhotoRecord,
                  lat: Double, lon: Double,
                  isCountry: Bool = false, nameForSpot: String? = nil,
-                 attachedToRoute: Bool = false) {
+                 attachedToRoute: Bool = false, timeInferred: Bool = false) {
             var c = cell[key] ?? ClusterCell()
             c.count += 1
+            c.hasTimeInference = c.hasTimeInference || timeInferred
             c.latSum += lat
             c.lonSum += lon
             c.isCountry = c.isCountry || isCountry
@@ -153,9 +159,10 @@ struct ClusterIndex {
             let matchingStarted = PerformanceDiagnostics.isEnabled ? CACurrentMediaTime() : 0
             #endif
             #if DEBUG
-            let snapResult = snapPhotoToTrailResult(
+            let snapResult = associations[r.localIdentifier] ?? snapPhotoToTrailResult(
                 lat: r.latitude, lon: r.longitude,
                 time: r.timestamp.timeIntervalSince1970, trails: trails,
+                queryContext: &trailQueryContext,
                 onTemporalQuery: { stats in
                     temporalQueryCount += 1
                     temporalIndexedCandidates += stats.indexedCandidateCount
@@ -167,11 +174,13 @@ struct ClusterIndex {
                 photoMatchingMilliseconds += (CACurrentMediaTime() - matchingStarted) * 1_000
             }
             #else
-            let snapResult = snapPhotoToTrailResult(
+            let snapResult = associations[r.localIdentifier] ?? snapPhotoToTrailResult(
                 lat: r.latitude, lon: r.longitude,
-                time: r.timestamp.timeIntervalSince1970, trails: trails)
+                time: r.timestamp.timeIntervalSince1970, trails: trails,
+                queryContext: &trailQueryContext)
             #endif
             onSnap?(snapResult)
+            onAssociation?(r.localIdentifier, snapResult)
             let snapped = (snapResult.lat, snapResult.lon)
             let attachedToRoute = snapResult.kind != .kept
             add(&pBuckets, province, r, lat: r.latitude, lon: r.longitude, isCountry: isCountry)
@@ -182,25 +191,29 @@ struct ClusterIndex {
                                      (snapped.0 * 10).rounded() / 10,
                                      (snapped.1 * 10).rounded() / 10)
             add(&dBuckets, districtKey, r, lat: snapped.0, lon: snapped.1,
-                nameForSpot: district ?? city, attachedToRoute: attachedToRoute)
+                nameForSpot: district ?? city, attachedToRoute: attachedToRoute,
+                timeInferred: snapResult.kind == .interpolated)
             // 乡镇级：0.05°≈5km 网格（吸附坐标；照片组贴路线）
             let townKey = String(format: "%.2f_%.2f",
                                  (snapped.0 * 20).rounded() / 20,
                                  (snapped.1 * 20).rounded() / 20)
             add(&tBuckets, townKey, r, lat: snapped.0, lon: snapped.1,
-                nameForSpot: district ?? city, attachedToRoute: attachedToRoute)
+                nameForSpot: district ?? city, attachedToRoute: attachedToRoute,
+                timeInferred: snapResult.kind == .interpolated)
             // 街区级：0.02°≈2km 网格（吸附坐标；照片组贴路线）
             let blockKey = String(format: "%.2f_%.2f",
                                   (snapped.0 * 50).rounded() / 50,
                                   (snapped.1 * 50).rounded() / 50)
             add(&bBuckets, blockKey, r, lat: snapped.0, lon: snapped.1,
-                nameForSpot: district ?? city, attachedToRoute: attachedToRoute)
+                nameForSpot: district ?? city, attachedToRoute: attachedToRoute,
+                timeInferred: snapResult.kind == .interpolated)
             // 地点级：0.005°≈500m 网格（吸附坐标）
             let spotKey = String(format: "%.3f_%.3f",
                                  (snapped.0 * 200).rounded() / 200,
                                  (snapped.1 * 200).rounded() / 200)
             add(&sBuckets, spotKey, r, lat: snapped.0, lon: snapped.1,
-                nameForSpot: district ?? city, attachedToRoute: attachedToRoute)
+                nameForSpot: district ?? city, attachedToRoute: attachedToRoute,
+                timeInferred: snapResult.kind == .interpolated)
             // 路线照片在最细层仍按约 150m 分组，保持“沿路线的照片组”；
             // 非路线照片保留约 55m 精度。
             let singleFactor = attachedToRoute ? 750.0 : 2000.0
@@ -208,7 +221,8 @@ struct ClusterIndex {
                                    (snapped.0 * singleFactor).rounded() / singleFactor,
                                    (snapped.1 * singleFactor).rounded() / singleFactor)
             add(&siBuckets, singleKey, r, lat: snapped.0, lon: snapped.1,
-                nameForSpot: district ?? city, attachedToRoute: attachedToRoute)
+                nameForSpot: district ?? city, attachedToRoute: attachedToRoute,
+                timeInferred: snapResult.kind == .interpolated)
         }
 
         func cluster(_ buckets: [String: ClusterCell], level: PhotoCluster.Level,
@@ -231,7 +245,9 @@ struct ClusterIndex {
                     lon: anchor.longitude,
                     isCountryLevel: level == .province && cell.isCountry,
                     thumbPath: cell.thumb,
-                    sampleIds: cell.samples.isEmpty ? nil : cell.samples)
+                    sampleIds: cell.samples.isEmpty ? nil : cell.samples,
+                    locationEvidence: cell.hasTimeInference ? "时间推断" :
+                        (cell.routeAnchors.isEmpty ? nil : "轨迹参考"))
             }
         }
 
@@ -248,6 +264,10 @@ struct ClusterIndex {
             "TrailIndex.temporalContainingCandidates", by: temporalContainingCandidates)
         PerformanceDiagnostics.count(
             "TrailIndex.temporalAvoidedCandidates", by: temporalAvoidedCandidates)
+        PerformanceDiagnostics.count(
+            "TrailIndex.spatialCacheHit", by: trailQueryContext.spatialCacheHits)
+        PerformanceDiagnostics.count(
+            "TrailIndex.spatialCacheMiss", by: trailQueryContext.spatialCacheMisses)
         #endif
         return ClusterIndex(
             province: cluster(pBuckets, level: .province) { key, _ in key },

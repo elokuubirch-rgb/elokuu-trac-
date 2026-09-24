@@ -5,7 +5,7 @@ import Photos
 import QuartzCore
 
 /// 照片扫描元数据（不含缩略图）
-struct PhotoInfo {
+struct PhotoInfo: Sendable {
     var localIdentifier: String
     var latitude: Double
     var longitude: Double
@@ -75,6 +75,15 @@ enum PhotoStore {
         indexBuilt = false
     }
 
+    static func resetLocalState() {
+        UserDefaults.standard.removeObject(forKey: hiddenPhotoIDsKey)
+        indexedAll.removeAll(keepingCapacity: false)
+        indexedByID.removeAll(keepingCapacity: false)
+        indexedByRegion.removeAll(keepingCapacity: false)
+        indexedRegionList.removeAll(keepingCapacity: false)
+        indexBuilt = false
+    }
+
     private static func ensureIndex(_ context: ModelContext) {
         guard !indexBuilt else { return }
         rebuildIndex(in: context)
@@ -141,35 +150,76 @@ enum PhotoStore {
         return added
     }
 
-    /// 后台线程版入库（万级照片专用）
+    /// Serialized storage; callers capture the token before permission/scanning.
     static func upsertInBackground(_ infos: [PhotoInfo], container: ModelContainer) async -> Int {
-        await withCheckedContinuation { continuation in
-            Task.detached(priority: .userInitiated) {
+        await importPhotos(infos, container: container).added
+    }
+
+    static func importPhotos(_ infos: [PhotoInfo], container: ModelContainer,
+                             token suppliedToken: LocalImportCoordinator.Token? = nil) async -> LocalImportResult {
+        let coordinator = LocalImportCoordinator.shared
+        guard let token = suppliedToken ?? coordinator.capture() else {
+            return LocalImportResult(status: .cancelled)
+        }
+        do {
+            let result = try await coordinator.run(token: token) {
                 let bg = ModelContext(container)
                 bg.autosaveEnabled = false
-                let existing = Set((try? bg.fetch(FetchDescriptor<PhotoRecord>()))?.map(\.localIdentifier) ?? [])
+                let records = try bg.fetch(FetchDescriptor<PhotoRecord>())
+                var existing: [String: PhotoRecord] = [:]
+                for record in records { existing[record.localIdentifier] = record }
                 let hidden = hiddenPhotoIDs()
-                var added = 0
-                for info in infos where !existing.contains(info.localIdentifier) && !hidden.contains(info.localIdentifier) {
-                    bg.insert(PhotoRecord(localIdentifier: info.localIdentifier,
-                                          latitude: info.latitude,
-                                          longitude: info.longitude,
-                                          timestamp: info.timestamp))
-                    added += 1
-                }
-                do { try bg.save() } catch {
-                    continuation.resume(returning: 0)
-                    return
-                }
-                appLog.info("[Import] 照片后台入库：\(infos.count) 条 → 新增 \(added)")
-                if added > 0 {
-                    await MainActor.run {
-                        invalidateIndex()
+                var result = LocalImportResult()
+                for (index, info) in infos.enumerated() {
+                    if index.isMultiple(of: 256), !coordinator.isCurrent(token) {
+                        throw LocalImportCoordinator.Failure.invalidated
                     }
-                    DataRevisionStore.commit([.photo, .stats], reason: "PhotoStore.upsertInBackground")
+                    guard GeoMath.isValid(latitude: info.latitude, longitude: info.longitude),
+                          info.timestamp.timeIntervalSince1970.isFinite else {
+                        result.invalid += 1
+                        continue
+                    }
+                    guard !hidden.contains(info.localIdentifier) else {
+                        result.duplicates += 1
+                        continue
+                    }
+                    if let record = existing[info.localIdentifier] {
+                        if record.latitude != info.latitude || record.longitude != info.longitude
+                            || record.timestamp != info.timestamp {
+                            record.latitude = info.latitude
+                            record.longitude = info.longitude
+                            record.timestamp = info.timestamp
+                            record.countryName = nil
+                            record.provinceName = nil
+                            record.cityName = nil
+                            record.districtName = nil
+                            record.regionState = 0
+                            result.updated += 1
+                        } else { result.duplicates += 1 }
+                    } else {
+                        let record = PhotoRecord(localIdentifier: info.localIdentifier,
+                                                 latitude: info.latitude, longitude: info.longitude,
+                                                 timestamp: info.timestamp)
+                        bg.insert(record)
+                        existing[info.localIdentifier] = record
+                        result.added += 1
+                    }
                 }
-                continuation.resume(returning: added)
+                guard coordinator.isCurrent(token) else {
+                    throw LocalImportCoordinator.Failure.invalidated
+                }
+                try bg.save()
+                if result.added + result.updated > 0 {
+                    DataRevisionStore.commit([.photo, .stats], reason: "PhotoStore.importPhotos")
+                }
+                return result
             }
+            if coordinator.isCurrent(token), result.added + result.updated > 0 {
+                invalidateIndex()
+            }
+            return result
+        } catch {
+            return LocalImportResult(status: coordinator.isCurrent(token) ? .failed : .cancelled)
         }
     }
 

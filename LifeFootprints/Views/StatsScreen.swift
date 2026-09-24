@@ -10,6 +10,9 @@ struct StatsScreen: View {
     @State private var cachedStats = FootprintStats()
     /// 密集区域聚类：后台重算后缓存，body 零重活（P0）。
     @State private var cachedClusters: [StatsDenseArea] = []
+    @State private var hasSummary = false
+    @State private var statsRefreshing = true
+    @State private var persistentLoadGeneration = 0
     @State private var clustersGeneration = 0
     @State private var appliedClusterKey: StatsClusterCacheKey?
     @State private var clusterConsumerTask: Task<Void, Never>?
@@ -30,10 +33,22 @@ struct StatsScreen: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 14) {
+                    if statsRefreshing {
+                        HStack(spacing: 7) {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text("正在更新统计…")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                        .accessibilityElement(children: .combine)
+                    }
                     HStack(spacing: 12) {
-                        statCard("足迹点", "\(stats.pointCount)")
-                        statCard("总里程", String(format: "%.0f KM", stats.distanceKM))
-                        statCard("活跃天", "\(stats.activeDays)")
+                        statCard("足迹点", hasSummary ? "\(stats.pointCount)" : "—")
+                        statCard("总里程", hasSummary
+                            ? String(format: "%.0f KM", stats.distanceKM) : "—")
+                        statCard("活跃天", hasSummary ? "\(stats.activeDays)" : "—")
                     }
                     yearlyCard
                     clustersCard
@@ -76,7 +91,8 @@ struct StatsScreen: View {
             PerformanceDiagnostics.event("StatsScreen.onAppear")
             MapDebugLog.log("StatsScreen onAppear（挂载）")
             #endif
-            refreshCache()
+            refreshFromMemory()
+            loadPersistentSnapshot()
         }
         .onChange(of: isActive) { _, active in
             #if DEBUG
@@ -86,7 +102,7 @@ struct StatsScreen: View {
             if active { scheduleClustersRebuild() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
-            refreshCache()
+            refreshFromMemory()
         }
         .onReceive(NotificationCenter.default.publisher(for: .dataRevisionChanged)) { notification in
             guard let change = notification.object as? DataRevisionChange,
@@ -94,7 +110,16 @@ struct StatsScreen: View {
             #if DEBUG
             PerformanceDiagnostics.event("dataRevision.receive.StatsScreen")
             #endif
-            refreshCache()
+            statsRefreshing = true
+            loadPersistentSnapshot()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .localDataReset)) { _ in
+            snapshots = []
+            cachedStats = FootprintStats()
+            cachedClusters = []
+            hasSummary = true
+            statsRefreshing = false
+            appliedClusterKey = nil
         }
         #if DEBUG
         .onReceive(NotificationCenter.default.publisher(for: .performanceOpenSettings)) { _ in
@@ -163,10 +188,60 @@ struct StatsScreen: View {
         year >= currentYear - 1 ? theme.color : Color.white.opacity(0.15)
     }
 
-    private func refreshCache() {
+    private func refreshFromMemory() {
         snapshots = SnapshotCache.pointSnapshots
-        cachedStats = SnapshotCache.stats
+        if SnapshotCache.pointSnapshotGeneration > 0 {
+            cachedStats = SnapshotCache.stats
+            hasSummary = true
+            statsRefreshing = false
+        }
         scheduleClustersRebuild()
+    }
+
+    /// Read a tiny projection from disk. A stale projection remains visible while the
+    /// map pipeline refreshes it, so switching tabs never flashes back to zero.
+    private func loadPersistentSnapshot() {
+        persistentLoadGeneration += 1
+        let generation = persistentLoadGeneration
+        let revision = DataRevisionStore.snapshot()
+        Task {
+            let loaded = await Task.detached(priority: .userInitiated) {
+                let stored = StatsSnapshotStore.shared.load(revision: revision)
+                guard stored == nil,
+                      let preview = MapDisplaySnapshotStore.shared.load(
+                        revision: revision) else {
+                    return (stored, Optional<FootprintStats>.none, false)
+                }
+                let isFresh = preview.placeRevision == revision.place
+                if isFresh {
+                    _ = StatsSnapshotStore.shared.saveSummary(
+                        preview.stats, revision: revision)
+                }
+                return (stored, Optional(preview.stats), isFresh)
+            }.value
+            guard generation == persistentLoadGeneration else { return }
+            if let result = loaded.0 {
+                if !hasSummary || result.summaryIsFresh {
+                    cachedStats = result.snapshot.stats
+                    hasSummary = true
+                }
+                statsRefreshing = !result.summaryIsFresh
+                if result.clustersAreFresh {
+                    cachedClusters = result.snapshot.clusters
+                    appliedClusterKey = StatsClusterCacheKey(
+                        placeRevision: revision.place,
+                        trajectoryRevision: revision.trajectory,
+                        snapshotGeneration: SnapshotCache.pointSnapshotGeneration)
+                }
+            } else if let previewStats = loaded.1 {
+                cachedStats = previewStats
+                hasSummary = true
+                statsRefreshing = !loaded.2
+            } else {
+                statsRefreshing = true
+            }
+            scheduleClustersRebuild()
+        }
     }
 
     /// 聚类结果按持久数据 revision 复用；并发 consumer 共用同一个后台 task。
@@ -183,12 +258,13 @@ struct StatsScreen: View {
             #endif
             return
         }
+        let source = snapshots
+        guard !source.isEmpty else { return }
         #if DEBUG
         PerformanceDiagnostics.count("StatsCluster.consumer.started")
         #endif
         clustersGeneration += 1
         let generation = clustersGeneration
-        let source = snapshots
         clusterConsumerTask?.cancel()
         clusterConsumerTask = Task {
             let result = await StatsClusterRevisionCache.shared.value(

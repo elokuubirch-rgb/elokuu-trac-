@@ -18,7 +18,8 @@ import SwiftData
 ///   FP_LANGUAGE=zh-Hans|zh-Hant|en|fr  初始应用语言
 ///   FP_SEED_CUSTOM_MAP=1           注入并选中测试瓦片源（验证冷启动恢复）
 ///   FP_PERF_VISUAL_SEED=1          注入确定性轨迹，供性能修复前后地图视觉回归
-///   FP_MAP=standard|satellite|topographic  初始地图源
+///   FP_PERF_LARGE_SCALE_SEED=1     在隔离模拟器注入 182 万点确定性性能夹具
+///   FP_MAP=standard|quiet|satellite|topographic  初始地图源
 ///   FP_PITCH=0...70                初始地图俯角
 ///   FP_PHOTO_TOGGLE=1              快速关闭/开启照片图层回归测试
 ///   FP_ROUTE_TOGGLE=1              快速隐藏/显示路线崩溃回归测试
@@ -44,6 +45,15 @@ enum TestHooks {
     static var autoReviewGroup: Bool { env["FP_AUTO_REVIEW_GROUP"] == "1" }
     static var autoOrientationSwipe: Bool { env["FP_AUTO_ORIENTATION_SWIPE"] == "1" }
     static var reviewDeletionCount: Int? { env["FP_REVIEW_DELETE_COUNT"].flatMap(Int.init) }
+    @MainActor private static var didConsumeReviewDeletionFixture = false
+    @MainActor static func consumeReviewDeletionCount() -> Int? {
+        guard !didConsumeReviewDeletionFixture, let count = reviewDeletionCount else { return nil }
+        didConsumeReviewDeletionFixture = true
+        return count
+    }
+    static var simulateReviewDeletionSuccess: Bool {
+        env["FP_REVIEW_SIMULATE_DELETE_SUCCESS"] == "1"
+    }
     static var photosHidden: Bool { env["FP_PHOTOS"] == "0" }
     static var photoToggle: Bool { env["FP_PHOTO_TOGGLE"] == "1" }
     static var routeToggle: Bool { env["FP_ROUTE_TOGGLE"] == "1" }
@@ -54,7 +64,264 @@ enum TestHooks {
     static var seedCustomMap: Bool { env["FP_SEED_CUSTOM_MAP"] == "1" }
     static var tabCycle: Bool { env["FP_TAB_CYCLE"] == "1" }
     static var performanceAutoCycle: Bool { env["FP_PERF_AUTO_CYCLE"] == "1" }
+    static var performanceScenario: String? { env["FP_PERF_SCENARIO"] }
     static var performanceVisualSeed: Bool { env["FP_PERF_VISUAL_SEED"] == "1" }
+    static var performanceLargeScaleSeed: Bool {
+        env["FP_PERF_LARGE_SCALE_SEED"] == "1"
+    }
+
+    /// 只用于隔离模拟器的等规模夹具。它不复刻用户坐标，而是精确复刻会影响
+    /// SwiftData、轨迹构建、冲突解析和 MapKit presentation 的记录数量与边界。
+    /// 若数据库不是空库或目标精确夹具，立即拒绝混写。
+    nonisolated static func seedLargeScalePerformanceData(
+        into container: ModelContainer
+    ) async -> Bool {
+        await Task.detached(priority: .utility) {
+            do {
+                let inventory = ModelContext(container)
+                inventory.autosaveEnabled = false
+                let existing = (
+                    footprints: try inventory.fetchCount(FetchDescriptor<FootprintPoint>()),
+                    photos: try inventory.fetchCount(FetchDescriptor<PhotoRecord>()),
+                    workouts: try inventory.fetchCount(FetchDescriptor<WorkoutRecord>()),
+                    routes: try inventory.fetchCount(FetchDescriptor<WorkoutRouteRecord>()),
+                    routePoints: try inventory.fetchCount(FetchDescriptor<WorkoutRoutePoint>())
+                )
+                if existing == largeScaleTarget {
+                    PerformanceDiagnostics.event("PERF_LARGE_SCALE_SEED_COMPLETE")
+                    PerformanceDiagnostics.flush()
+                    return true
+                }
+                guard existing == (0, 0, 0, 0, 0) else {
+                    PerformanceDiagnostics.event("PERF_LARGE_SCALE_SEED_REFUSED_NONEMPTY")
+                    PerformanceDiagnostics.flush()
+                    return false
+                }
+
+                try PerformanceDiagnostics.measure("PerfSeed.workoutMetadata") {
+                    let context = ModelContext(container)
+                    context.autosaveEnabled = false
+                    for workoutIndex in 0..<largeScaleTarget.workouts {
+                        let workoutID = "perf-workout-\(workoutIndex)"
+                        let start = healthRouteStart(workoutIndex)
+                        let hasRoute = workoutIndex < largeScaleTarget.routes
+                        context.insert(WorkoutRecord(
+                            healthKitUUID: workoutID, workoutType: "walking",
+                            startDate: start, endDate: start.addingTimeInterval(7_200),
+                            duration: 7_200, distanceMeters: hasRoute ? 8_000 : 0,
+                            caloriesKCal: hasRoute ? 420 : 0, elevationGain: 30,
+                            routeAvailable: hasRoute,
+                            routeSyncState: hasRoute ? .available : .noRoute))
+                        if hasRoute {
+                            context.insert(WorkoutRouteRecord(
+                                routeID: "perf-route-\(workoutIndex)",
+                                workoutID: workoutID,
+                                sourceIdentifier: "performance-scale-fixture",
+                                createdAt: start))
+                        }
+                    }
+                    try context.save()
+                }
+                PerformanceDiagnostics.count("PerfSeed.workouts", by: largeScaleTarget.workouts)
+                PerformanceDiagnostics.count("PerfSeed.routes", by: largeScaleTarget.routes)
+                PerformanceDiagnostics.flush()
+
+                try persistFootprints(into: container)
+                try persistRoutePoints(into: container)
+                try persistPhotos(into: container)
+
+                let verification = ModelContext(container)
+                verification.autosaveEnabled = false
+                let result = (
+                    footprints: try verification.fetchCount(FetchDescriptor<FootprintPoint>()),
+                    photos: try verification.fetchCount(FetchDescriptor<PhotoRecord>()),
+                    workouts: try verification.fetchCount(FetchDescriptor<WorkoutRecord>()),
+                    routes: try verification.fetchCount(FetchDescriptor<WorkoutRouteRecord>()),
+                    routePoints: try verification.fetchCount(FetchDescriptor<WorkoutRoutePoint>())
+                )
+                guard result == largeScaleTarget else {
+                    PerformanceDiagnostics.event("PERF_LARGE_SCALE_SEED_VERIFY_FAILED")
+                    PerformanceDiagnostics.flush()
+                    return false
+                }
+                PerformanceDiagnostics.event("PERF_LARGE_SCALE_SEED_COMPLETE")
+                PerformanceDiagnostics.flush()
+                return true
+            } catch {
+                PerformanceDiagnostics.event(
+                    "PERF_LARGE_SCALE_SEED_FAILED", metadata: error.localizedDescription)
+                PerformanceDiagnostics.flush()
+                return false
+            }
+        }.value
+    }
+
+    private nonisolated static let largeScaleTarget = (
+        footprints: 116_384,
+        photos: 16_106,
+        workouts: 1_282,
+        routes: 269,
+        routePoints: 1_710_404
+    )
+    private nonisolated static let trajectoryFootprintCount = 112_579
+    private nonisolated static let footprintTrajectoryCount = 3_202
+    private nonisolated static let fixtureEpoch = Date(timeIntervalSince1970: 1_577_836_800)
+
+    private nonisolated static func persistFootprints(into container: ModelContainer) throws {
+        let batchSize = 5_000
+        var lower = 0
+        while lower < largeScaleTarget.footprints {
+            let upper = min(lower + batchSize, largeScaleTarget.footprints)
+            try autoreleasepool {
+                let context = ModelContext(container)
+                context.autosaveEnabled = false
+                for index in lower..<upper {
+                    if index < trajectoryFootprintCount {
+                        let location = footprintLocation(globalIndex: index)
+                        context.insert(FootprintPoint(draft: FootprintDraft(
+                            latitude: location.latitude, longitude: location.longitude,
+                            timestamp: location.timestamp,
+                            source: FootprintSource.csv.rawValue)))
+                    } else {
+                        let offset = index - trajectoryFootprintCount
+                        context.insert(FootprintPoint(draft: FootprintDraft(
+                            latitude: 20 + Double(offset % 100) * 0.001,
+                            longitude: 105 + Double((offset / 100) % 100) * 0.001,
+                            timestamp: fixtureEpoch.addingTimeInterval(Double(index) * 60),
+                            source: FootprintSource.manual.rawValue)))
+                    }
+                }
+                try context.save()
+            }
+            PerformanceDiagnostics.count("PerfSeed.footprints", by: upper - lower)
+            PerformanceDiagnostics.flush()
+            lower = upper
+        }
+    }
+
+    private nonisolated static func persistRoutePoints(into container: ModelContainer) throws {
+        let batchSize = 5_000
+        var lower = 0
+        while lower < largeScaleTarget.routePoints {
+            let upper = min(lower + batchSize, largeScaleTarget.routePoints)
+            try autoreleasepool {
+                let context = ModelContext(container)
+                context.autosaveEnabled = false
+                for index in lower..<upper {
+                    let location = healthLocation(globalIndex: index)
+                    let workoutID = "perf-workout-\(location.route)"
+                    context.insert(WorkoutRoutePoint(
+                        workoutID: workoutID,
+                        latitude: location.latitude, longitude: location.longitude,
+                        altitude: 20 + sin(Double(location.point) * 0.01) * 5,
+                        timestamp: location.timestamp,
+                        routeID: "perf-route-\(location.route)",
+                        segmentIndex: 0, pointIndex: location.point,
+                        horizontalAccuracy: 5, verticalAccuracy: 8,
+                        speed: 1.4, course: 45,
+                        sourceIdentifier: "performance-scale-fixture"))
+                }
+                try context.save()
+            }
+            PerformanceDiagnostics.count("PerfSeed.routePoints", by: upper - lower)
+            PerformanceDiagnostics.flush()
+            lower = upper
+        }
+    }
+
+    private nonisolated static func persistPhotos(into container: ModelContainer) throws {
+        let batchSize = 5_000
+        var lower = 0
+        while lower < largeScaleTarget.photos {
+            let upper = min(lower + batchSize, largeScaleTarget.photos)
+            try autoreleasepool {
+                let context = ModelContext(container)
+                context.autosaveEnabled = false
+                for index in lower..<upper {
+                    let footprintIndex = index % trajectoryFootprintCount
+                    let location = footprintLocation(globalIndex: footprintIndex)
+                    let photo = PhotoRecord(
+                        localIdentifier: "performance-scale-photo-\(index)",
+                        latitude: location.latitude, longitude: location.longitude,
+                        timestamp: location.timestamp.addingTimeInterval(5), altitude: 20)
+                    photo.countryName = "性能测试"
+                    photo.provinceName = "确定性夹具"
+                    photo.cityName = "网格-\(index % 32)"
+                    photo.districtName = "分区-\(index % 128)"
+                    photo.regionState = 1
+                    context.insert(photo)
+                }
+                try context.save()
+            }
+            PerformanceDiagnostics.count("PerfSeed.photos", by: upper - lower)
+            PerformanceDiagnostics.flush()
+            lower = upper
+        }
+    }
+
+    private nonisolated static func footprintLocation(
+        globalIndex: Int
+    ) -> (route: Int, point: Int, latitude: Double, longitude: Double, timestamp: Date) {
+        let longRouteCount = 509
+        let longRoutePoints = 36
+        let prefix = longRouteCount * longRoutePoints
+        let route: Int
+        let point: Int
+        if globalIndex < prefix {
+            route = globalIndex / longRoutePoints
+            point = globalIndex % longRoutePoints
+        } else {
+            let remainder = globalIndex - prefix
+            route = longRouteCount + remainder / 35
+            point = remainder % 35
+        }
+        precondition(route < footprintTrajectoryCount)
+        let origin = routeOrigin(route)
+        let phase = Double(point) / 35
+        return (
+            route, point,
+            origin.latitude + phase * 0.002,
+            origin.longitude + phase * 0.003 + sin(phase * .pi * 2) * 0.0003,
+            fixtureEpoch.addingTimeInterval(Double(route * 3_600 + point * 10)))
+    }
+
+    private nonisolated static func healthLocation(
+        globalIndex: Int
+    ) -> (route: Int, point: Int, latitude: Double, longitude: Double, timestamp: Date) {
+        let longRouteCount = 102
+        let longRoutePoints = 6_359
+        let prefix = longRouteCount * longRoutePoints
+        let route: Int
+        let point: Int
+        if globalIndex < prefix {
+            route = globalIndex / longRoutePoints
+            point = globalIndex % longRoutePoints
+        } else {
+            let remainder = globalIndex - prefix
+            route = longRouteCount + remainder / 6_358
+            point = remainder % 6_358
+        }
+        let alignedFootprintRoute = min(route * 12, footprintTrajectoryCount - 1)
+        let origin = routeOrigin(alignedFootprintRoute)
+        let phase = Double(point) / 6_358
+        return (
+            route, point,
+            origin.latitude + phase * 0.018,
+            origin.longitude + phase * 0.024 + sin(phase * .pi * 4) * 0.0005,
+            healthRouteStart(route).addingTimeInterval(Double(point)))
+    }
+
+    private nonisolated static func healthRouteStart(_ route: Int) -> Date {
+        fixtureEpoch.addingTimeInterval(Double(route * 12 * 3_600))
+    }
+
+    private nonisolated static func routeOrigin(
+        _ route: Int
+    ) -> (latitude: Double, longitude: Double) {
+        let row = route % 64
+        let column = (route / 64) % 64
+        return (22 + Double(row) * 0.08, 105 + Double(column) * 0.12)
+    }
 
     /// 性能专项的确定性地图夹具。坐标、顺序和来源固定，确保优化前后的截图可逐像素比较。
     /// 仅 DEBUG 环境变量可触发，不进入正式业务路径。

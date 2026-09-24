@@ -1,5 +1,6 @@
 import SwiftUI
 import SwiftData
+import MapKit
 
 extension Notification.Name {
     static let mapSnapshotReady = Notification.Name("mapSnapshotReady")
@@ -22,10 +23,23 @@ enum MapEntrySource: Equatable {
 }
 
 struct MapPhotoHighlight: Equatable {
+    let requestID = UUID()
     let assetID: String
     let latitude: Double
     let longitude: Double
+    let timestamp: Date
+    let thumbnailPath: String?
     let clusterID: String?
+    /// 从回顾进入地图时使用的附近视野宽度；避免沿用全览地图的缩放级别。
+    let focusDistance: Double
+
+    var focusRegion: MKCoordinateRegion {
+        let delta = max(focusDistance / 55_000, 0.001)
+        return MKCoordinateRegion(
+            center: CLLocationCoordinate2D(latitude: latitude, longitude: longitude),
+            span: MKCoordinateSpan(latitudeDelta: delta, longitudeDelta: delta)
+        )
+    }
 }
 
 struct MapCameraSnapshot: Equatable {
@@ -68,12 +82,25 @@ final class AppNavigationCoordinator {
         mapPhotoHighlight = MapPhotoHighlight(assetID: photo.localIdentifier,
                                               latitude: photo.latitude,
                                               longitude: photo.longitude,
-                                              clusterID: nil)
+                                              timestamp: photo.timestamp,
+                                              thumbnailPath: photo.thumbnailPath,
+                                              clusterID: nil,
+                                              focusDistance: 1_200)
         selectedTab = .map
     }
 
     func returnToReview() {
         guard suspendedReviewContext != nil else { return }
+        if let session = globalReviewSession {
+            session.reconcileAvailablePhotos()
+            reviewOverviewGroups = reviewOverviewGroups.compactMap { group in
+                let available = session.availablePhotoIDs(from: group.photoIDs)
+                guard !available.isEmpty else { return nil }
+                return ReviewOverviewGroup(title: group.title, photoIDs: available,
+                                           previewID: group.previewID, completed: group.completed)
+            }
+            if session.photos.isEmpty { globalReviewSession = nil }
+        }
         mapEntrySource = .mapTab
         mapPhotoHighlight = nil
         selectedTab = .review
@@ -92,6 +119,7 @@ struct MainTabView: View {
     @AppStorage("mapType") private var mapTypeRaw = "standard"
     @Environment(\.modelContext) private var context
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var navigation: AppNavigationCoordinator
     /// 纯净模式：双击「地图」tab 切换（隐藏全部功能控件，图层保留）
     @State private var chromeHidden = false
@@ -115,11 +143,13 @@ struct MainTabView: View {
         #if DEBUG
         let _ = PerformanceDiagnostics.event("MainTabView.body")
         #endif
+        GeometryReader { viewport in
         ZStack(alignment: .bottom) {
             // P0 性能：三个主页面全部常驻（KEEP ALIVE）。切换 Tab 只改变绘制层级与
             // 命中测试，绝不销毁页面 —— 地图实例、回顾会话、统计缓存跨 Tab 存活。
             ZStack {
                 MapScreen(chromeHidden: $chromeHidden, navigation: navigation)
+                    .frame(width: viewport.size.width, height: viewport.size.height)
                     .zIndex(navigation.selectedTab == .map ? 1 : 0)
                     .allowsHitTesting(navigation.selectedTab == .map)
                     .accessibilityHidden(navigation.selectedTab != .map)
@@ -133,10 +163,14 @@ struct MainTabView: View {
                     onReturnToMap: { navigation.selectedTab = .map },
                     onImmersiveChanged: { reviewImmersive = $0 }
                 )
+                .frame(width: viewport.size.width, height: viewport.size.height)
+                // 回顾照片的氛围背景需要延伸到状态栏和 Home Indicator 下方。
+                // 只裁切照片卡片自身，不能在 Tab 根层裁切整个回顾页的安全区外绘制。
                 .zIndex(navigation.selectedTab == .review ? 1 : 0)
                 .allowsHitTesting(navigation.selectedTab == .review)
                 .accessibilityHidden(navigation.selectedTab != .review)
                 StatsScreen(isActive: navigation.selectedTab == .statistics)
+                    .frame(width: viewport.size.width, height: viewport.size.height)
                     .zIndex(navigation.selectedTab == .statistics ? 1 : 0)
                     .allowsHitTesting(navigation.selectedTab == .statistics)
                     .accessibilityHidden(navigation.selectedTab != .statistics)
@@ -188,49 +222,55 @@ struct MainTabView: View {
             .task {
                 #if DEBUG
                 guard TestHooks.performanceAutoCycle else { return }
-                try? await Task.sleep(for: .seconds(8))
                 for _ in 0..<600 where SnapshotCache.clusterIndex == nil {
                     try? await Task.sleep(for: .milliseconds(500))
                 }
+                let requestedScenario = TestHooks.performanceScenario
                 PerformanceDiagnostics.event(
                     "AUDIT_STEADY_STATE_BEGIN",
-                    metadata: "snapshots=\(SnapshotCache.pointSnapshots.count)|clustersReady=\(SnapshotCache.clusterIndex != nil)")
+                    metadata: "scenario=\(requestedScenario ?? "all")|snapshots=\(SnapshotCache.pointSnapshots.count)|clustersReady=\(SnapshotCache.clusterIndex != nil)")
 
-                for iteration in 1...20 {
-                    PerformanceDiagnostics.event("AUDIT_SCENARIO",
-                                                 metadata: "map_stats_map|\(iteration)")
-                    withAnimation(.easeInOut(duration: 0.27)) {
+                if requestedScenario == nil || requestedScenario == "map_stats_map" {
+                    for iteration in 1...20 {
+                        PerformanceDiagnostics.event("AUDIT_SCENARIO",
+                                                     metadata: "map_stats_map|\(iteration)")
+                        withAnimation(.easeInOut(duration: 0.27)) {
+                            navigation.selectedTab = .statistics
+                        }
+                        try? await Task.sleep(for: .milliseconds(450))
+                        withAnimation(.easeInOut(duration: 0.27)) {
+                            navigation.selectedTab = .map
+                        }
+                        try? await Task.sleep(for: .milliseconds(450))
+                    }
+                }
+
+                if requestedScenario == nil || requestedScenario == "map_settings_map" {
+                    for iteration in 1...20 {
+                        PerformanceDiagnostics.event("AUDIT_SCENARIO",
+                                                     metadata: "map_settings_map|\(iteration)")
                         navigation.selectedTab = .statistics
-                    }
-                    try? await Task.sleep(for: .milliseconds(450))
-                    withAnimation(.easeInOut(duration: 0.27)) {
+                        try? await Task.sleep(for: .milliseconds(350))
+                        NotificationCenter.default.post(name: .performanceOpenSettings, object: nil)
+                        try? await Task.sleep(for: .milliseconds(450))
+                        NotificationCenter.default.post(name: .performanceCloseSettings, object: nil)
+                        try? await Task.sleep(for: .milliseconds(450))
                         navigation.selectedTab = .map
+                        try? await Task.sleep(for: .milliseconds(350))
                     }
-                    try? await Task.sleep(for: .milliseconds(450))
                 }
 
-                for iteration in 1...20 {
-                    PerformanceDiagnostics.event("AUDIT_SCENARIO",
-                                                 metadata: "map_settings_map|\(iteration)")
+                if requestedScenario == nil || requestedScenario == "stats_settings_stats" {
                     navigation.selectedTab = .statistics
-                    try? await Task.sleep(for: .milliseconds(350))
-                    NotificationCenter.default.post(name: .performanceOpenSettings, object: nil)
                     try? await Task.sleep(for: .milliseconds(450))
-                    NotificationCenter.default.post(name: .performanceCloseSettings, object: nil)
-                    try? await Task.sleep(for: .milliseconds(450))
-                    navigation.selectedTab = .map
-                    try? await Task.sleep(for: .milliseconds(350))
-                }
-
-                navigation.selectedTab = .statistics
-                try? await Task.sleep(for: .milliseconds(450))
-                for iteration in 1...20 {
-                    PerformanceDiagnostics.event("AUDIT_SCENARIO",
-                                                 metadata: "stats_settings_stats|\(iteration)")
-                    NotificationCenter.default.post(name: .performanceOpenSettings, object: nil)
-                    try? await Task.sleep(for: .milliseconds(450))
-                    NotificationCenter.default.post(name: .performanceCloseSettings, object: nil)
-                    try? await Task.sleep(for: .milliseconds(450))
+                    for iteration in 1...20 {
+                        PerformanceDiagnostics.event("AUDIT_SCENARIO",
+                                                     metadata: "stats_settings_stats|\(iteration)")
+                        NotificationCenter.default.post(name: .performanceOpenSettings, object: nil)
+                        try? await Task.sleep(for: .milliseconds(450))
+                        NotificationCenter.default.post(name: .performanceCloseSettings, object: nil)
+                        try? await Task.sleep(for: .milliseconds(450))
+                    }
                 }
                 PerformanceDiagnostics.event("AUDIT_SCENARIO_COMPLETE")
                 try? await Task.sleep(for: .seconds(2))
@@ -238,11 +278,15 @@ struct MainTabView: View {
                 #endif
             }
 
-            // 自定义底部 tab 栏：两种模式始终显示（双击「地图」tab 切换纯净模式）
-            if navigation.selectedTab != .review || !reviewImmersive {
-                customTabBar
-                    .transition(.opacity.combined(with: .move(edge: .bottom)))
-            }
+            // Tab 栏始终保持挂载和同一坐标系。沉浸回顾只隐藏视觉与命中，
+            // 从地点跳回地图时不会重新创建内部选中态，避免底栏瞬时错位。
+            let hidesTabBar = (navigation.selectedTab == .review && reviewImmersive)
+                || (navigation.selectedTab == .map && chromeHidden)
+            customTabBar
+                .opacity(hidesTabBar ? 0 : 1)
+                .allowsHitTesting(!hidesTabBar)
+                .accessibilityHidden(hidesTabBar)
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.20), value: hidesTabBar)
 
             if !launchDataReady || !minimumLogoElapsed {
                 BrandLoadingView(accent: AppTheme(rawValue: themeRaw)?.color ?? .red)
@@ -250,8 +294,10 @@ struct MainTabView: View {
                     .zIndex(100)
             }
         }
-        .animation(.easeOut(duration: 0.25), value: chromeHidden)
-        .animation(.easeOut(duration: 0.35), value: launchDataReady)
+        .frame(width: viewport.size.width, height: viewport.size.height)
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.25), value: chromeHidden)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.35), value: launchDataReady)
         .task {
             #if DEBUG
             let duration: UInt64 = ProcessInfo.processInfo.environment["FP_HOLD_LOGO"] == "1"
@@ -261,6 +307,7 @@ struct MainTabView: View {
             #endif
             try? await Task.sleep(nanoseconds: duration)
             minimumLogoElapsed = true
+            if launchDataReady { MapStartupDiagnostics.shared.mark(.mapShellReady) }
         }
         .task {
             // 地图快照通常会很快就绪；但数据库升级、直接进入其他 tab
@@ -269,17 +316,39 @@ struct MainTabView: View {
             if !launchDataReady {
                 appLog.warning("[Launch] 快照准备超时，先进入界面并在后台继续加载")
                 launchDataReady = true
+                MapStartupDiagnostics.shared.mark(.mapShellReady)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
             launchDataReady = true
+            if minimumLogoElapsed { MapStartupDiagnostics.shared.mark(.mapShellReady) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .mapDisplayPreviewReady)) { _ in
+            launchDataReady = true
+            if minimumLogoElapsed { MapStartupDiagnostics.shared.mark(.mapShellReady) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .localDataReset)) { _ in
+            navigation.globalReviewSession = nil
+            navigation.reviewOverviewGroups.removeAll(keepingCapacity: false)
+            navigation.locationReviewSession = nil
+            navigation.suspendedReviewContext = nil
+            navigation.mapPhotoHighlight = nil
+            navigation.mapEntrySource = .mapTab
+            reviewImmersive = false
         }
         .onAppear {
             #if DEBUG
             PerformanceDiagnostics.event("MainTabView.onAppear")
+            // 真机长数据性能审计需要等待快照与空间索引完成。仅在显式测试钩子
+            // 开启时阻止设备自动息屏，避免远程运行中途把 scene 挂起；正式包及
+            // 普通 DEBUG 启动均不受影响。
+            if TestHooks.performanceAutoCycle {
+                UIApplication.shared.isIdleTimerDisabled = true
+            }
             #endif
             LocationService.shared.restoreBackgroundMonitoring()
-            LocationService.shared.setAppActive(true)
+            // 系统可能因后台定位事件冷启动进程；不能把 View 出现等同于前台。
+            LocationService.shared.setAppActive(scenePhase == .active)
         }
         .onChange(of: scenePhase) { _, phase in
             LocationService.shared.setAppActive(phase == .active)
@@ -297,6 +366,9 @@ struct MainTabView: View {
             #if DEBUG
             PerformanceDiagnostics.event("MainTabView.onDisappear")
             PerformanceDiagnostics.flush()
+            if TestHooks.performanceAutoCycle {
+                UIApplication.shared.isIdleTimerDisabled = false
+            }
             #endif
         }
     }
@@ -316,7 +388,9 @@ struct MainTabView: View {
             ),
             accent: AppTheme(rawValue: themeRaw)?.color ?? .mint,
             onMapDoubleTap: {
-                withAnimation(.easeOut(duration: 0.25)) { chromeHidden.toggle() }
+                withAnimation(reduceMotion ? nil : .easeOut(duration: 0.25)) {
+                    chromeHidden.toggle()
+                }
                 appLog.info("[Chrome] tab 双击 → 纯净模式=\(chromeHidden)")
             }
         )

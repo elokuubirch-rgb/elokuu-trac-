@@ -61,20 +61,63 @@ public struct TrajectoryResolution: Equatable, Sendable {
 }
 
 public enum TrajectoryConflictResolver {
+    /// 冲突候选会用同一条轨迹执行最多 64 次插值探针。旧实现每个探针都重新
+    /// 排序该轨迹的全部 segment points；真实 HealthKit 路线达到百万点后，
+    /// 这会把一次冷重建放大到数分钟。准备阶段只做一次完全相同的排序，随后
+    /// 的时间窗口和插值均只读复用，不改变候选、阈值或最终点顺序。
+    private struct PreparedTrajectory {
+        let trajectory: Trajectory
+        let pointsBySegment: [[TrajectoryPoint]]
+
+        init(_ trajectory: Trajectory) {
+            self.trajectory = trajectory
+            pointsBySegment = trajectory.segments.map { segment in
+                // Builder 和持久缓存本来就保证段内时间有序。命中这个常规路径时
+                // Array 只共享原存储，不再复制百万级点集；异常输入仍按旧语义排序。
+                Self.isChronological(segment.points)
+                    ? segment.points
+                    : segment.points.sorted { $0.timestamp < $1.timestamp }
+            }
+        }
+
+        static func isChronological(_ points: [TrajectoryPoint]) -> Bool {
+            guard points.count > 1 else { return true }
+            for index in 1..<points.count
+            where points[index].timestamp < points[index - 1].timestamp {
+                return false
+            }
+            return true
+        }
+    }
+
     public static func resolve(
         _ trajectories: [Trajectory],
         configuration: TrajectoryConflictConfiguration = .init()
     ) -> TrajectoryResolution {
         let ordered = trajectories.sorted { $0.id < $1.id }
+        #if DEBUG && !SWIFT_PACKAGE
+        let prepared = PerformanceDiagnostics.measure(
+            "TrajectoryConflictResolver.prepare",
+            metadata: "trajectories=\(ordered.count)"
+        ) {
+            ordered.map(PreparedTrajectory.init)
+        }
+        #else
+        let prepared = ordered.map(PreparedTrajectory.init)
+        #endif
         var conflicts: [TrajectoryConflict] = []
         var comparedPairCount = 0
-        let chronological = ordered.sorted {
-            $0.startTime == $1.startTime ? $0.id < $1.id : $0.startTime < $1.startTime
+        let chronological = prepared.sorted {
+            let left = $0.trajectory
+            let right = $1.trajectory
+            return left.startTime == right.startTime
+                ? left.id < right.id : left.startTime < right.startTime
         }
         if chronological.count > 1 {
             for leftIndex in 0..<(chronological.count - 1) {
                 for rightIndex in (leftIndex + 1)..<chronological.count {
-                    if chronological[rightIndex].startTime > chronological[leftIndex].endTime {
+                    if chronological[rightIndex].trajectory.startTime
+                        > chronological[leftIndex].trajectory.endTime {
                         break
                     }
                     comparedPairCount += 1
@@ -93,7 +136,29 @@ public enum TrajectoryConflictResolver {
             }
             return $0.winnerTrajectoryID < $1.winnerTrajectoryID
         }
-        let conflictsByLoser = Dictionary(grouping: conflicts, by: \.suppressedTrajectoryID)
+        return materialize(
+            ordered, conflicts: conflicts, comparedPairCount: comparedPairCount)
+    }
+
+    /// 从持久化的稀疏冲突区间恢复完整运行时解析结果。
+    ///
+    /// 磁盘只需要保存默认规则之外的冲突区间；每点 suppression metadata 仍可在
+    /// 内存中按完全相同的规则重建，避免派生缓存成为第二份逐点数据库。
+    public static func materialize(
+        _ trajectories: [Trajectory],
+        conflicts: [TrajectoryConflict],
+        comparedPairCount: Int
+    ) -> TrajectoryResolution {
+        let ordered = trajectories.sorted { $0.id < $1.id }
+        let orderedConflicts = conflicts.sorted {
+            if $0.startTime != $1.startTime { return $0.startTime < $1.startTime }
+            if $0.suppressedTrajectoryID != $1.suppressedTrajectoryID {
+                return $0.suppressedTrajectoryID < $1.suppressedTrajectoryID
+            }
+            return $0.winnerTrajectoryID < $1.winnerTrajectoryID
+        }
+        let conflictsByLoser = Dictionary(
+            grouping: orderedConflicts, by: \.suppressedTrajectoryID)
         let preferenceRank = Dictionary(uniqueKeysWithValues: ordered.sorted {
             prefers($0, over: $1)
         }.enumerated().map { ($0.element.id, $0.offset) })
@@ -109,15 +174,17 @@ public enum TrajectoryConflictResolver {
             if $0.trajectoryID != $1.trajectoryID { return $0.trajectoryID < $1.trajectoryID }
             return $0.point.id < $1.point.id
         }
-        return TrajectoryResolution(trajectories: ordered, conflicts: conflicts,
+        return TrajectoryResolution(trajectories: ordered, conflicts: orderedConflicts,
                                     points: flattenedPoints,
                                     comparedPairCount: comparedPairCount)
     }
 
     private static func conflict(
-        between left: Trajectory, and right: Trajectory,
+        between preparedLeft: PreparedTrajectory, and preparedRight: PreparedTrajectory,
         configuration: TrajectoryConflictConfiguration
     ) -> TrajectoryConflict? {
+        let left = preparedLeft.trajectory
+        let right = preparedRight.trajectory
         let overlapStart = max(left.startTime, right.startTime)
         let overlapEnd = min(left.endTime, right.endTime)
         let overlapDuration = overlapEnd.timeIntervalSince(overlapStart)
@@ -127,12 +194,12 @@ public enum TrajectoryConflictResolver {
         let overlapRatio = min(1, overlapDuration / shorterDuration)
         guard overlapRatio >= configuration.minimumOverlapRatio else { return nil }
 
-        let leftPoints = points(in: left, from: overlapStart, through: overlapEnd)
-        let rightPoints = points(in: right, from: overlapStart, through: overlapEnd)
+        let leftPoints = points(in: preparedLeft, from: overlapStart, through: overlapEnd)
+        let rightPoints = points(in: preparedRight, from: overlapStart, through: overlapEnd)
         let probes = sampled(
             leftPoints.count <= rightPoints.count ? leftPoints : rightPoints,
             maximumCount: configuration.maximumProbeCount)
-        let comparison = leftPoints.count <= rightPoints.count ? right : left
+        let comparison = leftPoints.count <= rightPoints.count ? preparedRight : preparedLeft
         guard probes.count >= 2 else { return nil }
         let distances = probes.compactMap { probe -> Double? in
             guard let coordinate = interpolatedCoordinate(
@@ -209,11 +276,40 @@ public enum TrajectoryConflictResolver {
         }
     }
 
-    private static func points(in trajectory: Trajectory, from start: Date,
+    private static func points(in prepared: PreparedTrajectory, from start: Date,
                                through end: Date) -> [TrajectoryPoint] {
-        trajectory.segments.flatMap(\.points).filter {
-            start <= $0.timestamp && $0.timestamp <= end
-        }.sorted { $0.timestamp < $1.timestamp }
+        var result: [TrajectoryPoint] = []
+        for points in prepared.pointsBySegment {
+            guard let first = points.first, let last = points.last,
+                  first.timestamp <= end, last.timestamp >= start else { continue }
+            var lower = 0
+            var upper = points.count
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2
+                if points[middle].timestamp < start {
+                    lower = middle + 1
+                } else {
+                    upper = middle
+                }
+            }
+            let startIndex = lower
+            upper = points.count
+            while lower < upper {
+                let middle = lower + (upper - lower) / 2
+                if points[middle].timestamp <= end {
+                    lower = middle + 1
+                } else {
+                    upper = middle
+                }
+            }
+            result.append(contentsOf: points[startIndex..<lower])
+        }
+        // Segments are normally chronological and disjoint. Keep exact legacy behavior
+        // for overlapping or out-of-order segment fixtures.
+        if !PreparedTrajectory.isChronological(result) {
+            result.sort { $0.timestamp < $1.timestamp }
+        }
+        return result
     }
 
     private static func sampled(_ points: [TrajectoryPoint], maximumCount: Int) -> [TrajectoryPoint] {
@@ -225,10 +321,9 @@ public enum TrajectoryConflictResolver {
         }
     }
 
-    private static func interpolatedCoordinate(in trajectory: Trajectory, at time: Date,
+    private static func interpolatedCoordinate(in prepared: PreparedTrajectory, at time: Date,
                                                maximumGap: TimeInterval) -> (Double, Double)? {
-        for segment in trajectory.segments {
-            let points = segment.points.sorted { $0.timestamp < $1.timestamp }
+        for points in prepared.pointsBySegment {
             guard let first = points.first, let last = points.last,
                   first.timestamp <= time, time <= last.timestamp else { continue }
             if time == first.timestamp { return (first.latitude, first.longitude) }

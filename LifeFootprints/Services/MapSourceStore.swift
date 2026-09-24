@@ -36,4 +36,9 @@ enum MapSourceStore {
         guard !ids.isEmpty else { return }
         save(load().filter { !ids.contains($0.id) })
     }
+
+    static func reset() {
+        UserDefaults.standard.removeObject(forKey: storageKey)
+        NotificationCenter.default.post(name: .mapSourcesChanged, object: nil)
+    }
 }

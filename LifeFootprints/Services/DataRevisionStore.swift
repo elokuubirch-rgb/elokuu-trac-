@@ -35,6 +35,11 @@ enum DataRevisionStore {
     private static let photoKey = "dataRevision.photo.v1"
     private static let placeKey = "dataRevision.place.v1"
     private static let statsKey = "dataRevision.stats.v1"
+    private static let displaySafetyKey = "dataRevision.displaySafety.v1"
+
+    static func displaySafetyRevision(defaults: UserDefaults = .standard) -> Int {
+        lock.withLock { defaults.integer(forKey: displaySafetyKey) }
+    }
 
     static func snapshot(defaults: UserDefaults = .standard) -> DataRevisionSnapshot {
         lock.withLock { snapshotUnlocked(defaults: defaults) }
@@ -42,11 +47,16 @@ enum DataRevisionStore {
 
     @discardableResult
     static func commit(_ domains: DataRevisionDomains, reason: String,
+                       invalidatesDisplay: Bool = true,
                        defaults: UserDefaults = .standard,
                        publish: Bool = true) -> DataRevisionChange? {
         guard !domains.isEmpty else { return nil }
         let change = lock.withLock { () -> DataRevisionChange in
             let previous = snapshotUnlocked(defaults: defaults)
+            if invalidatesDisplay, !domains.intersection([.trajectory, .place]).isEmpty {
+                defaults.set(defaults.integer(forKey: displaySafetyKey) + 1,
+                             forKey: displaySafetyKey)
+            }
             if domains.contains(.trajectory) {
                 defaults.set(previous.trajectory + 1, forKey: trajectoryKey)
             }
@@ -63,7 +73,7 @@ enum DataRevisionStore {
             #if DEBUG
             PerformanceDiagnostics.event(
                 "DataRevision.changed",
-                metadata: "reason=\(reason) domains=\(domains.rawValue) trajectory=\(change.current.trajectory)")
+                metadata: "reason=\(reason) domains=\(domains.rawValue) trajectory=\(change.current.trajectory) invalidatesDisplay=\(invalidatesDisplay)")
             PerformanceDiagnostics.count("dataImported.post.total")
             #endif
             NotificationCenter.default.post(name: .dataRevisionChanged, object: change)

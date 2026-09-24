@@ -13,10 +13,13 @@ public struct CustomMapSource: Codable, Hashable, Identifiable, Sendable {
     public var minimumZoom: Int
     public var maximumZoom: Int
     public var attribution: String
+    /// nil means the source did not declare a geographic coordinate reference system.
+    public var coordinateReferenceSystem: CoordinateReferenceSystem?
 
     public init(id: UUID = UUID(), name: String, urlTemplate: String,
                 scheme: MapTileScheme = .xyz, minimumZoom: Int = 0,
-                maximumZoom: Int = 19, attribution: String) {
+                maximumZoom: Int = 19, attribution: String,
+                coordinateReferenceSystem: CoordinateReferenceSystem? = nil) {
         self.id = id
         self.name = name
         self.urlTemplate = urlTemplate
@@ -24,6 +27,7 @@ public struct CustomMapSource: Codable, Hashable, Identifiable, Sendable {
         self.minimumZoom = minimumZoom
         self.maximumZoom = maximumZoom
         self.attribution = attribution
+        self.coordinateReferenceSystem = coordinateReferenceSystem
     }
 }
 

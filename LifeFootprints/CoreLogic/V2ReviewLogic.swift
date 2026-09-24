@@ -1,12 +1,5 @@
 import Foundation
 
-public enum ReviewDisplayState: Equatable, Sendable {
-    case browsing
-    case refreshing
-    case completion
-    case finished
-}
-
 public enum ReviewCompletionKind: Equatable, Sendable {
     case global
     case location(hasUnseenPhotos: Bool)
@@ -43,7 +36,7 @@ public enum MapTimeScope: Hashable, Sendable {
     case year(Int)
 
     public static func choices(currentYear: Int) -> [MapTimeScope] {
-        [.all, .year(currentYear), .year(currentYear - 1), .year(currentYear - 2)]
+        [.all, .year(currentYear), .year(currentYear - 1)]
     }
 
     public func contains(_ date: Date, calendar: Calendar = .autoupdatingCurrent) -> Bool {
@@ -132,11 +125,33 @@ public enum ReviewLivePlaybackLogic {
         currentAssetID: String?,
         autoPlayEnabled: Bool,
         resourceReady: Bool,
-        isInteracting: Bool
+        isInteracting: Bool,
+        isActive: Bool = true
     ) -> Bool {
         autoPlayEnabled
+            && isActive
             && resourceReady
             && !isInteracting
             && currentAssetID == requestedAssetID
+    }
+}
+
+/// SwiftUI task identity for Live Photo preparation/autoplay. Resource readiness
+/// is deliberately part of the identity: a request that was not ready at page
+/// commit must run again when PhotoKit finishes preparing that same asset.
+public struct ReviewLivePlaybackRequest: Hashable, Sendable {
+    public let assetID: String
+    public let autoPlayEnabled: Bool
+    public let isLivePhoto: Bool
+    public let resourceReady: Bool
+    public let isActive: Bool
+
+    public init(assetID: String, autoPlayEnabled: Bool,
+                isLivePhoto: Bool, resourceReady: Bool, isActive: Bool = true) {
+        self.assetID = assetID
+        self.autoPlayEnabled = autoPlayEnabled
+        self.isLivePhoto = isLivePhoto
+        self.resourceReady = resourceReady
+        self.isActive = isActive
     }
 }

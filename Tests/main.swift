@@ -19,8 +19,8 @@ func check(_ cond: Bool, _ name: String, _ detail: String = "") {
 var v2Calendar = Calendar(identifier: .gregorian)
 v2Calendar.timeZone = TimeZone(secondsFromGMT: 0)!
 let v2Date = v2Calendar.date(from: DateComponents(year: 2025, month: 6, day: 1))!
-check(MapTimeScope.choices(currentYear: 2026) == [.all, .year(2026), .year(2025), .year(2024)],
-      "V2 时间筛选仅保留全部/今年/去年/前年")
+check(MapTimeScope.choices(currentYear: 2026) == [.all, .year(2026), .year(2025)],
+      "V2 时间筛选仅保留全部/今年/去年")
 check(MapTimeScope.year(2025).contains(v2Date, calendar: v2Calendar)
       && !MapTimeScope.year(2024).contains(v2Date, calendar: v2Calendar),
       "V2 统一年份判断")
@@ -68,6 +68,11 @@ check(!ReviewLivePlaybackLogic.shouldStart(
     requestedAssetID: "live-B", currentAssetID: "live-B",
     autoPlayEnabled: true, resourceReady: true, isInteracting: true
 ), "Live-Swipe过程中禁止启动播放")
+check(!ReviewLivePlaybackLogic.shouldStart(
+    requestedAssetID: "live-B", currentAssetID: "live-B",
+    autoPlayEnabled: true, resourceReady: true, isInteracting: false,
+    isActive: false
+), "Live-离屏暂停但不关闭自动播放偏好")
 
 // ── CSV 基础解析 ──
 let r1 = CSVParser.parse("""
@@ -91,6 +96,9 @@ check(r3.header.first == "lat" && r3.rows.count == 2, "BOM 与 CRLF", "header=\(
 let m1 = ColumnMapping(latIndex: 0, lonIndex: 1, timeIndex: 2, nameIndex: 3)
 let mapped = r1.mapPoints(m1)
 check(mapped.points.count == 2 && mapped.points[0].city == "上海", "列映射", "\(mapped.points)")
+check(mapped.points[0].sourceCoordinateSystem == .unknown
+      && mapped.points[0].latitude == mapped.points[0].rawLatitude,
+      "CSV 未声明坐标系时保留原值")
 var utc = Calendar(identifier: .gregorian)
 utc.timeZone = TimeZone(identifier: "UTC")!
 check(utc.component(.year, from: mapped.points[0].timestamp) == 2021, "ISO8601 时间解析", "\(mapped.points[0].timestamp)")
@@ -102,6 +110,88 @@ let r4 = CSVParser.parse("lat,lon,time\n999,121,2021-01-01\n31,121,2021-01-01\n0
 let m4 = ColumnMapping(latIndex: 0, lonIndex: 1, timeIndex: 2, nameIndex: nil)
 let mapped4 = r4.mapPoints(m4)
 check(mapped4.points.count == 2 && mapped4.skipped == 1, "非法坐标跳过", "pts=\(mapped4.points.count) skip=\(mapped4.skipped)")
+
+// ── 坐标来源、归一化与原值保留 ──
+let shanghaiWGS = CoordinateValue(latitude: 31.2304, longitude: 121.4737)
+let shanghaiGCJ = CoordinateTransform.wgs84ToGcj02(
+    latitude: shanghaiWGS.latitude, longitude: shanghaiWGS.longitude)
+check(GeoMath.distanceMeters(
+    from: (shanghaiWGS.latitude, shanghaiWGS.longitude),
+    to: (shanghaiGCJ.latitude, shanghaiGCJ.longitude)) > 300,
+      "WGS-84→GCJ-02 公开公式量级")
+let shanghaiRoundTrip = CoordinateTransform.gcj02ToWgs84(
+    latitude: shanghaiGCJ.latitude, longitude: shanghaiGCJ.longitude)
+check(GeoMath.distanceMeters(
+    from: (shanghaiWGS.latitude, shanghaiWGS.longitude),
+    to: (shanghaiRoundTrip.latitude, shanghaiRoundTrip.longitude)) < 0.5,
+      "GCJ-02 迭代逆解公式残差小于 0.5 米")
+let sanFrancisco = CoordinateTransform.wgs84ToGcj02(latitude: 37.7749, longitude: -122.4194)
+check(sanFrancisco == CoordinateValue(latitude: 37.7749, longitude: -122.4194),
+      "近似边界外坐标保持不变")
+
+let gcjCSV = CSVParser.parse("lat,lon,time\n\(shanghaiGCJ.latitude),\(shanghaiGCJ.longitude),2026-01-01T00:00:00Z\n")
+let gcjMapped = gcjCSV.mapPoints(ColumnMapping(
+    latIndex: 0, lonIndex: 1, timeIndex: 2,
+    sourceCoordinateSystem: .gcj02))
+check(gcjMapped.points.count == 1
+      && gcjMapped.points[0].sourceCoordinateSystem == .gcj02
+      && gcjMapped.points[0].rawLatitude == shanghaiGCJ.latitude
+      && gcjMapped.points[0].coordinateTransformVersion == CoordinateTransform.algorithmVersion
+      && GeoMath.distanceMeters(
+        from: (gcjMapped.points[0].latitude, gcjMapped.points[0].longitude),
+        to: (shanghaiWGS.latitude, shanghaiWGS.longitude)) < 0.5,
+      "CSV 声明 GCJ-02 后归一化且保留原值")
+
+let diagnosisStart = Date(timeIntervalSince1970: 1_700_000_000)
+let diagnosisReferences = (0..<8).map { index in
+    TimedCoordinateObservation(
+        latitude: 31.20 + Double(index) * 0.02,
+        longitude: 121.40 + Double(index) * 0.02,
+        timestamp: diagnosisStart.addingTimeInterval(Double(index) * 3_600))
+}
+let diagnosisGCJCandidates = diagnosisReferences.map { reference in
+    let shifted = CoordinateTransform.wgs84ToGcj02(
+        latitude: reference.coordinate.latitude,
+        longitude: reference.coordinate.longitude)
+    return TimedCoordinateObservation(latitude: shifted.latitude, longitude: shifted.longitude,
+                                      timestamp: reference.timestamp)
+}
+let gcjDiagnosis = CoordinateSystemDiagnoser.diagnose(
+    candidates: diagnosisGCJCandidates, references: diagnosisReferences)
+check(gcjDiagnosis.recommendation == .gcj02 && gcjDiagnosis.matchedSampleCount == 8,
+      "诊断器识别带时间配对的 GCJ-02 样本", "\(gcjDiagnosis)")
+let wgsDiagnosis = CoordinateSystemDiagnoser.diagnose(
+    candidates: diagnosisReferences, references: diagnosisReferences)
+check(wgsDiagnosis.recommendation == .wgs84,
+      "诊断器识别带时间配对的 WGS-84 样本", "\(wgsDiagnosis)")
+let insufficientDiagnosis = CoordinateSystemDiagnoser.diagnose(
+    candidates: Array(diagnosisReferences.prefix(2)),
+    references: Array(diagnosisReferences.prefix(2)))
+check(insufficientDiagnosis.recommendation == nil,
+      "诊断样本不足时返回未知")
+
+// ── 地图呈现坐标：原始值始终保留 WGS-84，仅高德系底图显示为 GCJ-02 ──
+let daliStadium = CoordinateValue(latitude: 25.5969, longitude: 100.22615)
+let daliOnStandardMap = MapCoordinatePresentation.display(
+    daliStadium, targetSystem: .gcj02)
+check(daliOnStandardMap.latitude < daliStadium.latitude - 0.0025
+      && daliOnStandardMap.longitude > daliStadium.longitude + 0.0008,
+      "大陆标准地图按 GCJ-02 呈现坐标")
+let daliRoundTrip = MapCoordinatePresentation.canonical(
+    daliOnStandardMap, sourceSystem: .gcj02)
+check(GeoMath.distanceMeters(
+        from: (daliRoundTrip.latitude, daliRoundTrip.longitude),
+        to: (daliStadium.latitude, daliStadium.longitude)) < 0.5,
+      "地图显示坐标可无损回到原始 WGS-84")
+check(MapCoordinatePresentation.targetSystem(
+        mapType: "standard", customSourceSystem: nil) == .gcj02,
+      "标准地图采用 GCJ-02 呈现")
+check(MapCoordinatePresentation.targetSystem(
+        mapType: "topographic", customSourceSystem: nil) == .wgs84,
+      "户外地图保留 WGS-84 呈现")
+check(MapCoordinatePresentation.targetSystem(
+        mapType: "custom:any", customSourceSystem: .wgs84) == .wgs84,
+      "自定义地图遵循来源坐标声明")
 
 // ── 距离计算（经度 0.05° ≈ 4.65km @31.23°N）──
 let d = GeoMath.distanceMeters(from: (31.2304, 121.4737), to: (31.2304, 121.5237))
@@ -212,7 +302,7 @@ func trajectorySample(_ id: String, _ source: TrajectorySource, _ seconds: Doubl
 }
 let domainSamples = [
     trajectorySample("a1", .coreLocation, 0, 31.0000, 121.0000),
-    trajectorySample("a2", .coreLocation, 60, 31.0005, 121.0005),
+    trajectorySample("a2", .coreLocation, 20, 31.0005, 121.0005),
     trajectorySample("a3", .coreLocation, 4_000, 31.0010, 121.0010),
     trajectorySample("w1-r1-1", .healthWorkout, 100, 31.1000, 121.1000, session: "workout-1", route: "route-1"),
     trajectorySample("w1-r1-2", .healthWorkout, 160, 31.1005, 121.1005, session: "workout-1", route: "route-1"),
@@ -223,6 +313,10 @@ let domainTrajectories = TrajectoryBuilder.build(samples: domainSamples)
 let autoDomain = domainTrajectories.filter { $0.source == .coreLocation }
 let workoutDomain = domainTrajectories.filter { $0.source == .healthWorkout }
 check(autoDomain.count == 2, "轨迹领域-Core Location时间断层生成新Session", "count=\(autoDomain.count)")
+check(TrajectoryBuilder.build(samples: [
+    trajectorySample("gap-1", .coreLocation, 0, 31, 121),
+    trajectorySample("gap-2", .coreLocation, 60, 31.0005, 121.0005)
+]).count == 2, "轨迹领域-GPS超过30秒不能推定连续路线")
 check(workoutDomain.count == 2, "轨迹领域-不同Workout永不合并", "count=\(workoutDomain.count)")
 check(workoutDomain.first(where: { $0.sessionID == "workout-1" })?.segments.count == 2,
       "轨迹领域-同Workout多Route保持独立Segment")
@@ -478,7 +572,7 @@ check(mid.latitude > 31.23 && mid.latitude < 36.07, "Catmull-Rom 中间值有界
 let trail = TrailIndex(points: [
     TrailPoint(lat: 31.2304, lon: 121.4737, t: 1_700_000_000),
     TrailPoint(lat: 31.2320, lon: 121.4750, t: 1_700_000_100),
-    TrailPoint(lat: 31.2350, lon: 121.4780, t: 1_700_000_300),
+    TrailPoint(lat: 31.2350, lon: 121.4780, t: 1_700_000_200),
 ])
 // 线段投影：返回位置应在 p0-p1 之间，不应吸到两端的离散 GPS 点。
 let routeProjection = trail.nearestOnRoute(to: 31.23115, lon: 121.4747, within: 100)
@@ -490,17 +584,23 @@ check(routeProjection != nil
 let exact = snapPhotoToTrail(lat: 31.2312, lon: 121.47435, time: 1_700_000_050, trails: trail)
 check(abs(exact.0 - 31.2312) < 0.0001 && abs(exact.1 - 121.47435) < 0.0001,
       "轨迹精确匹配(时间位置<50m)", "\(exact)")
-// 轨迹吸附：时间位置 50-300m → 吸附（t=200 → (31.2335,121.4765)，照片偏东 ~140m）
-let snap = snapPhotoToTrail(lat: 31.2335, lon: 121.4780, time: 1_700_000_200, trails: trail)
+// 轨迹吸附：100秒连续段内 t=150 → (31.2335,121.4765)，照片偏东约140m。
+let snap = snapPhotoToTrail(lat: 31.2335, lon: 121.4780, time: 1_700_000_150, trails: trail)
 check(abs(snap.0 - 31.2335) < 0.0001 && abs(snap.1 - 121.4765) < 0.0001,
       "轨迹吸附(时间位置50-300m)", "\(snap)")
 // 超距不吸附（保持原坐标）
 let far = snapPhotoToTrail(lat: 31.2500, lon: 121.4900, time: 1_700_000_200, trails: trail)
 check(abs(far.0 - 31.2500) < 0.00001, "超距不吸附(>300m)", "\(far)")
 // 时间插值：无 GPS 照片按拍摄时间定位（前后点线性插值）
-let interp = snapPhotoToTrail(lat: 999, lon: 999, time: 1_700_000_200, trails: trail)
+let interp = snapPhotoToTrail(lat: 999, lon: 999, time: 1_700_000_150, trails: trail)
 check(abs(interp.0 - 31.2335) < 0.0001 && abs(interp.1 - 121.4765) < 0.0001,
       "时间插值定位(无GPS)", "\(interp)")
+let insufficientPhotoEvidence = TrailIndex(points: [
+    TrailPoint(lat: 31.2320, lon: 121.4750, t: 1_700_000_100),
+    TrailPoint(lat: 31.2350, lon: 121.4780, t: 1_700_000_300)
+])
+check(insufficientPhotoEvidence.interpolate(at: 1_700_000_200) == nil,
+      "时间插值-超过120秒的空档不能生成照片坐标")
 // 无轨迹返回原坐标
 let noTrail = snapPhotoToTrail(lat: 31.24, lon: 121.48, time: 1_700_000_100, trails: nil)
 check(noTrail.0 == 31.24 && noTrail.1 == 121.48, "无轨迹原坐标", "\(noTrail)")
@@ -595,120 +695,10 @@ check(HealthRouteRetryPolicy.stateAfterEmptyResult(
     retryCount: 99, workoutEnd: retryNow.addingTimeInterval(-60), now: retryNow) == "pending",
       "Health Route重试-新近Workout不提前终止")
 
-// ── 后台低功耗交通策略（本地 / 高铁 / 飞机）──
-let bgBase = BackgroundLocationSample(latitude: 31.2304, longitude: 121.4737,
-                                      timestamp: 1_700_000_000, speedMPS: 0,
-                                      altitude: 10, horizontalAccuracy: 30)
-let localMove = BackgroundLocationSample(latitude: 31.2304, longitude: 121.4787,
-                                         timestamp: 1_700_000_600, speedMPS: 1.2,
-                                         altitude: 10, horizontalAccuracy: 35)
-let localDecision = BackgroundTrackPolicy.evaluate(previous: bgBase, current: localMove)
-check(localDecision.shouldRecord && localDecision.mode == .local,
-      "后台策略-本地重大位移留点", "\(localDecision)")
-
-let railMove = BackgroundLocationSample(latitude: 31.2304, longitude: 121.5337,
-                                        timestamp: 1_700_000_180, speedMPS: 82 / 3.6,
-                                        altitude: 20, horizontalAccuracy: 80)
-let railDecision = BackgroundTrackPolicy.evaluate(previous: bgBase, current: railMove)
-check(railDecision.shouldRecord && railDecision.mode == .highSpeedRail,
-      "后台策略-高铁稀疏关键点", "\(railDecision)")
-
-let shortFlight = BackgroundLocationSample(latitude: 31.2304, longitude: 121.5737,
-                                           timestamp: 1_700_000_300, speedMPS: 220,
-                                           altitude: 9_000, horizontalAccuracy: 250)
-let shortFlightDecision = BackgroundTrackPolicy.evaluate(previous: bgBase, current: shortFlight)
-check(!shortFlightDecision.shouldRecord && shortFlightDecision.mode == .airborne,
-      "后台策略-飞机短距离不密集留点", "\(shortFlightDecision)")
-let flightMove = BackgroundLocationSample(latitude: 31.2304, longitude: 121.8737,
-                                          timestamp: 1_700_000_600, speedMPS: 220,
-                                          altitude: 9_500, horizontalAccuracy: 300)
-let flightDecision = BackgroundTrackPolicy.evaluate(previous: bgBase, current: flightMove)
-check(flightDecision.shouldRecord && flightDecision.mode == .airborne,
-      "后台策略-飞机长距离关键点", "\(flightDecision)")
-
-let inaccurate = BackgroundLocationSample(latitude: 31.3, longitude: 121.8,
-                                           timestamp: 1_700_001_000, speedMPS: 50,
-                                           altitude: 10, horizontalAccuracy: 2_000)
-check(!BackgroundTrackPolicy.evaluate(previous: bgBase, current: inaccurate).shouldRecord,
-      "后台策略-拒绝低精度漂移")
-
-// ── 主动轨迹点过滤（联合决策：距离 + 时间 + 转向 + 精度 + 瞬移）──
-var trackFilter = TrackPointFilter()
-let tfBase = 1_700_000_000.0
-let tfFirst = TrackSample(latitude: 31.2304, longitude: 121.4737, timestamp: tfBase,
-                          speedMPS: 0, course: 0, horizontalAccuracy: 10)
-check(trackFilter.evaluate(tfFirst).accept, "轨迹过滤-首点作为起点")
-
-// 距离触发：向北约 11m → 接受（步行 3–8m 目标区间的下界之外仍接受）
-let tfDist = TrackSample(latitude: 31.2305, longitude: 121.4737, timestamp: tfBase + 3,
-                         speedMPS: 1.2, course: 0, horizontalAccuracy: 10)
-let tfDistDec = trackFilter.evaluate(tfDist)
-check(tfDistDec.accept && tfDistDec.distanceMeters > 9,
-      "轨迹过滤-距离触发接受", "d=\(tfDistDec.distanceMeters)")
-
-// 静止：相对上一个已接受点（tfDist @31.2305）仅约 2m 位移 + 短时间 + 良好精度 → 拒绝为 stationary
-let tfStationary = TrackSample(latitude: 31.23051, longitude: 121.47372, timestamp: tfBase + 4,
-                               speedMPS: 0, course: 0, horizontalAccuracy: 10)
-let tfStatDec = trackFilter.evaluate(tfStationary)
-check(!tfStatDec.accept && tfStatDec.reason == .stationary,
-      "轨迹过滤-静止拒绝", "reason=\(String(describing: tfStatDec.reason)) d=\(tfStatDec.distanceMeters)")
-
-// 时间兜底：慢速约 2m 位移，但已过 8s 且精度合理 → 接受
-let tfSlow = TrackSample(latitude: 31.23052, longitude: 121.4737, timestamp: tfBase + 12,
-                         speedMPS: 0.2, course: 0, horizontalAccuracy: 20)
-let tfSlowDec = trackFilter.evaluate(tfSlow)
-check(tfSlowDec.accept, "轨迹过滤-时间兜底接受", "d=\(tfSlowDec.distanceMeters) e=\(tfSlowDec.elapsedSeconds)")
-
-// 转向兜底：约 2m 位移 + 90° 转向 → 接受
-var tf2 = TrackPointFilter()
-_ = tf2.evaluate(TrackSample(latitude: 31.2304, longitude: 121.4737, timestamp: tfBase,
-                             speedMPS: 0, course: 0, horizontalAccuracy: 10))
-let tfTurn = TrackSample(latitude: 31.23042, longitude: 121.4737, timestamp: tfBase + 2,
-                         speedMPS: 0.5, course: 90, horizontalAccuracy: 15)
-let tfTurnDec = tf2.evaluate(tfTurn)
-check(tfTurnDec.accept && tfTurnDec.headingChangeDegrees >= 40,
-      "轨迹过滤-转向兜底接受", "heading=\(tfTurnDec.headingChangeDegrees)")
-
-// 极差精度：>100m → 拒绝 poorAccuracy
-var tf3 = TrackPointFilter()
-_ = tf3.evaluate(TrackSample(latitude: 31.2304, longitude: 121.4737, timestamp: tfBase,
-                             speedMPS: 0, course: 0, horizontalAccuracy: 10))
-let tfBad = TrackSample(latitude: 31.2305, longitude: 121.4737, timestamp: tfBase + 2,
-                        speedMPS: 1, course: 0, horizontalAccuracy: 250)
-let tfBadDec = tf3.evaluate(tfBad)
-check(!tfBadDec.accept && tfBadDec.reason == .poorAccuracy,
-      "轨迹过滤-极差精度拒绝", "reason=\(String(describing: tfBadDec.reason))")
-
-// 真正重复：<1m → 拒绝 duplicate
-var tf4 = TrackPointFilter()
-_ = tf4.evaluate(TrackSample(latitude: 31.2304, longitude: 121.4737, timestamp: tfBase,
-                             speedMPS: 0, course: 0, horizontalAccuracy: 10))
-let tfDup = TrackSample(latitude: 31.2304002, longitude: 121.4737002, timestamp: tfBase + 1,
-                        speedMPS: 0, course: 0, horizontalAccuracy: 10)
-let tfDupDec = tf4.evaluate(tfDup)
-check(!tfDupDec.accept && tfDupDec.reason == .duplicate,
-      "轨迹过滤-重复坐标拒绝", "reason=\(String(describing: tfDupDec.reason))")
-
-// 不合理瞬移：约 500m 在 2s 内（250 m/s）→ 拒绝 impossibleJump
-var tf5 = TrackPointFilter()
-_ = tf5.evaluate(TrackSample(latitude: 31.2304, longitude: 121.4737, timestamp: tfBase,
-                             speedMPS: 0, course: 0, horizontalAccuracy: 10))
-let tfJump = TrackSample(latitude: 31.2349, longitude: 121.4737, timestamp: tfBase + 2,
-                         speedMPS: 0, course: 0, horizontalAccuracy: 10)
-let tfJumpDec = tf5.evaluate(tfJump)
-check(!tfJumpDec.accept && tfJumpDec.reason == .impossibleJump,
-      "轨迹过滤-不合理瞬移拒绝", "reason=\(String(describing: tfJumpDec.reason)) d=\(tfJumpDec.distanceMeters)")
-
-// 非法坐标与时间倒序 → 拒绝
-var tf6 = TrackPointFilter()
-_ = tf6.evaluate(TrackSample(latitude: 31.2304, longitude: 121.4737, timestamp: tfBase,
-                             speedMPS: 0, course: 0, horizontalAccuracy: 10))
-check(tf6.evaluate(TrackSample(latitude: 999, longitude: 121.4737, timestamp: tfBase + 1,
-                               speedMPS: 0, course: 0, horizontalAccuracy: 10)).reason == .invalidCoordinate,
-      "轨迹过滤-非法坐标拒绝")
-check(tf6.evaluate(TrackSample(latitude: 31.2305, longitude: 121.4737, timestamp: tfBase - 1,
-                               speedMPS: 0, course: 0, horizontalAccuracy: 10)).reason == .invalidTimestamp,
-      "轨迹过滤-时间倒序拒绝")
+// Current quality-gate → candidate → window-correction and batch-writer contracts.
+runLocationPipelineChecks()
+runTrackBatchBufferChecks()
+runImportIntegrityChecks()
 
 // ── 回顾 Session 逻辑（再来一组 / 近期去重 / 分组）──
 check(ReviewSessionLogic.clampedGroupSize(0) == 1, "回顾-组大小下限")

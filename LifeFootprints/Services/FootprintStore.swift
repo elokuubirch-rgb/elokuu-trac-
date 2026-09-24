@@ -1,7 +1,7 @@
 import Foundation
 import SwiftData
 
-struct FootprintStats {
+struct FootprintStats: Sendable {
     var pointCount = 0
     var distanceKM = 0.0
     var activeDays = 0
@@ -10,8 +10,40 @@ struct FootprintStats {
     var perYear: [(year: Int, count: Int)] = []
 }
 
+/// 大数据导入只控制持久化边界，不改变去重或数据语义。
+enum FootprintImportPersistencePolicy {
+    static let existingFetchPageSize = 20_000
+    static let insertBatchSize = 5_000
+
+    static func batchCount(for itemCount: Int) -> Int {
+        guard itemCount > 0 else { return 0 }
+        return (itemCount + insertBatchSize - 1) / insertBatchSize
+    }
+}
+
 @MainActor
 enum FootprintStore {
+
+    /// 自动轨迹 writer 的原子批次入口。一个批次要么全部保存，要么全部留在内存重试。
+    nonisolated static func persistTrackBatch(_ drafts: [FootprintDraft],
+                                              container: ModelContainer) async -> Bool {
+        guard !drafts.isEmpty,
+              drafts.allSatisfy({ GeoMath.isValid(latitude: $0.latitude,
+                                                   longitude: $0.longitude) }) else { return false }
+        return await withCheckedContinuation { continuation in
+            Task.detached(priority: .utility) {
+                do {
+                    try persist(drafts, in: container)
+                    DataRevisionStore.commit([.trajectory, .place, .stats],
+                                             reason: "FootprintStore.trackBatch", invalidatesDisplay: false)
+                    continuation.resume(returning: true)
+                } catch {
+                    appLog.error("[TrackBatch] 原子保存失败: \(error.localizedDescription)")
+                    continuation.resume(returning: false)
+                }
+            }
+        }
+    }
 
     /// 单个后台关键点专用入库：只查询同一天的数据，避免每次系统唤醒扫描十几万条记录。
     nonisolated static func importBackgroundDraft(_ draft: FootprintDraft,
@@ -45,7 +77,7 @@ enum FootprintStore {
                     return
                 }
                 DataRevisionStore.commit([.trajectory, .place, .stats],
-                                         reason: "FootprintStore.backgroundDraft")
+                                         reason: "FootprintStore.backgroundDraft", invalidatesDisplay: false)
                 continuation.resume(returning: true)
             }
         }
@@ -76,7 +108,7 @@ enum FootprintStore {
         if added > 0 {
             var domains: DataRevisionDomains = [.place, .stats]
             if insertedTrajectory { domains.insert(.trajectory) }
-            DataRevisionStore.commit(domains, reason: "FootprintStore.importDrafts")
+            DataRevisionStore.commit(domains, reason: "FootprintStore.importDrafts", invalidatesDisplay: false)
         }
         return added
     }
@@ -85,57 +117,128 @@ enum FootprintStore {
         Int(date.timeIntervalSince1970 / 86_400)
     }
 
-    /// 后台线程版导入（十万级数据专用）：后台 ModelContext 插入+保存，主线程零阻塞
-    /// dense=true：密集路线导入跳过 50m 去重——
-    /// 路线点间距仅几米，去重会互相吞掉导致无法成线
+    /// Compatibility entry point. Exact measurement dedupe now applies to both modes.
     static func importDraftsInBackground(_ drafts: [FootprintDraft], container: ModelContainer,
                                          dense: Bool = false) async -> Int {
-        await withCheckedContinuation { continuation in
-            Task.detached(priority: .userInitiated) {
-                let bg = ModelContext(container)
-                bg.autosaveEnabled = false
-                let existing = (try? bg.fetch(FetchDescriptor<FootprintPoint>())) ?? []
-                var index = DedupeIndex()
-                if !dense {
-                    for p in existing {
-                        index.add(day: dayKey(p.timestamp), lat: p.latitude, lon: p.longitude)
-                    }
-                }
-                var added = 0
-                var insertedTrajectory = false
-                for d in drafts {
-                    guard GeoMath.isValid(latitude: d.latitude, longitude: d.longitude) else { continue }
-                    if dense {
-                        // 密集路线：保持连续性，不做空间去重（点密度由点模式采样控制）
-                        bg.insert(FootprintPoint(draft: d))
-                        added += 1
-                        insertedTrajectory = insertedTrajectory
-                            || d.source == FootprintSource.gps.rawValue
-                            || d.source == FootprintSource.csv.rawValue
-                        continue
-                    }
-                    let day = dayKey(d.timestamp)
-                    guard !index.hasNearby(day: day, lat: d.latitude, lon: d.longitude, withinMeters: 50) else { continue }
-                    index.add(day: day, lat: d.latitude, lon: d.longitude)
-                    bg.insert(FootprintPoint(draft: d))
-                    added += 1
-                    insertedTrajectory = insertedTrajectory
-                        || d.source == FootprintSource.gps.rawValue
-                        || d.source == FootprintSource.csv.rawValue
-                }
-                do { try bg.save() } catch {
-                    continuation.resume(returning: 0)
-                    return
-                }
-                appLog.info("[Import] 后台导入完成：\(drafts.count) 条 → 新增 \(added)（dense=\(dense)）")
-                if added > 0 {
-                    var domains: DataRevisionDomains = [.place, .stats]
-                    if insertedTrajectory { domains.insert(.trajectory) }
-                    DataRevisionStore.commit(domains, reason: "FootprintStore.importDraftsInBackground")
-                }
-                continuation.resume(returning: added)
-            }
+        // Kept for older internal callers; both paths now preserve measured samples.
+        await importMeasurements(drafts, container: container).added
+    }
+
+    static func importMeasurements(
+        _ drafts: [FootprintDraft], container: ModelContainer,
+        token suppliedToken: LocalImportCoordinator.Token? = nil,
+        persistBatch: (@Sendable ([FootprintDraft], ModelContainer) throws -> Void)? = nil
+    ) async -> LocalImportResult {
+        let coordinator = LocalImportCoordinator.shared
+        guard let token = suppliedToken ?? coordinator.capture() else {
+            return LocalImportResult(status: .cancelled)
         }
+        do {
+            return try await coordinator.run(token: token) {
+                var result = LocalImportResult()
+                guard !drafts.isEmpty else { return result }
+                var identities = Set<ImportPointIdentity>()
+                do {
+                    try loadExistingMeasurementIdentities(from: container, into: &identities,
+                                                          matching: drafts, token: token)
+                } catch {
+                    result.status = coordinator.isCurrent(token) ? .failed : .cancelled
+                    return result
+                }
+                var batch: [FootprintDraft] = []
+                batch.reserveCapacity(FootprintImportPersistencePolicy.insertBatchSize)
+                func saveBatch() throws {
+                    guard !batch.isEmpty else { return }
+                    guard coordinator.isCurrent(token) else {
+                        throw LocalImportCoordinator.Failure.invalidated
+                    }
+                    if let persistBatch { try persistBatch(batch, container) }
+                    else { try persist(batch, in: container) }
+                    result.added += batch.count
+                    batch.removeAll(keepingCapacity: true)
+                }
+                do {
+                    for (index, draft) in drafts.enumerated() {
+                        if index.isMultiple(of: 256), !coordinator.isCurrent(token) {
+                            throw LocalImportCoordinator.Failure.invalidated
+                        }
+                        guard GeoMath.isValid(latitude: draft.latitude, longitude: draft.longitude),
+                              draft.timestamp.timeIntervalSince1970.isFinite else {
+                            result.invalid += 1
+                            continue
+                        }
+                        guard identities.insert(ImportPointIdentity(draft)).inserted else {
+                            result.duplicates += 1
+                            continue
+                        }
+                        batch.append(draft)
+                        if batch.count == FootprintImportPersistencePolicy.insertBatchSize {
+                            try saveBatch()
+                        }
+                    }
+                    try saveBatch()
+                } catch {
+                    result.status = coordinator.isCurrent(token) ? .failed : .cancelled
+                    appLog.error("[Import] 导入未完成，已提交 \(result.added) 条")
+                }
+                if result.added > 0, coordinator.isCurrent(token) {
+                    DataRevisionStore.commit([.trajectory, .place, .stats],
+                                             reason: "FootprintStore.importMeasurements")
+                }
+                return result
+            }
+        } catch {
+            return LocalImportResult(status: .cancelled)
+        }
+    }
+
+    nonisolated private static func loadExistingMeasurementIdentities(
+        from container: ModelContainer, into identities: inout Set<ImportPointIdentity>,
+        matching drafts: [FootprintDraft],
+        token: LocalImportCoordinator.Token
+    ) throws {
+        let times = drafts.map(\.timestamp).filter { $0.timeIntervalSince1970.isFinite }
+        guard let first = times.min(), let last = times.max() else { return }
+        let sources = Array(Set(drafts.map(\.source)))
+        // A short CSV import must not materialize unrelated years of GPS/photo data.
+        let predicate = #Predicate<FootprintPoint> {
+            $0.timestamp >= first && $0.timestamp <= last && sources.contains($0.sourceRaw)
+        }
+        var offset = 0
+        while true {
+            guard LocalImportCoordinator.shared.isCurrent(token) else {
+                throw LocalImportCoordinator.Failure.invalidated
+            }
+            let context = ModelContext(container)
+            context.autosaveEnabled = false
+            var descriptor = FetchDescriptor<FootprintPoint>(predicate: predicate, sortBy: [
+                SortDescriptor(\.timestamp), SortDescriptor(\.latitude),
+                SortDescriptor(\.longitude), SortDescriptor(\.sourceRaw)
+            ])
+            descriptor.fetchLimit = FootprintImportPersistencePolicy.existingFetchPageSize
+            descriptor.fetchOffset = offset
+            let page = try context.fetch(descriptor)
+            for point in page {
+                identities.insert(ImportPointIdentity(FootprintDraft(
+                    latitude: point.latitude, longitude: point.longitude,
+                    timestamp: point.timestamp, source: point.sourceRaw,
+                    trajectoryID: point.trajectoryID, sessionID: point.sessionID,
+                    segmentID: point.segmentID)))
+            }
+            if page.count < FootprintImportPersistencePolicy.existingFetchPageSize { return }
+            offset += page.count
+        }
+    }
+
+
+    /// 每批使用独立 ModelContext；保存后整个对象图即可释放。
+    nonisolated private static func persist(
+        _ drafts: [FootprintDraft], in container: ModelContainer
+    ) throws {
+        let context = ModelContext(container)
+        context.autosaveEnabled = false
+        for draft in drafts { context.insert(FootprintPoint(draft: draft)) }
+        try context.save()
     }
 
     /// 统计：总里程只累计时间间隔 < 12 小时的相邻点（避免跨城直线距离虚高）。
@@ -196,10 +299,11 @@ enum FootprintStore {
     }
 
     static func exportCSV(_ points: [FootprintPoint]) throws -> URL {
-        var text = "latitude,longitude,time,source\n"
+        var text = "latitude,longitude,time,source,source_coordinate_system,raw_latitude,raw_longitude,coordinate_transform_version\n"
         let iso = ISO8601DateFormatter()
         for p in points.sorted(by: { $0.timestamp < $1.timestamp }) {
-            text += "\(p.latitude),\(p.longitude),\(iso.string(from: p.timestamp)),\(p.sourceRaw)\n"
+            let version = p.coordinateTransformVersion.map(String.init) ?? ""
+            text += "\(p.latitude),\(p.longitude),\(iso.string(from: p.timestamp)),\(p.sourceRaw),\(p.sourceCoordinateSystem.rawValue),\(p.originalLatitude),\(p.originalLongitude),\(version)\n"
         }
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("足迹备份.csv")
         try text.write(to: url, atomically: true, encoding: .utf8)

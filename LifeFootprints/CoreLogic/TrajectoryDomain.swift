@@ -111,6 +111,7 @@ public struct TrajectorySample: Equatable, Sendable {
     public let source: TrajectorySource
     public let sourceIdentifier: String?
     public let sessionID: String?
+    public let segmentID: String?
     public let routeID: String?
     public let activityType: String?
     public let latitude: Double
@@ -122,7 +123,8 @@ public struct TrajectorySample: Equatable, Sendable {
     public let course: Double?
 
     public init(id: String, source: TrajectorySource, sourceIdentifier: String? = nil,
-                sessionID: String? = nil, routeID: String? = nil, activityType: String? = nil,
+                sessionID: String? = nil, segmentID: String? = nil,
+                routeID: String? = nil, activityType: String? = nil,
                 latitude: Double, longitude: Double, timestamp: Date,
                 altitude: Double? = nil, horizontalAccuracy: Double? = nil,
                 speed: Double? = nil, course: Double? = nil) {
@@ -130,6 +132,7 @@ public struct TrajectorySample: Equatable, Sendable {
         self.source = source
         self.sourceIdentifier = sourceIdentifier
         self.sessionID = sessionID
+        self.segmentID = segmentID
         self.routeID = routeID
         self.activityType = activityType
         self.latitude = latitude
@@ -207,13 +210,17 @@ public enum TrajectoryBuilder {
 
     private static func buildGapDelimited(samples: [TrajectorySample], source: TrajectorySource,
                                           configuration: TrajectoryBuilderConfiguration) -> [Trajectory] {
+        var configuration = configuration
+        if source == .coreLocation {
+            configuration.maximumTimeGap = min(configuration.maximumTimeGap,
+                                                TrackConnectionPolicy.maximumContinuousInterval)
+        }
         var result: [Trajectory] = []
         let explicit = Dictionary(grouping: samples.filter { $0.sessionID != nil }) { $0.sessionID! }
         for sessionID in explicit.keys.sorted() {
             let sessionSamples = explicit[sessionID] ?? []
-            let segments = partition(sessionSamples, configuration: configuration).enumerated().map {
-                ("\(sessionID):segment:\($0.offset)", $0.element)
-            }
+            let segments = explicitSegments(sessionSamples, sessionID: sessionID,
+                                            configuration: configuration)
             if let trajectory = makeTrajectory(
                 source: source, sessionID: sessionID,
                 sourceIdentifier: sessionSamples.first?.sourceIdentifier,
@@ -235,6 +242,40 @@ public enum TrajectoryBuilder {
             }
         }
         return result
+    }
+
+    /// 保留持久化边界；GPS 历史段另外按连续性上限细分，不改变原始点。
+    private static func explicitSegments(
+        _ samples: [TrajectorySample], sessionID: String,
+        configuration: TrajectoryBuilderConfiguration
+    ) -> [(id: String, samples: [TrajectorySample])] {
+        let ordered = samples.sorted {
+            $0.timestamp == $1.timestamp ? $0.id < $1.id : $0.timestamp < $1.timestamp
+        }
+        guard ordered.contains(where: { $0.segmentID != nil }) else {
+            return partition(ordered, configuration: configuration).enumerated().map {
+                ("\(sessionID):segment:\($0.offset)", $0.element)
+            }
+        }
+        var result: [(String, [TrajectorySample])] = []
+        var currentID: String?
+        var current: [TrajectorySample] = []
+        for sample in ordered {
+            let sampleID = sample.segmentID ?? "\(sessionID):legacy"
+            if currentID != nil, sampleID != currentID {
+                result.append((currentID!, current)); current = []
+            }
+            currentID = sampleID; current.append(sample)
+        }
+        if let currentID, !current.isEmpty { result.append((currentID, current)) }
+        return result.flatMap { id, points in
+            guard points.first?.source == .coreLocation else { return [(id, points)] }
+            let parts = partition(points, configuration: configuration)
+            if parts.count <= 1 { return [(id, points)] }
+            return parts.enumerated().map { index, values in
+                ("\(id):continuity-v1:\(index)", values)
+            }
+        }
     }
 
     private static func partition(_ samples: [TrajectorySample],

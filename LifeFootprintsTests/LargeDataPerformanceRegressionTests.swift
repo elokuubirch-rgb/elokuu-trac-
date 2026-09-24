@@ -3,11 +3,54 @@ import MapKit
 @testable import LifeFootprints
 
 final class LargeDataPerformanceRegressionTests: XCTestCase {
+    func testRoutePointChunkPrototypeBenchmarkAtRequestedScales() throws {
+        guard ProcessInfo.processInfo.environment["FP_RUN_ROUTE_CHUNK_BENCHMARK"] == "1"
+        else { throw XCTSkip("Set FP_RUN_ROUTE_CHUNK_BENCHMARK=1 for the 100k/500k/1.7m benchmark") }
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+        for count in [100_000, 500_000, 1_700_000] {
+            try autoreleasepool {
+                var samples: [RoutePointChunkPrototypeSample] = []
+                samples.reserveCapacity(count)
+                for index in 0..<count {
+                    let latitude = 31.2 + Double(index) * 0.000_001
+                    let longitude = 121.4 + sin(Double(index) / 500) * 0.001
+                    samples.append(RoutePointChunkPrototypeSample(
+                        latitude: latitude,
+                        longitude: longitude,
+                        altitude: 10 + Double(index % 100) / 10,
+                        timestamp: base.addingTimeInterval(Double(index)),
+                        horizontalAccuracy: 5,
+                        speed: 1.5,
+                        course: Double(index % 360)))
+                }
+                let encodeStart = CFAbsoluteTimeGetCurrent()
+                let data = try RoutePointChunkPrototypeCodec.encode(
+                    workoutID: "benchmark-workout", routeID: "benchmark-route",
+                    segmentID: "benchmark-segment", samples: samples)
+                let encodeMilliseconds = (CFAbsoluteTimeGetCurrent() - encodeStart) * 1_000
+                let decodeStart = CFAbsoluteTimeGetCurrent()
+                let decoded = try RoutePointChunkPrototypeCodec.decode(data)
+                let decodeMilliseconds = (CFAbsoluteTimeGetCurrent() - decodeStart) * 1_000
+                let randomReadStart = CFAbsoluteTimeGetCurrent()
+                let start = max(0, decoded.samples.count / 2 - 512)
+                let end = min(decoded.samples.count, start + 1_024)
+                let checksum = decoded.samples[start..<end].reduce(0.0) {
+                    $0 + $1.latitude + $1.longitude
+                }
+                let randomReadMilliseconds =
+                    (CFAbsoluteTimeGetCurrent() - randomReadStart) * 1_000
+                XCTAssertEqual(decoded.samples.count, count)
+                XCTAssertTrue(checksum.isFinite)
+                print("ROUTE_CHUNK_BENCHMARK points=\(count) bytes=\(data.count) bytesPerPoint=\(Double(data.count) / Double(count)) encodeMs=\(encodeMilliseconds) decodeMs=\(decodeMilliseconds) random1024Ms=\(randomReadMilliseconds)")
+            }
+        }
+    }
+
     func testSyntheticScalePagingIsBoundedAt100k300kAnd623k() {
         let cases = [
-            (rows: 100_000, batches: 5),
-            (rows: 300_000, batches: 15),
-            (rows: 623_384, batches: 32)
+            (rows: 100_000, batches: 20),
+            (rows: 300_000, batches: 60),
+            (rows: 623_384, batches: 125)
         ]
         for item in cases {
             XCTAssertEqual(
@@ -15,7 +58,7 @@ final class LargeDataPerformanceRegressionTests: XCTestCase {
                 item.batches)
             XCTAssertEqual(
                 TrajectoryReadPagingPolicy.maximumMaterializedModels(forRowCount: item.rows),
-                20_000)
+                5_000)
         }
         XCTAssertEqual(TrajectoryReadPagingPolicy.batchCount(forRowCount: 0), 0)
         XCTAssertEqual(TrajectoryReadPagingPolicy.maximumMaterializedModels(forRowCount: 0), 0)
@@ -42,7 +85,7 @@ final class LargeDataPerformanceRegressionTests: XCTestCase {
         XCTAssertEqual(oneChange.unchanged.count, 99_999)
         XCTAssertEqual(
             MapOverlayAmplificationPolicy.overlayCount(forLogicalRouteCount: current.count),
-            current.count)
+            1)
         XCTAssertEqual(
             MapOverlayAmplificationPolicy.polylineCount(forLogicalRouteCount: current.count), 0)
     }

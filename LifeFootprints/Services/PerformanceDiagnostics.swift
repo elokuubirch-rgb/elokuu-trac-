@@ -2,6 +2,7 @@
 import Foundation
 import QuartzCore
 import os
+import Darwin
 
 /// 只在 FP_PERF_DIAGNOSTICS=1 时启用。记录 signpost 与内存聚合，
 /// 不参与任何产品状态、数据筛选或渲染决策。
@@ -18,7 +19,7 @@ enum PerformanceDiagnostics {
         guard isEnabled else { return }
         os_signpost(.event, log: log, name: "PERF_EVENT", "%{public}s|%{public}s",
                     name, metadata)
-        storage.recordEvent(name: name, mainThread: Thread.isMainThread)
+        storage.recordEvent(name: name, metadata: metadata, mainThread: Thread.isMainThread)
     }
 
     static func count(_ name: String, by amount: Int = 1) {
@@ -120,9 +121,20 @@ private final class PerformanceDiagnosticsStorage: @unchecked Sendable {
         let generatedAt: Date
         let processIdentifier: Int32
         let systemVersion: String
+        let residentMemoryBytes: UInt64
+        let physicalFootprintBytes: UInt64
+        let peakResidentMemoryBytes: UInt64
+        let peakPhysicalFootprintBytes: UInt64
         let metrics: [String: Metric]
         let events: [String: EventMetric]
         let counters: [String: Int]
+        let startupMilliseconds: [String: Double]
+        let revisionEvents: [RevisionEvent]
+    }
+
+    private struct RevisionEvent: Codable {
+        let monotonicSeconds: Double
+        let metadata: String
     }
 
     private let lock = NSLock()
@@ -130,12 +142,19 @@ private final class PerformanceDiagnosticsStorage: @unchecked Sendable {
     private var metrics: [String: Metric] = [:]
     private var events: [String: EventMetric] = [:]
     private var counters: [String: Int] = [:]
+    private var revisionEvents: [RevisionEvent] = []
     private var tabTransition: (from: Int, to: Int, started: CFTimeInterval)?
     private var transitions: [String: CFTimeInterval] = [:]
     private var pendingFlush: DispatchWorkItem?
+    private var peakResidentMemoryBytes: UInt64 = 0
+    private var peakPhysicalFootprintBytes: UInt64 = 0
 
-    func recordEvent(name: String, mainThread: Bool) {
+    func recordEvent(name: String, metadata: String, mainThread: Bool) {
         lock.withLock {
+            if name == "DataRevision.changed" {
+                revisionEvents.append(.init(monotonicSeconds: CACurrentMediaTime(), metadata: metadata))
+                if revisionEvents.count > 128 { revisionEvents.removeFirst() }
+            }
             var value = events[name] ?? EventMetric()
             value.calls += 1
             if mainThread { value.mainThreadCalls += 1 }
@@ -205,10 +224,22 @@ private final class PerformanceDiagnosticsStorage: @unchecked Sendable {
     }
 
     func flush() {
+        let memory = Self.currentMemoryUsage()
         let report = lock.withLock {
-            Report(generatedAt: Date(), processIdentifier: ProcessInfo.processInfo.processIdentifier,
-                   systemVersion: ProcessInfo.processInfo.operatingSystemVersionString,
-                   metrics: metrics, events: events, counters: counters)
+            peakResidentMemoryBytes = max(peakResidentMemoryBytes, memory.resident)
+            peakPhysicalFootprintBytes = max(
+                peakPhysicalFootprintBytes, memory.physicalFootprint)
+            return Report(
+                generatedAt: Date(),
+                processIdentifier: ProcessInfo.processInfo.processIdentifier,
+                systemVersion: ProcessInfo.processInfo.operatingSystemVersionString,
+                residentMemoryBytes: memory.resident,
+                physicalFootprintBytes: memory.physicalFootprint,
+                peakResidentMemoryBytes: peakResidentMemoryBytes,
+                peakPhysicalFootprintBytes: peakPhysicalFootprintBytes,
+                metrics: metrics, events: events, counters: counters,
+                startupMilliseconds: MapStartupDiagnostics.shared.snapshot(),
+                revisionEvents: revisionEvents)
         }
         guard let data = try? JSONEncoder.performanceAudit.encode(report) else { return }
         let directory = FileManager.default.urls(for: .documentDirectory,
@@ -222,6 +253,19 @@ private final class PerformanceDiagnosticsStorage: @unchecked Sendable {
         let work = DispatchWorkItem { [weak self] in self?.flush() }
         pendingFlush = work
         flushQueue.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    private static func currentMemoryUsage() -> (resident: UInt64, physicalFootprint: UInt64) {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(
+            MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return (0, 0) }
+        return (UInt64(info.resident_size), UInt64(info.phys_footprint))
     }
 }
 

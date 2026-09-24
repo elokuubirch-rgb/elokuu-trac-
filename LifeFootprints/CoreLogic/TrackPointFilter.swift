@@ -1,222 +1,191 @@
 import Foundation
+import CoreLocation
 
-/// 主动轨迹记录流水线的拒绝原因。
-/// 每一个被拒绝的 GPS 点都必须携带一个原因，便于定位「16 个点」到底卡在哪一层。
-public enum TrackRejectionReason: String, CaseIterable {
-    case invalidCoordinate
-    case invalidTimestamp
-    case poorAccuracy
-    case stationary
+public enum TrackRejectReason: String, CaseIterable, Sendable {
     case duplicate
-    case impossibleJump
-    case other
-
-    /// 诊断摘要里对外展示的归类名（invalidCoordinate / invalidTimestamp / other 统一归入 Other）。
-    public var summaryCategory: String {
-        switch self {
-        case .poorAccuracy: return "Poor accuracy"
-        case .stationary: return "Stationary"
-        case .duplicate: return "Duplicate"
-        case .impossibleJump: return "Impossible jump"
-        case .invalidCoordinate, .invalidTimestamp, .other: return "Other"
-        }
-    }
+    case stationaryJitter
+    case obviousTeleport
+    case accelerationDiscontinuity
 }
 
-/// 一条被拒绝点的明细（用于诊断日志；值类型，无 CoreLocation 依赖）。
-public struct TrackRejectionRecord: Equatable {
-    public let reason: TrackRejectionReason
-    public let timestamp: TimeInterval
-    public let latitude: Double
-    public let longitude: Double
+public enum TrackSegmentBreakReason: String, CaseIterable, Sendable {
+    case timeGap, distanceGap, unreliableGap, sessionBoundary, sourceBoundary, locationRestart
+    case insufficientConnectionEvidence
+}
+
+/// Realtime filter 认为“值得继续观察”的点。它只存在短窗口内，不能直接入库。
+public struct TrackCandidate: Equatable, Sendable {
+    public let id: UUID
+    public let coordinate: CLLocationCoordinate2D
+    public let timestamp: Date
     public let horizontalAccuracy: Double
-    public let distanceToLastMeters: Double
+    public let altitude: Double
+    public let systemSpeed: Double
+    public let derivedSpeed: Double
+    public let acceleration: Double?
+    public let course: Double
+    public let source: LocationSampleSource
+    public let motionState: MotionState
+    public let realtimeConfidence: Double
 
-    public init(reason: TrackRejectionReason, timestamp: TimeInterval,
-                latitude: Double, longitude: Double,
-                horizontalAccuracy: Double, distanceToLastMeters: Double) {
-        self.reason = reason
+    public init(id: UUID = UUID(), coordinate: CLLocationCoordinate2D,
+                timestamp: Date, horizontalAccuracy: Double, altitude: Double,
+                systemSpeed: Double, derivedSpeed: Double,
+                acceleration: Double?, course: Double,
+                source: LocationSampleSource, motionState: MotionState,
+                realtimeConfidence: Double) {
+        self.id = id
+        self.coordinate = coordinate
         self.timestamp = timestamp
-        self.latitude = latitude
-        self.longitude = longitude
         self.horizontalAccuracy = horizontalAccuracy
-        self.distanceToLastMeters = distanceToLastMeters
-    }
-}
-
-/// 过滤流水线的输入：一次原始 GPS 回调（CLLocation 的纯值投影）。
-public struct TrackSample: Equatable {
-    public let latitude: Double
-    public let longitude: Double
-    public let timestamp: TimeInterval   // Unix 秒
-    public let speedMPS: Double          // 设备报告速度；<0 视为无效
-    public let course: Double            // 朝向（度）；<0 视为无效
-    public let horizontalAccuracy: Double // 精度（米）；<0 视为无效
-
-    public init(latitude: Double, longitude: Double, timestamp: TimeInterval,
-                speedMPS: Double, course: Double, horizontalAccuracy: Double) {
-        self.latitude = latitude
-        self.longitude = longitude
-        self.timestamp = timestamp
-        self.speedMPS = speedMPS
+        self.altitude = altitude
+        self.systemSpeed = systemSpeed
+        self.derivedSpeed = derivedSpeed
+        self.acceleration = acceleration
         self.course = course
-        self.horizontalAccuracy = horizontalAccuracy
+        self.source = source
+        self.motionState = motionState
+        self.realtimeConfidence = realtimeConfidence
+    }
+
+    public static func == (lhs: TrackCandidate, rhs: TrackCandidate) -> Bool {
+        lhs.id == rhs.id
+            && lhs.coordinate.latitude == rhs.coordinate.latitude
+            && lhs.coordinate.longitude == rhs.coordinate.longitude
+            && lhs.timestamp == rhs.timestamp
+            && lhs.horizontalAccuracy == rhs.horizontalAccuracy
+            && lhs.altitude == rhs.altitude
+            && lhs.systemSpeed == rhs.systemSpeed
+            && lhs.derivedSpeed == rhs.derivedSpeed
+            && lhs.acceleration == rhs.acceleration
+            && lhs.course == rhs.course
+            && lhs.source == rhs.source
+            && lhs.motionState == rhs.motionState
+            && lhs.realtimeConfidence == rhs.realtimeConfidence
     }
 }
 
-/// 一次过滤决策。
-public struct TrackFilterDecision: Equatable {
-    public let accept: Bool
-    public let reason: TrackRejectionReason?
-    public let distanceMeters: Double
-    public let elapsedSeconds: Double
-    public let headingChangeDegrees: Double
-    public let speedMPS: Double
-
-    public init(accept: Bool, reason: TrackRejectionReason?,
-                distanceMeters: Double, elapsedSeconds: Double,
-                headingChangeDegrees: Double, speedMPS: Double) {
-        self.accept = accept
-        self.reason = reason
-        self.distanceMeters = distanceMeters
-        self.elapsedSeconds = elapsedSeconds
-        self.headingChangeDegrees = headingChangeDegrees
-        self.speedMPS = speedMPS
-    }
+public enum RealtimeTrackDecision: Equatable, Sendable {
+    case reject(TrackRejectReason)
+    case candidate(TrackCandidate)
+    case newSegmentCandidate(TrackCandidate, TrackSegmentBreakReason)
 }
 
-/// 主动轨迹点的联合决策过滤器（距离 + 时间 + 速度 + 方向变化 + GPS 精度）。
-///
-/// 不是简单的 `distance >= X`：步行约 3–8m 产生一个点，同时提供
-/// 时间兜底与转向兜底，避免慢速/原地踱步时长期不落点。
-public struct TrackPointFilter {
-
-    public struct Config: Equatable {
-        // 距离触发：步行 3–8m 的目标区间
-        public var minDistanceMeters: Double = 3
-        // 时间兜底：即使未到 minDistance，合理时间 + 可信位移也落点
-        public var timeFallbackSeconds: Double = 8
-        public var fallbackMinDistanceMeters: Double = 1.5
-        public var fallbackMaxAccuracyMeters: Double = 35
-        // 转向兜底：明显转向即使短距也落点（还原路口/折返）
-        public var turnThresholdDegrees: Double = 40
-        public var turnMinDistanceMeters: Double = 1.0
-        public var turnMaxAccuracyMeters: Double = 50
-        // 精度门控：超过即 poorAccuracy（明显漂移/极差精度）
-        public var maxAccuracyMeters: Double = 100
-        // 真正重复坐标
-        public var duplicateDistanceMeters: Double = 1.0
-        // 不合理瞬移：位移巨大且速度离谱
-        public var maxPlausibleSpeedMPS: Double = 45     // 约 162 km/h
-        public var jumpMinDistanceMeters: Double = 100
-
-        public init() {}
-    }
-
-    /// 上一个已接受的点（用于距离/时间基准）
-    public private(set) var lastAccepted: TrackSample?
-    /// 上一个原始点（用于方向变化判断，无论是否被接受）
-    private var lastRaw: TrackSample?
-
+/// 实时层只回答“这个点是否值得继续观察”。
+/// 高速本身永远不是拒绝理由；非极端 spike 留给 TrackWindowCorrector。
+public struct TrackPointFilter: Sendable {
+    private var lastCandidate: TrackCandidate?
     public init() {}
 
-    public mutating func reset() {
-        lastAccepted = nil
-        lastRaw = nil
+    public mutating func reset() { lastCandidate = nil }
+
+    public mutating func evaluate(_ sample: RawLocationSample, motion: MotionObservation,
+                                  configuration: LocationFilterConfiguration)
+        -> RealtimeTrackDecision {
+        guard let previous = lastCandidate else {
+            let candidate = makeCandidate(sample, previous: nil, motion: motion)
+            lastCandidate = candidate
+            return .candidate(candidate)
+        }
+
+        let elapsed = sample.timestamp.timeIntervalSince(previous.timestamp)
+        let distance = GeoMath.distanceMeters(
+            from: (previous.coordinate.latitude, previous.coordinate.longitude),
+            to: (sample.latitude, sample.longitude))
+        let derivedSpeed = elapsed > 0 ? distance / elapsed : 0
+        let acceleration = elapsed > 0
+            ? (derivedSpeed - previous.derivedSpeed) / elapsed : nil
+        let candidate = makeCandidate(sample, previous: previous, motion: motion,
+                                      derivedSpeed: derivedSpeed,
+                                      acceleration: acceleration)
+
+        if sample.source != previous.source {
+            lastCandidate = candidate
+            return .newSegmentCandidate(candidate, .sourceBoundary)
+        }
+        if elapsed > configuration.automaticSessionGap {
+            lastCandidate = candidate
+            return .newSegmentCandidate(candidate, .sessionBoundary)
+        }
+        let gap = configuration.gapProfile(for: sample.source)
+        if elapsed > gap.maximumTimeGap {
+            lastCandidate = candidate
+            let unreliable = max(sample.horizontalAccuracy,
+                                 previous.horizontalAccuracy)
+                >= configuration.unreliableAccuracy
+            return .newSegmentCandidate(candidate,
+                                        unreliable ? .unreliableGap : .timeGap)
+        }
+        if distance > gap.maximumDistanceGap {
+            lastCandidate = candidate
+            return .newSegmentCandidate(candidate, .distanceGap)
+        }
+        if distance < configuration.duplicateDistance {
+            return .reject(.duplicate)
+        }
+
+        let centerDistance = GeoMath.distanceMeters(
+            from: (motion.centerLatitude, motion.centerLongitude),
+            to: (sample.latitude, sample.longitude))
+        if motion.state == .stationary,
+           centerDistance <= min(configuration.stationaryMaximumRadius,
+                                 max(configuration.stationaryMinimumRadius,
+                                     motion.dynamicRadius)) {
+            return .reject(.stationaryJitter)
+        }
+        if distance < configuration.minimumTrackDistance,
+           motion.state != .moving {
+            return .reject(.stationaryJitter)
+        }
+
+        let accelerationBreak = acceleration.map {
+            $0 > configuration.maxPositiveAcceleration
+                || $0 < -configuration.maxNegativeAcceleration
+        } ?? false
+        if distance >= configuration.obviousTeleportMinimumDistance,
+           elapsed <= configuration.obviousTeleportMaximumInterval,
+           sample.horizontalAccuracy >= configuration.obviousTeleportMinimumAccuracy,
+           accelerationBreak {
+            return .reject(.obviousTeleport)
+        }
+        if distance >= configuration.teleportMinimumDistance,
+           sample.horizontalAccuracy >= configuration.unreliableAccuracy,
+           accelerationBreak,
+           elapsed <= 1 {
+            return .reject(.accelerationDiscontinuity)
+        }
+
+        if !TrackConnectionPolicy.permitsConnection(
+            source: sample.source, elapsed: elapsed, distance: distance) {
+            lastCandidate = candidate
+            return .newSegmentCandidate(candidate, .insufficientConnectionEvidence)
+        }
+        lastCandidate = candidate
+        return .candidate(candidate)
     }
 
-    public mutating func evaluate(_ sample: TrackSample,
-                                  config: Config = Config()) -> TrackFilterDecision {
-        defer { lastRaw = sample }
-
-        let reportedSpeed = sample.speedMPS >= 0 ? sample.speedMPS : 0
-        guard GeoMath.isValid(latitude: sample.latitude, longitude: sample.longitude) else {
-            return .init(accept: false, reason: .invalidCoordinate,
-                         distanceMeters: 0, elapsedSeconds: 0,
-                         headingChangeDegrees: 0, speedMPS: reportedSpeed)
-        }
-        guard sample.horizontalAccuracy >= 0 else {
-            return .init(accept: false, reason: .poorAccuracy,
-                         distanceMeters: 0, elapsedSeconds: 0,
-                         headingChangeDegrees: 0, speedMPS: reportedSpeed)
-        }
-        guard sample.horizontalAccuracy <= config.maxAccuracyMeters else {
-            return .init(accept: false, reason: .poorAccuracy,
-                         distanceMeters: 0, elapsedSeconds: 0,
-                         headingChangeDegrees: 0, speedMPS: reportedSpeed)
-        }
-
-        guard let last = lastAccepted else {
-            // 起点：首个精度可接受的点
-            lastAccepted = sample
-            return .init(accept: true, reason: nil,
-                         distanceMeters: 0, elapsedSeconds: 0,
-                         headingChangeDegrees: 0, speedMPS: reportedSpeed)
-        }
-
-        let distance = GeoMath.distanceMeters(from: (last.latitude, last.longitude),
-                                              to: (sample.latitude, sample.longitude))
-        let elapsed = sample.timestamp - last.timestamp
-        guard elapsed > 0 else {
-            return .init(accept: false, reason: .invalidTimestamp,
-                         distanceMeters: distance, elapsedSeconds: 0,
-                         headingChangeDegrees: 0, speedMPS: reportedSpeed)
-        }
-
-        let calcSpeed = distance / elapsed
-        let speed = max(reportedSpeed, calcSpeed)
-        let heading = headingChange(from: lastRaw, to: sample)
-
-        // 不合理瞬移：位移大且速度离谱（GPS 跳点）
-        if calcSpeed > config.maxPlausibleSpeedMPS, distance > config.jumpMinDistanceMeters {
-            return .init(accept: false, reason: .impossibleJump,
-                         distanceMeters: distance, elapsedSeconds: elapsed,
-                         headingChangeDegrees: heading, speedMPS: speed)
-        }
-
-        // 真正重复坐标（同一位置反复回调）
-        if distance < config.duplicateDistanceMeters {
-            return .init(accept: false, reason: .duplicate,
-                         distanceMeters: distance, elapsedSeconds: elapsed,
-                         headingChangeDegrees: heading, speedMPS: speed)
-        }
-
-        // 距离触发（步行 3–8m）
-        if distance >= config.minDistanceMeters {
-            lastAccepted = sample
-            return .init(accept: true, reason: nil,
-                         distanceMeters: distance, elapsedSeconds: elapsed,
-                         headingChangeDegrees: heading, speedMPS: speed)
-        }
-
-        // 转向触发（明显转向且确实发生了有效位移）
-        if heading >= config.turnThresholdDegrees,
-           distance >= config.turnMinDistanceMeters,
-           sample.horizontalAccuracy <= config.turnMaxAccuracyMeters {
-            lastAccepted = sample
-            return .init(accept: true, reason: nil,
-                         distanceMeters: distance, elapsedSeconds: elapsed,
-                         headingChangeDegrees: heading, speedMPS: speed)
-        }
-
-        // 时间兜底（合理时间 + 可信位移 + 合理精度）
-        if elapsed >= config.timeFallbackSeconds,
-           distance >= config.fallbackMinDistanceMeters,
-           sample.horizontalAccuracy <= config.fallbackMaxAccuracyMeters {
-            lastAccepted = sample
-            return .init(accept: true, reason: nil,
-                         distanceMeters: distance, elapsedSeconds: elapsed,
-                         headingChangeDegrees: heading, speedMPS: speed)
-        }
-
-        return .init(accept: false, reason: .stationary,
-                     distanceMeters: distance, elapsedSeconds: elapsed,
-                     headingChangeDegrees: heading, speedMPS: speed)
-    }
-
-    private func headingChange(from a: TrackSample?, to b: TrackSample) -> Double {
-        guard let a, a.course >= 0, b.course >= 0 else { return 0 }
-        let diff = abs(b.course - a.course).truncatingRemainder(dividingBy: 360)
-        return diff > 180 ? 360 - diff : diff
+    private func makeCandidate(_ sample: RawLocationSample,
+                               previous: TrackCandidate?,
+                               motion: MotionObservation,
+                               derivedSpeed suppliedSpeed: Double? = nil,
+                               acceleration: Double? = nil) -> TrackCandidate {
+        let elapsed = previous.map { sample.timestamp.timeIntervalSince($0.timestamp) } ?? 0
+        let distance = previous.map {
+            GeoMath.distanceMeters(
+                from: ($0.coordinate.latitude, $0.coordinate.longitude),
+                to: (sample.latitude, sample.longitude))
+        } ?? 0
+        let derivedSpeed = suppliedSpeed ?? (elapsed > 0 ? distance / elapsed : 0)
+        let accuracyScore = max(0, min(1,
+            1 - sample.horizontalAccuracy / 100))
+        let accelerationMagnitude = acceleration.map(abs) ?? 0
+        let continuityPenalty = min(0.35, accelerationMagnitude / 100)
+        return TrackCandidate(
+            coordinate: sample.coordinate, timestamp: sample.timestamp,
+            horizontalAccuracy: sample.horizontalAccuracy, altitude: sample.altitude,
+            systemSpeed: sample.systemSpeed, derivedSpeed: derivedSpeed,
+            acceleration: acceleration, course: sample.course,
+            source: sample.source, motionState: motion.state,
+            realtimeConfidence: max(0.05, accuracyScore - continuityPenalty))
     }
 }

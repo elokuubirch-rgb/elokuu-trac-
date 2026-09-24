@@ -76,6 +76,8 @@ struct PhotoExploreView: View {
     var onDismissRequested: (() -> Void)?
     /// 全局三组回顾：「再来一组」直接切到 Session 下一组（由 ReviewTabView 提供）。
     var onNextGroup: (() -> Void)?
+    /// 确认删除成功：Global Review 原子换到下一组；Map Review 由 session 自己换批。
+    var onConfirmedDeletion: (() -> Void)?
 
     @Environment(\.modelContext) private var context
     @Environment(\.dismiss) private var dismiss
@@ -112,6 +114,7 @@ struct PhotoExploreView: View {
             ZStack {
             // Layer 1: Background Layer（全屏铺满背景，不参与任何位移）
             ambientPhotoBackground()
+                .id(session.batchID)
                 .frame(width: geo.size.width, height: geo.size.height)
                 .ignoresSafeArea()
                 .reviewFrameProbe("BACKGROUND")
@@ -174,45 +177,54 @@ struct PhotoExploreView: View {
                 ZStack {
                     // Layer 2: 唯一参与 swipe 的层。Previous / Current / Next 始终共用
                     // 同一 mediaSafeRect，照片和 Live Photo 只在其内做 Aspect Fit。
-                    PhotoSwipeCardStack(
-                        session: session,
-                        stage: viewportSize,
-                        displayMode: displayMode,
-                        asyncImages: asyncImages,
-                        assetMetadata: assetMetadata,
-                        highResolutionIDs: highResolutionIDs,
-                        preparedLivePhotos: preparedLivePhotos,
-                        aroundDayNamespace: aroundDayNamespace,
-                        showDailyPhotos: showDailyPhotos,
-                        aroundDayTransitionProgress: aroundDayTransitionProgress,
-                        zoomScale: $zoomScale,
-                        dailyPhotos: $dailyPhotos,
-                        onTapCard: { },
-                        onUserInteractionBegan: { },
-                        onRequestThumbnail: { photo in
-                            requestPhotoThumbnail(for: photo)
-                        },
-                        onPrepareLivePhoto: { photo, size in
-                            Task { await prepareAdjacentLivePhotos(around: session.index, targetSize: size) }
-                        }
-                    )
-                    .frame(width: viewportSize.width, height: viewportSize.height)
-                    .reviewFrameProbe("MEDIA")
-                    // mediaSafeRect 水平始终居中，只做不参与布局的垂直渲染位移。
-                    .offset(y: metrics.mediaRect.midY - screenSize.height / 2)
-                    .zIndex(0)
+                    if !session.isTransitioningToNextBatch {
+                        PhotoSwipeCardStack(
+                            session: session,
+                            isActive: isActive,
+                            stage: viewportSize,
+                            displayMode: displayMode,
+                            asyncImages: asyncImages,
+                            assetMetadata: assetMetadata,
+                            highResolutionIDs: highResolutionIDs,
+                            preparedLivePhotos: preparedLivePhotos,
+                            aroundDayNamespace: aroundDayNamespace,
+                            showDailyPhotos: showDailyPhotos,
+                            aroundDayTransitionProgress: aroundDayTransitionProgress,
+                            zoomScale: $zoomScale,
+                            dailyPhotos: $dailyPhotos,
+                            onTapCard: { },
+                            onUserInteractionBegan: { },
+                            onRequestThumbnail: { photo in
+                                requestPhotoThumbnail(for: photo)
+                            },
+                            onPrepareLivePhoto: { photo, size in
+                                Task {
+                                    await prepareAdjacentLivePhotos(
+                                        around: session.index, targetSize: size)
+                                }
+                            }
+                        )
+                        .id(session.batchID)
+                        .frame(width: viewportSize.width, height: viewportSize.height)
+                        .reviewFrameProbe("MEDIA")
+                        // mediaSafeRect 水平始终居中，只做不参与布局的垂直渲染位移。
+                        .offset(y: metrics.mediaRect.midY - screenSize.height / 2)
+                        .zIndex(0)
+                    }
                 }
                 .frame(width: screenSize.width, height: screenSize.height)
                 .reviewFrameProbe("FOREGROUND")
                 // Layer 3: alignment overlay 由根屏幕直接锚定，子视图无法改变坐标原点。
                 .overlay(alignment: .top) {
-                    header(in: metrics.chromeWidth, screenWidth: screenSize.width)
-                        .frame(width: metrics.chromeWidth, height: 44)
-                        .reviewFrameProbe("HEADER")
-                        .padding(.top, metrics.topControlY)
+                    if !session.isTransitioningToNextBatch {
+                        header(in: metrics.chromeWidth, screenWidth: screenSize.width)
+                            .frame(width: metrics.chromeWidth, height: 44)
+                            .reviewFrameProbe("HEADER")
+                            .padding(.top, metrics.topControlY)
+                    }
                 }
                 .overlay(alignment: .topLeading) {
-                    if currentPhotoIsLive {
+                    if !session.isTransitioningToNextBatch, currentPhotoIsLive {
                         liveBadge
                             .padding(.leading, resolvedSafeLeading + 16)
                             .padding(.top, metrics.liveBadgeY)
@@ -220,9 +232,11 @@ struct PhotoExploreView: View {
                     }
                 }
                 .overlay(alignment: .bottom) {
-                    infoBlock
-                        .reviewFrameProbe("LOCATION")
-                        .padding(.bottom, max(0, screenSize.height - metrics.locationBottomY))
+                    if !session.isTransitioningToNextBatch {
+                        infoBlock
+                            .reviewFrameProbe("LOCATION")
+                            .padding(.bottom, max(0, screenSize.height - metrics.locationBottomY))
+                    }
                 }
                 .clipped()
 #if DEBUG
@@ -263,21 +277,14 @@ struct PhotoExploreView: View {
                 .allowsHitTesting(showDailyPhotos)
             }
 
-            if case .transitioning(let next) = session.phase {
-                transitionOverlay(next: next)
-                    .zIndex(10)
-            }
-            if case .refreshing = session.phase {
-                refreshOverlay
-                    .zIndex(10)
-            }
             if case .done = session.phase {
                 doneOverlay
                     .zIndex(10)
             }
-            if case .review = session.phase {
+            if session.phase == .review || session.isTransitioningToNextBatch {
                 reviewOverlay
                     .zIndex(10)
+                    .allowsHitTesting(!session.isTransitioningToNextBatch)
             }
             }
             .frame(width: geo.size.width, height: geo.size.height)
@@ -322,21 +329,27 @@ struct PhotoExploreView: View {
             trimImageCaches(around: session.index)
             loadPrecisePlaceForCurrentPhoto()
         }
-        .onChange(of: isActive) { _, active in
-            if !active {
-                // 被覆盖时不销毁页面
-            }
-        }
         .onChange(of: session.id) { _, _ in
+            // Global Review 会替换整个 session；先清空旧组瞬时状态，再加载新组首图。
+            resetTransientStateForBatchTransition()
             prefetch(from: session.index)
             trimImageCaches(around: session.index)
             loadPrecisePlaceForCurrentPhoto()
+        }
+        .onChange(of: session.phase) { _, phase in
+            if case .transitioningToNextBatch = phase {
+                resetTransientStateForBatchTransition()
+            } else if case .browsing = phase {
+                prefetch(from: session.index)
+                trimImageCaches(around: session.index)
+                loadPrecisePlaceForCurrentPhoto()
+            }
         }
         .onAppear {
             prefetch(from: session.index)
             loadPrecisePlaceForCurrentPhoto()
 #if DEBUG
-            if let count = TestHooks.reviewDeletionCount {
+            if let count = TestHooks.consumeReviewDeletionCount() {
                 session.showDeletionReviewForTesting(count: count)
             } else if TestHooks.reviewTest {
                 session.showReviewForTesting()
@@ -452,6 +465,7 @@ struct PhotoExploreView: View {
 
     /// 当前照片的背景图；未就绪时退回上一张（保持背景连续，不闪黑）。
     private var currentAmbientImage: UIImage? {
+        guard !session.isTransitioningToNextBatch else { return nil }
         let image = session.currentPhoto.flatMap { backgroundImage(for: $0) }
         return image ?? lastAmbientImage
     }
@@ -492,7 +506,16 @@ struct PhotoExploreView: View {
             // 磁盘缩略图先快速上屏。
             for item in missingImages {
                 if let path = item.path, let image = UIImage(contentsOfFile: path) {
-                    await MainActor.run { asyncImages[item.id] = image }
+                    let ambient = image.preparingThumbnail(
+                        of: CGSize(width: 96, height: 96)
+                    ) ?? image
+                    await MainActor.run {
+                        asyncImages[item.id] = image
+                        backgroundImages[item.id] = ambient
+                        if item.id == session.currentPhoto?.localIdentifier {
+                            lastAmbientImage = ambient
+                        }
+                    }
                 }
             }
             // Preview 可从 iCloud 获取，但不会等待 Live Photo 资源。
@@ -504,12 +527,13 @@ struct PhotoExploreView: View {
                 }
                 for await (id, image) in group {
                     if let image {
+                        let ambient = image.preparingThumbnail(
+                            of: CGSize(width: 96, height: 96)
+                        ) ?? image
                         await MainActor.run {
                             asyncImages[id] = image
                             highResolutionIDs.insert(id)
-                            backgroundImages[id] = image.preparingThumbnail(
-                                of: CGSize(width: 96, height: 96)
-                            ) ?? image
+                            backgroundImages[id] = ambient
                             // 当前照片的背景就绪 → 更新兜底（切组时背景连续）
                             if id == session.currentPhoto?.localIdentifier,
                                let bg = backgroundImages[id] {
@@ -618,9 +642,13 @@ struct PhotoExploreView: View {
         return ZStack {
             // 中间进度条：数据源唯一严格绑定 (session.index, session.photos.count)，
             // 屏蔽外部动画污染，纯 GPU scaleEffect 驱动
-            PhotoProgressBar(index: session.index, totalCount: session.photos.count)
+            PhotoProgressBar(index: max(0, session.progressIndex - 1), totalCount: session.progressCount)
                 .frame(width: progressWidth)
                 .reviewFrameProbe("PROGRESS")
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("回顾进度")
+                .accessibilityValue(session.progressText)
+                .accessibilityIdentifier("review-progress")
 
             // 左右按钮：固定在 headerWidth 左右两端，绝对不受中间进度条/文字/照片切换影响
             HStack {
@@ -667,21 +695,19 @@ struct PhotoExploreView: View {
     /// Live 状态属于 Fixed Chrome：拖动期间不位移，只在 index commit 后更新。
     private var liveBadge: some View {
         Menu {
-            Button {
-                session.liveAutoPlayEnabled.toggle()
-            } label: {
-                Label("自动播放", systemImage: session.liveAutoPlayEnabled ? "checkmark" : "play.fill")
-            }
-            Button {
-                session.liveMuted.toggle()
-            } label: {
-                Label("静音播放", systemImage: session.liveMuted ? "checkmark" : "speaker.wave.2.fill")
-            }
+            Toggle("自动播放", isOn: Binding(
+                get: { session.livePreferences.autoPlayEnabled },
+                set: { session.livePreferences.autoPlayEnabled = $0 }
+            ))
+            Toggle("静音播放", isOn: Binding(
+                get: { session.livePreferences.muted },
+                set: { session.livePreferences.muted = $0 }
+            ))
         } label: {
             HStack(spacing: 4) {
                 Image(systemName: "livephoto")
                 Text("实况")
-                if session.liveAutoPlayEnabled {
+                if session.livePreferences.autoPlayEnabled {
                     Circle().fill(.white.opacity(0.82)).frame(width: 4, height: 4)
                 }
             }
@@ -691,6 +717,8 @@ struct PhotoExploreView: View {
             .frame(height: 34)
             .background(.thinMaterial, in: Capsule())
             .shadow(color: .black.opacity(0.12), radius: 6, y: 2)
+            .padding(.vertical, 5)
+            .contentShape(Rectangle())
         }
     }
 
@@ -720,6 +748,11 @@ struct PhotoExploreView: View {
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.white.opacity(0.62))
                         .frame(minHeight: 14)
+                        Text(GeoMath.isValid(latitude: photo.latitude, longitude: photo.longitude) ?
+                             LocalizedStringKey("照片原始位置") : LocalizedStringKey("暂无照片定位"))
+                            .font(.system(size: 10))
+                            .foregroundStyle(.white.opacity(0.62))
+                            .accessibilityIdentifier("review-location-origin")
                         if let title = locationTitle(photo) {
                             Text(title)
                                 .font(.system(size: 14, weight: .semibold))
@@ -735,6 +768,10 @@ struct PhotoExploreView: View {
             .background(.ultraThinMaterial.opacity(0.72), in: Capsule())
         }
         .buttonStyle(.plain)
+        #if DEBUG
+        .accessibilityIdentifier("review-current-photo")
+        .accessibilityValue(session.currentPhoto?.localIdentifier ?? "none")
+        #endif
     }
 
     private func photoDateString(_ photo: PhotoRecord) -> String {
@@ -790,21 +827,58 @@ struct PhotoExploreView: View {
     }
 
     private func deletePendingPhotos() {
-        let ids = session.pendingRemovalIDs
-        guard !ids.isEmpty, !deletionInProgress else { return }
+        guard !deletionInProgress else { return }
+        let ids = session.beginConfirmedDeletionTransition()
+        guard !ids.isEmpty else { return }
         deletionInProgress = true
+        #if DEBUG
+        if TestHooks.simulateReviewDeletionSuccess {
+            finishSuccessfulDeletion(ids: ids)
+            return
+        }
+        #endif
         Task {
             do {
                 try await PhotoStore.deleteFromSystemLibrary(ids: ids)
-                PhotoStore.hide(ids: ids, in: context)
-                session.confirmPendingRemovals()
-                deletionInProgress = false
-                dismiss()
+                finishSuccessfulDeletion(ids: ids)
             } catch {
+                session.restoreDeletionReviewAfterFailure()
                 deletionInProgress = false
                 deletionErrorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func finishSuccessfulDeletion(ids: Set<String>) {
+        PhotoStore.hide(ids: ids, in: context)
+        let advance = session.completeConfirmedDeletionTransition()
+        deletionInProgress = false
+        switch advance {
+        case .mapBatchReady:
+            break
+        case .mapClusterExhausted:
+            onFinishLocationReview?()
+            if onFinishLocationReview == nil { dismiss() }
+        case .globalReviewNeedsNextGroup:
+            if let onConfirmedDeletion { onConfirmedDeletion() }
+            else if let onExitReview { onExitReview() }
+            else { dismiss() }
+        }
+    }
+
+    private func resetTransientStateForBatchTransition() {
+        zoomScale = 1
+        showDailyPhotos = false
+        aroundDayTransitionProgress = 0
+        dailyPhotos.removeAll(keepingCapacity: false)
+        asyncImages.removeAll(keepingCapacity: false)
+        backgroundImages.removeAll(keepingCapacity: false)
+        highResolutionIDs.removeAll(keepingCapacity: false)
+        lastAmbientImage = nil
+        preparedLivePhotos.removeAll(keepingCapacity: false)
+        precisePlaces.removeAll(keepingCapacity: false)
+        assetMetadata.removeAll(keepingCapacity: false)
+        deletionErrorMessage = nil
     }
 
     private var reviewOverlay: some View {
@@ -860,9 +934,7 @@ struct PhotoExploreView: View {
                     }
                 } else if session.isLocationReview {
                     HStack(spacing: 10) {
-                        if session.hasUnseenPhotos {
-                            completionButton("继续看看") { session.startNextRound() }
-                        }
+                        completionButton("继续看看") { session.startNextRound() }
                         completionButton("返回地图") {
                             onFinishLocationReview?()
                             if onFinishLocationReview == nil { dismiss() }
@@ -894,7 +966,6 @@ struct PhotoExploreView: View {
         ZStack {
             ForEach(Array(session.completionPreviewPhotos.enumerated()), id: \.element.localIdentifier) { index, photo in
                 completionPreviewCard(photo)
-                    .frame(width: 164, height: 210)
                     .rotationEffect(.degrees([-6.0, 5.0, 0.0][min(index, 2)]))
                     .offset(x: [-44.0, 44.0, 0.0][min(index, 2)],
                             y: [10.0, 12.0, -6.0][min(index, 2)])
@@ -916,6 +987,12 @@ struct PhotoExploreView: View {
                 Color.white.opacity(0.08).overlay(ProgressView().tint(.white.opacity(0.7)))
             }
         }
+        // The fixed preview window must be established before clipping. If the
+        // frame is applied by the caller after this view's clipShape, a landscape
+        // image's scaled-to-fill width becomes the clipping boundary and can
+        // visibly escape the portrait completion card.
+        .frame(width: 164, height: 210)
+        .clipped()
         .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 16).stroke(.white.opacity(0.22)))
         .shadow(color: .black.opacity(0.24), radius: 12, y: 7)
@@ -939,65 +1016,6 @@ struct PhotoExploreView: View {
         .buttonStyle(.plain)
         .background(.white.opacity(0.08), in: Capsule())
         .overlay(Capsule().stroke(.white.opacity(0.13)))
-    }
-
-    private var refreshOverlay: some View {
-        VStack(spacing: 20) {
-            ZStack {
-                Circle()
-                    .stroke(accent.opacity(0.16), lineWidth: 1)
-                    .frame(width: 112, height: 112)
-                Circle().fill(accent.opacity(0.14)).frame(width: 82, height: 82)
-                Image(systemName: "shuffle")
-                    .font(.system(size: 30, weight: .semibold))
-                    .foregroundStyle(accent)
-                    .symbolEffect(.pulse, options: .repeating)
-            }
-            VStack(spacing: 5) {
-                Text("正在洗牌")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                Text(session.regionName)
-                    .font(.system(size: 24, weight: .heavy))
-            }
-            ProgressView().tint(accent)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.ultraThinMaterial.opacity(0.98), ignoresSafeAreaEdges: .all)
-        .transition(.asymmetric(
-            insertion: .move(edge: .trailing).combined(with: .opacity),
-            removal: .move(edge: .leading).combined(with: .opacity)
-        ))
-    }
-
-    private func transitionOverlay(next: String) -> some View {
-        VStack(spacing: 20) {
-            ZStack {
-                Circle()
-                    .stroke(accent.opacity(0.16), lineWidth: 1)
-                    .frame(width: 112, height: 112)
-                Circle().fill(accent.opacity(0.14)).frame(width: 82, height: 82)
-                Image(systemName: "paperplane.fill")
-                    .font(.system(size: 32))
-                    .foregroundStyle(accent)
-                    .symbolEffect(.pulse, options: .repeating)
-            }
-            VStack(spacing: 5) {
-                Text("下一组")
-                    .font(.system(size: 13))
-                    .foregroundStyle(.secondary)
-                Text(next)
-                    .font(.system(size: 24, weight: .heavy))
-            }
-            ProgressView()
-                .tint(accent)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(.ultraThinMaterial.opacity(0.98), ignoresSafeAreaEdges: .all)
-        .transition(.asymmetric(
-            insertion: .move(edge: .trailing).combined(with: .opacity),
-            removal: .move(edge: .leading).combined(with: .opacity)
-        ))
     }
 
     private var doneOverlay: some View {
@@ -1122,6 +1140,7 @@ private extension View {
 
 private struct PhotoSwipeCardStack: View {
     @Bindable var session: ExploreSession
+    let isActive: Bool
     let stage: CGSize
     let displayMode: PhotoDisplayMode
     let asyncImages: [String: UIImage]
@@ -1188,6 +1207,13 @@ private struct PhotoSwipeCardStack: View {
             verticalFlyOut = 0
             deletionThresholdReached = false
         }
+        .onChange(of: isActive) { _, active in
+            if !active { stopLivePhoto() }
+        }
+        .onChange(of: session.livePreferences.autoPlayEnabled) { _, enabled in
+            if !enabled { stopLivePhoto() }
+        }
+        .onDisappear { stopLivePhoto() }
         #if DEBUG
         .task {
             guard TestHooks.autoOrientationSwipe, !orientationRegressionStarted,
@@ -1215,6 +1241,12 @@ private struct PhotoSwipeCardStack: View {
     }
 
     private func frontCard(_ photo: PhotoRecord) -> some View {
+        let livePlaybackRequest = ReviewLivePlaybackRequest(
+            assetID: photo.localIdentifier,
+            autoPlayEnabled: session.livePreferences.autoPlayEnabled,
+            isLivePhoto: assetMetadata[photo.localIdentifier]?.isLivePhoto == true,
+            resourceReady: preparedLivePhotos[photo.localIdentifier] != nil,
+            isActive: isActive)
         let currentY: CGFloat = verticalFlyOut != 0
             ? verticalFlyOut * stage.height * 1.35
             : (horizontalDrag == false ? dragY * 0.62 : 0)
@@ -1230,7 +1262,7 @@ private struct PhotoSwipeCardStack: View {
                 beginLivePhoto(for: photo, requiresHold: true, muted: false)
             } onPressingChanged: { pressing in
                 livePressHeld = pressing
-                if !pressing, !session.liveAutoPlayEnabled { pauseLivePhoto() }
+                if !pressing, !session.livePreferences.autoPlayEnabled { pauseLivePhoto() }
             }
 
         return Group {
@@ -1241,12 +1273,12 @@ private struct PhotoSwipeCardStack: View {
                 cardContent
             }
         }
-        .task(id: "live-prefetch|\(photo.localIdentifier)|\(session.liveAutoPlayEnabled)|\(assetMetadata[photo.localIdentifier]?.isLivePhoto == true)") {
-            guard assetMetadata[photo.localIdentifier]?.isLivePhoto == true else { return }
+        .task(id: livePlaybackRequest) {
+            guard livePlaybackRequest.isLivePhoto else { return }
             onPrepareLivePhoto(photo, stage)
             scheduleAutoPlay(for: photo)
         }
-        .onChange(of: session.liveMuted) { _, muted in
+        .onChange(of: session.livePreferences.muted) { _, muted in
             if livePhotoMounted { activeLiveMuted = muted }
         }
         .overlay {
@@ -1425,11 +1457,11 @@ private struct PhotoSwipeCardStack: View {
         withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.90, blendDuration: 0)) {
             dragX = direction * stage.width
         } completion: {
+            stopLivePhoto()
             if goingForward { session.advance() }
             else { session.retreat() }
             dragX = 0
             isTransitioning = false
-            stopLivePhoto()
         }
 
         Task { @MainActor in
@@ -1456,13 +1488,13 @@ private struct PhotoSwipeCardStack: View {
         withAnimation(.interactiveSpring(response: 0.22, dampingFraction: 0.90, blendDuration: 0)) {
             verticalFlyOut = -1
         } completion: {
+            stopLivePhoto()
             session.togglePendingRemovalForCurrentPhoto()
             session.advance()
             dragY = 0
             verticalFlyOut = 0
             deletionThresholdReached = false
             isTransitioning = false
-            stopLivePhoto()
         }
 
         Task { @MainActor in
@@ -1506,6 +1538,7 @@ private struct PhotoSwipeCardStack: View {
 
     private func beginLivePhoto(for photo: PhotoRecord, requiresHold: Bool, muted: Bool) {
         let id = photo.localIdentifier
+        guard isActive else { return }
         guard preparedLivePhotos[id] != nil else { return }
         guard !requiresHold || livePressHeld else { return }
         guard session.currentPhoto?.localIdentifier == id else { return }
@@ -1517,7 +1550,7 @@ private struct PhotoSwipeCardStack: View {
 
     private func scheduleAutoPlay(for photo: PhotoRecord) {
         livePlaybackTask?.cancel()
-        guard session.liveAutoPlayEnabled else { return }
+        guard isActive, session.livePreferences.autoPlayEnabled else { return }
         let assetID = photo.localIdentifier
         livePlaybackTask = Task {
             try? await Task.sleep(for: .milliseconds(150))
@@ -1525,16 +1558,20 @@ private struct PhotoSwipeCardStack: View {
             let canStart = ReviewLivePlaybackLogic.shouldStart(
                 requestedAssetID: assetID,
                 currentAssetID: session.currentPhoto?.localIdentifier,
-                autoPlayEnabled: session.liveAutoPlayEnabled,
+                autoPlayEnabled: session.livePreferences.autoPlayEnabled,
                 resourceReady: preparedLivePhotos[assetID] != nil,
-                isInteracting: dragX != 0
+                isInteracting: dragX != 0,
+                isActive: isActive
             )
             guard canStart else { return }
-            beginLivePhoto(for: photo, requiresHold: false, muted: session.liveMuted)
+            beginLivePhoto(for: photo, requiresHold: false,
+                           muted: session.livePreferences.muted)
         }
     }
 
     private func stopLivePhoto() {
+        livePlaybackTask?.cancel()
+        livePlaybackTask = nil
         livePhotoPlaying = false
         livePhotoMounted = false
     }
@@ -1809,6 +1846,7 @@ enum ProgressTraceLogger {
         dragOffset: CGFloat = 0,
         throttleDrag: Bool = false
     ) {
+        #if DEBUG
         let now = Date().timeIntervalSince1970
         if throttleDrag {
             if abs(dragOffset - lastLoggedDragOffset) < 20 && (now - lastLoggedTime) < 0.25 {
@@ -1829,7 +1867,6 @@ enum ProgressTraceLogger {
         let offsetStr = String(format: "%.1f", dragOffset)
         let logMsg = "[PROGRESS TRACE] event=\(event) index=\(index) count=\(totalCount) progress=\(progressStr) photo=\(photoID) mediaType=\(mediaType) size=\(size) orientation=\(orientation) dragOffset=\(offsetStr) ts=\(ts)"
         MapDebugLog.log(logMsg)
-        #if DEBUG
         print(logMsg)
         #endif
     }

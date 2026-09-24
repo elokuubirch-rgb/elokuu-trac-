@@ -1,7 +1,7 @@
 import Foundation
 
 /// CSV 解析结果
-public struct CSVParseResult {
+public struct CSVParseResult: Sendable {
     public var header: [String] = []
     public var rows: [[String]] = []
     public var error: String?
@@ -10,17 +10,21 @@ public struct CSVParseResult {
 }
 
 /// 列映射（索引从 0 开始；nil = 不导入该列）
-public struct ColumnMapping {
+public struct ColumnMapping: Equatable, Sendable {
     public var latIndex: Int?
     public var lonIndex: Int?
     public var timeIndex: Int?
     public var nameIndex: Int?
+    public var sourceCoordinateSystem: CoordinateReferenceSystem
 
-    public init(latIndex: Int? = nil, lonIndex: Int? = nil, timeIndex: Int? = nil, nameIndex: Int? = nil) {
+    public init(latIndex: Int? = nil, lonIndex: Int? = nil, timeIndex: Int? = nil,
+                nameIndex: Int? = nil,
+                sourceCoordinateSystem: CoordinateReferenceSystem = .unknown) {
         self.latIndex = latIndex
         self.lonIndex = lonIndex
         self.timeIndex = timeIndex
         self.nameIndex = nameIndex
+        self.sourceCoordinateSystem = sourceCoordinateSystem
     }
 }
 
@@ -29,58 +33,61 @@ public enum CSVParser {
 
     public static func parse(_ text: String) -> CSVParseResult {
         var result = CSVParseResult()
-        var body = text
-        if body.hasPrefix("\u{FEFF}") { body.removeFirst() }
-
         var field = ""
         var row: [String] = []
         var inQuotes = false
-        // 注意：必须按 UnicodeScalar 迭代，不能用 Array(String) 的 Character——
+        // 注意：必须按 UnicodeScalar 迭代，不能用 String 的 Character——
         // Unicode 把 CRLF 视为单个字素簇（grapheme cluster），Character 会把
         // \r\n 打包成一个字符，导致 \r 与 \n 的 case 都无法命中。
-        let scalars = Array(body.unicodeScalars)
-        var i = 0
+        // 直接使用迭代器，避免 12MB CSV 被复制成一个百 MB 级 UnicodeScalar 数组。
+        var iterator = text.unicodeScalars.makeIterator()
+        var current = iterator.next()
+        if current?.value == 0xFEFF { current = iterator.next() }
 
-        while i < scalars.count {
-            let s = scalars[i]
+        while let s = current {
             if inQuotes {
-                if s == "\"" {
-                    if i + 1 < scalars.count && scalars[i + 1] == "\"" {
+                if s.value == 34 {
+                    let next = iterator.next()
+                    if next?.value == 34 {
                         field.append("\"")
-                        i += 2
-                        continue
+                        current = iterator.next()
+                    } else {
+                        inQuotes = false
+                        current = next
                     }
-                    inQuotes = false
-                    i += 1
-                    continue
+                } else {
+                    field.unicodeScalars.append(s)
+                    current = iterator.next()
                 }
-                field.unicodeScalars.append(s)
-                i += 1
                 continue
             }
             switch s.value {
             case 34: // "
                 inQuotes = true
-                i += 1
+                current = iterator.next()
             case 44: // ,
                 row.append(field)
                 field = ""
-                i += 1
+                current = iterator.next()
             case 10: // \n
                 row.append(field)
                 field = ""
                 finishRow(&result, &row)
-                i += 1
+                current = iterator.next()
             case 13: // \r
-                if i + 1 < scalars.count && scalars[i + 1].value == 10 { i += 1 }
                 row.append(field)
                 field = ""
                 finishRow(&result, &row)
-                i += 1
+                let next = iterator.next()
+                current = next?.value == 10 ? iterator.next() : next
             default:
                 field.unicodeScalars.append(s)
-                i += 1
+                current = iterator.next()
             }
+        }
+        if inQuotes {
+            result.error = "CSV contains an unclosed quoted field."
+            return result
         }
         if !field.isEmpty || !row.isEmpty {
             row.append(field)
@@ -232,7 +239,7 @@ public enum CSVParser {
     /// 智能映射：表头优先，缺失部分用数据嗅探补齐
     public static func smartMapping(_ result: CSVParseResult) -> ColumnMapping {
         var m = headerMapping(result.header)
-        if m.latIndex == nil || m.lonIndex == nil {
+        if m.latIndex == nil || m.lonIndex == nil || m.timeIndex == nil {
             let s = sniffMapping(result)
             m.latIndex = m.latIndex ?? s.latIndex
             m.lonIndex = m.lonIndex ?? s.lonIndex
@@ -263,10 +270,16 @@ final class DateFormatCache {
 
     func date(_ s: String, format: String) -> Date? {
         lock.lock(); defer { lock.unlock() }
-        if let df = cache[format] { return df.date(from: s) }
+        if let df = cache[format] {
+            df.timeZone = .current
+            return df.date(from: s)
+        }
         let df = DateFormatter()
-        df.dateFormat = format
         df.locale = Locale(identifier: "en_US_POSIX")
+        df.calendar = Calendar(identifier: .gregorian)
+        df.isLenient = false
+        df.timeZone = .current
+        df.dateFormat = format
         cache[format] = df
         return df.date(from: s)
     }
@@ -275,30 +288,88 @@ final class DateFormatCache {
 extension CSVParseResult {
     /// 按映射把行转换为足迹草稿；非法坐标行跳过并计数
     public func mapPoints(_ mapping: ColumnMapping) -> (points: [FootprintDraft], skipped: Int) {
-        var points: [FootprintDraft] = []
-        var skipped = 0
-        for row in rows {
+        let result = validatedPoints(mapping)
+        return (result.points, result.issues.count)
+    }
+
+    /// Missing/invalid measurement times are never replaced with the import time.
+    public func validatedPoints(_ mapping: ColumnMapping) -> CSVMappingResult {
+        var result = CSVMappingResult()
+        guard error == nil else { return result }
+        for (index, row) in rows.enumerated() {
+            let rowNumber = index + 1 // Data row, excluding the optional header.
             guard let latIdx = mapping.latIndex, row.indices.contains(latIdx),
                   let lonIdx = mapping.lonIndex, row.indices.contains(lonIdx),
                   let lat = Double(row[latIdx].trimmingCharacters(in: .whitespaces)),
                   let lon = Double(row[lonIdx].trimmingCharacters(in: .whitespaces)),
                   GeoMath.isValid(latitude: lat, longitude: lon) else {
-                skipped += 1
+                result.issues.append(.init(row: rowNumber, reason: .invalidCoordinate))
                 continue
             }
-            var time = Date()
-            if let t = mapping.timeIndex, row.indices.contains(t) {
-                time = CSVParser.parseDate(row[t].trimmingCharacters(in: .whitespaces)) ?? Date()
+            guard let t = mapping.timeIndex, row.indices.contains(t),
+                  !row[t].trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                result.issues.append(.init(row: rowNumber, reason: .missingTime))
+                continue
+            }
+            guard let time = CSVParser.parseDate(row[t]) else {
+                result.issues.append(.init(row: rowNumber, reason: .invalidTime))
+                continue
             }
             let name: String? = mapping.nameIndex.flatMap { row.indices.contains($0) ? row[$0] : nil }
-            points.append(FootprintDraft(
-                latitude: lat,
-                longitude: lon,
+            let normalized = CoordinateTransform.normalize(
+                latitude: lat, longitude: lon,
+                sourceSystem: mapping.sourceCoordinateSystem)
+            result.points.append(FootprintDraft(
+                latitude: normalized.normalized.latitude,
+                longitude: normalized.normalized.longitude,
                 timestamp: time,
                 source: FootprintSource.csv.rawValue,
-                city: name
+                city: name,
+                rawLatitude: normalized.raw.latitude,
+                rawLongitude: normalized.raw.longitude,
+                sourceCoordinateSystem: normalized.sourceSystem,
+                coordinateTransformVersion: normalized.transformVersion
             ))
         }
-        return (points, skipped)
+        return result
     }
+}
+
+extension CSVParseResult {
+    /// Raw, timed observations for diagnosis. No coordinate conversion is performed here.
+    public func coordinateObservations(_ mapping: ColumnMapping,
+                                       limit: Int = 2_000) -> [TimedCoordinateObservation] {
+        guard error == nil, let latIndex = mapping.latIndex,
+              let lonIndex = mapping.lonIndex, let timeIndex = mapping.timeIndex,
+              limit > 0 else { return [] }
+        let step = max(1, rows.count / limit)
+        var observations: [TimedCoordinateObservation] = []
+        observations.reserveCapacity(min(limit, rows.count))
+        var index = 0
+        while index < rows.count, observations.count < limit {
+            let row = rows[index]
+            if row.indices.contains(latIndex), row.indices.contains(lonIndex),
+               row.indices.contains(timeIndex),
+               let latitude = Double(row[latIndex].trimmingCharacters(in: .whitespaces)),
+               let longitude = Double(row[lonIndex].trimmingCharacters(in: .whitespaces)),
+               GeoMath.isValid(latitude: latitude, longitude: longitude),
+               let timestamp = CSVParser.parseDate(row[timeIndex]) {
+                observations.append(TimedCoordinateObservation(
+                    latitude: latitude, longitude: longitude, timestamp: timestamp))
+            }
+            index += step
+        }
+        return observations
+    }
+}
+
+public struct CSVMappingResult: Sendable {
+    public struct Issue: Equatable, Sendable {
+        public enum Reason: String, Sendable { case invalidCoordinate, missingTime, invalidTime }
+        public let row: Int
+        public let reason: Reason
+    }
+    public var points: [FootprintDraft] = []
+    public var issues: [Issue] = []
+    public init() {}
 }

@@ -2,8 +2,34 @@ import Foundation
 import SwiftData
 
 enum ReviewSource: Equatable {
-    case global
+    case globalReview
     case mapCluster(clusterID: String)
+}
+
+/// 用户的 Live Photo 偏好跨所有回顾组和地图照片会话共享；播放中的资源仍由页面单独管理。
+@MainActor
+@Observable
+final class ReviewLivePlaybackPreferences {
+    static let shared = ReviewLivePlaybackPreferences()
+
+    private enum Key {
+        static let autoPlay = "reviewLiveAutoPlayEnabled"
+        static let muted = "reviewLiveMuted"
+    }
+
+    @ObservationIgnored private let defaults: UserDefaults
+    var autoPlayEnabled: Bool {
+        didSet { defaults.set(autoPlayEnabled, forKey: Key.autoPlay) }
+    }
+    var muted: Bool {
+        didSet { defaults.set(muted, forKey: Key.muted) }
+    }
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        autoPlayEnabled = defaults.bool(forKey: Key.autoPlay)
+        muted = defaults.object(forKey: Key.muted) as? Bool ?? true
+    }
 }
 
 /// 区域照片探索会话：状态机驱动「当前区域浏览 → 同级随机跳转 → 无限探索」
@@ -19,18 +45,27 @@ final class ExploreSession: Identifiable {
     private(set) var regionName: String
     private(set) var photos: [PhotoRecord] = []
     private(set) var index = 0
+    /// 每次原子替换照片批次时更新。UI 用它切断旧卡片、旧背景和手势状态的视图身份。
+    private(set) var batchID = UUID()
     private(set) var pendingRemovalIDs: Set<String> = []
-    /// Live 设置属于会话而不是页面；临时前往地图后仍保持。
-    var liveAutoPlayEnabled = false
-    var liveMuted = true
+    /// 新组和地图会话均使用同一份用户偏好，而非重置为会话默认值。
+    let livePreferences: ReviewLivePlaybackPreferences
+    var liveAutoPlayEnabled: Bool {
+        get { livePreferences.autoPlayEnabled }
+        set { livePreferences.autoPlayEnabled = newValue }
+    }
+    var liveMuted: Bool {
+        get { livePreferences.muted }
+        set { livePreferences.muted = newValue }
+    }
     /// Location Review 的完整候选数及本会话已展示集合。
     private(set) var sourcePhotoCount = 0
     private(set) var displayedPhotoIDs: Set<String> = []
+    private(set) var allCandidatePhotoIDs: [String] = []
     /// 最近浏览过的区域（防重复随机，上限 4）
     private(set) var recent: [String] = []
     /// 照片 id 集合会话（点分组进入）：翻完循环回第一张，不跳去其他区域
     private(set) var isPlaceCollection = false
-    private var collectionSourceIDs: [String]?
     private var preparedNextPhotos: [PhotoRecord]?
     /// 地点纵向导航历史：下滑可回到上一个地点。
     private struct PlaceHistoryEntry {
@@ -50,7 +85,7 @@ final class ExploreSession: Identifiable {
     enum Phase: Equatable {
         case browsing
         case transitioning(String)   // 正在前往下一个区域
-        case refreshing              // 当前地点重新抽取下一组
+        case transitioningToNextBatch // 确认删除后冻结旧组，等待原子切换
         case review                  // 当前组浏览完成，复核待移除照片或进入下一组
         case done                    // 当前级别暂无更多照片
     }
@@ -58,21 +93,32 @@ final class ExploreSession: Identifiable {
 
     private let context: ModelContext
 
-    init(level: String, regionName: String, context: ModelContext, source: ReviewSource = .global) {
+    init(level: String, regionName: String, context: ModelContext,
+         source: ReviewSource = .globalReview,
+         livePreferences: ReviewLivePlaybackPreferences? = nil) {
         self.level = level
         self.regionName = regionName
         self.context = context
         self.source = source
+        self.livePreferences = livePreferences ?? .shared
     }
 
     /// 当前照片
     var currentPhoto: PhotoRecord? {
-        photos.indices.contains(index) ? photos[index] : nil
+        guard !isTransitioningToNextBatch else { return nil }
+        return photos.indices.contains(index) ? photos[index] : nil
     }
 
     /// 浏览进度 "12 / 48"
     var progressText: String {
-        "\(photos.isEmpty ? 0 : index + 1) / \(photos.count)"
+        "\(progressIndex) / \(progressCount)"
+    }
+
+    var progressIndex: Int { isTransitioningToNextBatch || photos.isEmpty ? 0 : index + 1 }
+    var progressCount: Int { isTransitioningToNextBatch ? 0 : photos.count }
+    var isTransitioningToNextBatch: Bool {
+        if case .transitioningToNextBatch = phase { return true }
+        return false
     }
 
     var canGoToPreviousPlace: Bool { placeHistoryIndex > 0 }
@@ -86,15 +132,6 @@ final class ExploreSession: Identifiable {
     var completionPreviewPhotos: [PhotoRecord] {
         guard photos.count > 3 else { return photos }
         return [photos[0], photos[photos.count / 2], photos[photos.count - 1]]
-    }
-
-    var displayState: ReviewDisplayState {
-        switch phase {
-        case .browsing, .transitioning: return .browsing
-        case .refreshing: return .refreshing
-        case .review: return .completion
-        case .done: return .completion
-        }
     }
 
     var isLocationReview: Bool {
@@ -119,11 +156,12 @@ final class ExploreSession: Identifiable {
     func loadPhotos(for name: String, startAt: Int = 0) {
         let sourcePhotos = PhotoStore.photos(level: level, regionName: name, in: context)
         photos = timeStratifiedSample(sourcePhotos)
+        batchID = UUID()
         sourcePhotoCount = sourcePhotos.count
+        allCandidatePhotoIDs = sourcePhotos.map(\.localIdentifier)
         displayedPhotoIDs.formUnion(photos.map(\.localIdentifier))
         regionName = name
         isPlaceCollection = false
-        collectionSourceIDs = nil
         index = 0
         pendingRemovalIDs.removeAll()
         phase = .browsing
@@ -146,11 +184,12 @@ final class ExploreSession: Identifiable {
         } else {
             photos = timeStratifiedSample(sourcePhotos)
         }
+        batchID = UUID()
         sourcePhotoCount = sourcePhotos.count
+        allCandidatePhotoIDs = ids
         displayedPhotoIDs.formUnion(photos.map(\.localIdentifier))
         regionName = "此地"
         isPlaceCollection = true
-        collectionSourceIDs = ids
         index = 0
         pendingRemovalIDs.removeAll()
         phase = .browsing
@@ -162,10 +201,41 @@ final class ExploreSession: Identifiable {
         appLog.info("[Explore] 开始浏览地点聚合 \(count) 张照片（随机顺序，从第\(startIndex + 1)张）")
     }
 
+    /// 地图内删除可能发生在常驻回顾页之外。返回前只剔除已不存在的照片，
+    /// 保留原顺序与当前张；若当前张被删，优先接着看下一张，末尾则回到上一张。
+    func reconcileAvailablePhotos() {
+        let oldPhotos = photos
+        guard !oldPhotos.isEmpty else { return }
+        let available = Set(PhotoStore.records(ids: oldPhotos.map(\.localIdentifier), in: context)
+            .map(\.localIdentifier))
+        guard available.count != oldPhotos.count else { return }
+        let oldIndex = min(index, oldPhotos.count - 1)
+        let oldID = oldPhotos[oldIndex].localIdentifier
+        let removedBefore = oldPhotos.prefix(oldIndex).filter { !available.contains($0.localIdentifier) }.count
+        photos = oldPhotos.filter { available.contains($0.localIdentifier) }
+        index = photos.isEmpty ? 0 : min(oldIndex - removedBefore, photos.count - 1)
+        allCandidatePhotoIDs.removeAll { !available.contains($0) }
+        displayedPhotoIDs.formIntersection(available)
+        pendingRemovalIDs.formIntersection(available)
+        sourcePhotoCount = allCandidatePhotoIDs.count
+        batchID = UUID()
+        if photos.isEmpty {
+            phase = .done
+        } else if photos[index].localIdentifier != oldID {
+            noteCurrentPhotoPresented()
+        }
+    }
+
+    func availablePhotoIDs(from ids: [String]) -> [String] {
+        let available = Set(PhotoStore.records(ids: ids, in: context).map(\.localIdentifier))
+        return ids.filter { available.contains($0) }
+    }
+
     /// 手动重新洗牌（探索页右上角按钮）：本组照片顺序打乱，回到第一张
     func reshuffle() {
         guard photos.count > 1 else { return }
         photos.shuffle()
+        batchID = UUID()
         index = 0
         phase = .browsing
         noteCurrentPhotoPresented()
@@ -224,49 +294,104 @@ final class ExploreSession: Identifiable {
     func startNextRound() {
         guard phase == .review else { return }
         pendingRemovalIDs.removeAll()
-        beginRefresh()
+        replaceWithNextRound()
     }
 
     func abandonDeletionAndStartNextRound() {
         guard phase == .review else { return }
         pendingRemovalIDs.removeAll()
-        beginRefresh()
+        replaceWithNextRound()
     }
 
-    private func beginRefresh() {
-        phase = .refreshing
-        Task { @MainActor [weak self] in
-            guard let self, self.phase == .refreshing else { return }
-            await Task.yield()
-            if let prepared = self.preparedNextPhotos, !prepared.isEmpty {
-                self.preparedNextPhotos = nil
-                self.photos = prepared
-                self.displayedPhotoIDs.formUnion(prepared.map(\.localIdentifier))
-                self.index = 0
-                self.phase = .browsing
-                self.noteCurrentPhotoPresented()
-                self.scheduleNextRoundPreparation()
-                return
-            }
-            let completeSource: [PhotoRecord]
-            if let ids = self.collectionSourceIDs {
-                completeSource = PhotoStore.records(ids: ids, in: self.context)
-            } else {
-                completeSource = PhotoStore.photos(level: self.level, regionName: self.regionName, in: self.context)
-            }
-            let unseen = completeSource.filter { !self.displayedPhotoIDs.contains($0.localIdentifier) }
-            guard !unseen.isEmpty else {
-                self.phase = .review
-                return
-            }
-            self.photos = self.timeStratifiedSample(unseen)
-            self.displayedPhotoIDs.formUnion(self.photos.map(\.localIdentifier))
-            self.index = 0
-            self.phase = .browsing
-            self.noteCurrentPhotoPresented()
-            self.scheduleNextRoundPreparation()
-            appLog.info("[Explore] 再来一组：留在「\(self.regionName)」重新抽取 \(self.photos.count) 张")
+    /// 确认删除按钮提交后立即冻结旧 batch。此时 currentPhoto/progress 都不再读取旧数组。
+    @discardableResult
+    func beginConfirmedDeletionTransition() -> Set<String> {
+        guard phase == .review, !pendingRemovalIDs.isEmpty else { return [] }
+        phase = .transitioningToNextBatch
+        return pendingRemovalIDs
+    }
+
+    /// PhotoKit 删除失败时恢复原确认页；旧 batch 从未被局部修改。
+    func restoreDeletionReviewAfterFailure() {
+        guard isTransitioningToNextBatch else { return }
+        phase = .review
+    }
+
+    enum ConfirmedDeletionAdvance: Equatable {
+        case mapBatchReady
+        case mapClusterExhausted
+        case globalReviewNeedsNextGroup
+    }
+
+    /// 删除成功后的唯一提交点。Map Review 在锁定的 Cluster 候选中原子换组；
+    /// Global Review 先清空旧组，再交给 ReviewTabView 沿用现有全局选组算法。
+    @discardableResult
+    func completeConfirmedDeletionTransition() -> ConfirmedDeletionAdvance {
+        guard isTransitioningToNextBatch else {
+            return isLocationReview ? .mapClusterExhausted : .globalReviewNeedsNextGroup
         }
+        pendingRemovalIDs.removeAll()
+        preparedNextPhotos = nil
+
+        guard isLocationReview else {
+            photos = []
+            batchID = UUID()
+            index = 0
+            return .globalReviewNeedsNextGroup
+        }
+
+        let completeSource = completeSourcePhotos()
+        sourcePhotoCount = completeSource.count
+        let unseen = completeSource.filter { !displayedPhotoIDs.contains($0.localIdentifier) }
+        let next = timeStratifiedSample(unseen)
+        photos = next
+        batchID = UUID()
+        index = 0
+        guard !next.isEmpty else {
+            // 维持冻结态直到 Viewer 退出；删除成功路径不能重新落回完成页。
+            return .mapClusterExhausted
+        }
+        displayedPhotoIDs.formUnion(next.map(\.localIdentifier))
+        phase = .browsing
+        noteCurrentPhotoPresented()
+        scheduleNextRoundPreparation()
+        return .mapBatchReady
+    }
+
+    /// 下一组优先消费浏览期间准备好的数据；没有预备组时在同一事务中直接生成并替换。
+    /// 这里没有视觉 loading phase，也没有人为延时。
+    private func replaceWithNextRound() {
+        if let prepared = preparedNextPhotos, !prepared.isEmpty {
+            preparedNextPhotos = nil
+            photos = prepared
+            batchID = UUID()
+            displayedPhotoIDs.formUnion(prepared.map(\.localIdentifier))
+            index = 0
+            phase = .browsing
+            noteCurrentPhotoPresented()
+            scheduleNextRoundPreparation()
+            return
+        }
+
+        let completeSource = completeSourcePhotos()
+        guard !completeSource.isEmpty else { return }
+        var candidates = completeSource.filter {
+            !displayedPhotoIDs.contains($0.localIdentifier)
+        }
+        if candidates.isEmpty {
+            // “继续看看”允许在当前 Cluster 全部看完后重置本 Session 随机池。
+            // 删除成功路径不经过这里，仍会在无剩余时直接结束地图回顾。
+            displayedPhotoIDs.removeAll()
+            candidates = completeSource
+        }
+        photos = timeStratifiedSample(candidates)
+        batchID = UUID()
+        displayedPhotoIDs.formUnion(photos.map(\.localIdentifier))
+        index = 0
+        phase = .browsing
+        noteCurrentPhotoPresented()
+        scheduleNextRoundPreparation()
+        appLog.info("[Explore] 再来一组：留在「\(self.regionName)」重新抽取 \(self.photos.count) 张")
     }
 
     private func scheduleNextRoundPreparation() {
@@ -274,12 +399,7 @@ final class ExploreSession: Identifiable {
         Task { @MainActor [weak self] in
             await Task.yield()
             guard let self, self.phase == .browsing else { return }
-            let completeSource: [PhotoRecord]
-            if let ids = self.collectionSourceIDs {
-                completeSource = PhotoStore.records(ids: ids, in: self.context)
-            } else {
-                completeSource = PhotoStore.photos(level: self.level, regionName: self.regionName, in: self.context)
-            }
+            let completeSource = self.completeSourcePhotos()
             let unseen = completeSource.filter { !self.displayedPhotoIDs.contains($0.localIdentifier) }
             guard !unseen.isEmpty else { return }
             let next = self.timeStratifiedSample(unseen)
@@ -300,15 +420,11 @@ final class ExploreSession: Identifiable {
 
     func showDeletionReviewForTesting(count: Int) {
         pendingRemovalIDs = Set(photos.prefix(max(1, count)).map(\.localIdentifier))
+        // 必须模拟真实路径：用户已完整浏览到旧 batch 最后一张后才看到删除确认页。
+        index = max(0, photos.count - 1)
         phase = .review
     }
 #endif
-
-    func confirmPendingRemovals() {
-        PhotoStore.hide(ids: pendingRemovalIDs, in: context)
-        pendingRemovalIDs.removeAll()
-        phase = .browsing
-    }
 
     func photosOnCurrentLocalDay() -> [PhotoRecord] {
         guard let currentPhoto else { return [] }
@@ -391,11 +507,15 @@ final class ExploreSession: Identifiable {
     private func loadHistoryEntry(_ entry: PlaceHistoryEntry) {
         if let ids = entry.photoIDs {
             photos = timeStratifiedSample(PhotoStore.records(ids: ids, in: context))
+            allCandidatePhotoIDs = ids
             isPlaceCollection = true
         } else {
-            photos = timeStratifiedSample(PhotoStore.photos(level: level, regionName: entry.name, in: context))
+            let sourcePhotos = PhotoStore.photos(level: level, regionName: entry.name, in: context)
+            photos = timeStratifiedSample(sourcePhotos)
+            allCandidatePhotoIDs = sourcePhotos.map(\.localIdentifier)
             isPlaceCollection = false
         }
+        batchID = UUID()
         regionName = entry.name
         index = 0
         pendingRemovalIDs.removeAll()
@@ -447,6 +567,11 @@ final class ExploreSession: Identifiable {
             result.append(remaining.remove(at: candidate))
         }
         return result
+    }
+
+    /// Map Cluster 使用进入时锁定的完整 ID 集合；普通区域探索才按行政区重新查询。
+    private func completeSourcePhotos() -> [PhotoRecord] {
+        PhotoStore.records(ids: allCandidatePhotoIDs, in: context)
     }
 
     /// 当前区域照片全部浏览完成 → 查询同级其他有照片区域并随机选择

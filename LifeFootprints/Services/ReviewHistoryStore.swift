@@ -32,4 +32,30 @@ enum ReviewHistoryStore {
             UserDefaults.standard.set(data, forKey: key)
         }
     }
+
+    static func reset() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+
+/// Global Review 的三组概览属于本地回顾状态，完整 Reset 后不可恢复旧 Model ID。
+enum ReviewSessionPersistence {
+    static let groupsKey = "reviewSessionGroupsV2"
+    static let currentIndexKey = "reviewSessionCurrentIndexV2"
+
+    @MainActor
+    static func save<T: Encodable>(_ groups: [T], currentIndex: Int?) {
+        guard LocalImportCoordinator.shared.capture() != nil else { return }
+        // No session is absence, not an encoded empty array recreated after reset.
+        guard !groups.isEmpty else { reset(); return }
+        guard let data = try? JSONEncoder().encode(groups) else { return }
+        UserDefaults.standard.set(data, forKey: groupsKey)
+        if let currentIndex { UserDefaults.standard.set(currentIndex, forKey: currentIndexKey) }
+        else { UserDefaults.standard.removeObject(forKey: currentIndexKey) }
+    }
+
+    static func reset() {
+        UserDefaults.standard.removeObject(forKey: groupsKey)
+        UserDefaults.standard.removeObject(forKey: currentIndexKey)
+    }
 }

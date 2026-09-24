@@ -19,6 +19,7 @@ extension View {
 struct BrandLoadingView: View {
     let accent: Color
     @State private var breathing = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         ZStack {
@@ -44,7 +45,7 @@ struct BrandLoadingView: View {
                     Text("Tracé")
                         .font(.system(size: 28, weight: .heavy, design: .rounded))
                     Text("正在整理你的旅程")
-                        .font(.system(size: 12, weight: .medium))
+                        .font(.footnote.weight(.medium))
                         .foregroundStyle(.secondary)
                 }
                 ProgressView()
@@ -53,6 +54,8 @@ struct BrandLoadingView: View {
             }
         }
         .onAppear {
+            // Reduce Motion 下只保留静态品牌页与 ProgressView，不做循环呼吸动画。
+            guard !reduceMotion else { return }
             withAnimation(.easeInOut(duration: 1.1).repeatForever(autoreverses: true)) {
                 breathing = true
             }

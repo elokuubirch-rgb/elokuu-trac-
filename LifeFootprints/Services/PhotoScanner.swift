@@ -30,7 +30,8 @@ enum PhotoScanner {
 
     /// 扫描相册中带 GPS 位置的照片（仅读取元数据，不解码图片），
     /// 只产出照片地理元数据；不再把照片坐标写入 FootprintPoint。
-    static func scanWithPhotos(progress: @escaping (Int, Int) -> Void) -> PhotoScanResult {
+    static func scanWithPhotos(shouldContinue: @escaping () -> Bool = { true },
+                               progress: @escaping (Int, Int) -> Void) -> PhotoScanResult {
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
         let assets = PHAsset.fetchAssets(with: .image, options: options)
@@ -38,15 +39,15 @@ enum PhotoScanner {
         appLog.info("[Scan] 相册照片总数: \(total)")
         var infos: [PhotoInfo] = []
         infos.reserveCapacity(total)
-        assets.enumerateObjects { asset, _, _ in
+        assets.enumerateObjects { asset, index, stop in
+            guard shouldContinue() else { stop.pointee = true; return }
+            if index.isMultiple(of: 300) { progress(index, total) }
             guard let location = asset.location, let date = asset.creationDate else { return }
             let lat = location.coordinate.latitude
             let lon = location.coordinate.longitude
             infos.append(PhotoInfo(localIdentifier: asset.localIdentifier, latitude: lat, longitude: lon, timestamp: date))
-            if infos.count % 300 == 0 {
-                progress(infos.count, total)
-            }
         }
+        if shouldContinue() { progress(total, total) }
         appLog.info("[Scan] 含位置照片数: \(infos.count)")
         return PhotoScanResult(photoInfos: infos)
     }

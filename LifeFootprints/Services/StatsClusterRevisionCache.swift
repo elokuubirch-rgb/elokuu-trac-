@@ -58,11 +58,25 @@ actor StatsClusterRevisionCache {
         let value = await task.value
         inFlight[key] = nil
         // 较旧 revision 即使稍后才完成，也不能挤掉更新 revision 的已完成缓存。
-        if latestRequestedKey == key { completed = (key, value) }
+        if latestRequestedKey == key {
+            completed = (key, value)
+            let revision = DataRevisionStore.snapshot()
+            if revision.place == key.placeRevision,
+               revision.trajectory == key.trajectoryRevision {
+                _ = StatsSnapshotStore.shared.saveClusters(value, revision: revision)
+            }
+        }
         return value
     }
 
     func diagnosticBuildCount() -> Int { buildCount }
+
+    func reset() {
+        for task in inFlight.values { task.cancel() }
+        completed = nil
+        inFlight.removeAll()
+        latestRequestedKey = nil
+    }
 
     private nonisolated static func build(_ snapshots: [FootprintSnapshot]) -> [StatsDenseArea] {
         let points = snapshots.map { (lat: $0.lat, lon: $0.lon) }

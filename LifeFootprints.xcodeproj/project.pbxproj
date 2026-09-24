@@ -6,6 +6,23 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXContainerItemProxy section */
+		B10000000000000000000040 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A1B2C3D4E5F6000000000006 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A1B2C3D4E5F6000000000005;
+			remoteInfo = LifeFootprints;
+		};
+		B10000000000000000000041 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A1B2C3D4E5F6000000000006 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A1B2C3D4E5F6000000000005;
+			remoteInfo = LifeFootprints;
+		};
+/* End PBXContainerItemProxy section */
+
 /* Begin PBXFileReference section */
 		A1B2C3D4E5F6000000000004 /* LifeFootprints.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = LifeFootprints.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B10000000000000000000001 /* LifeFootprintsTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = LifeFootprintsTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -29,23 +46,6 @@
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
-
-/* Begin PBXContainerItemProxy section */
-		B10000000000000000000040 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = A1B2C3D4E5F6000000000006 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = A1B2C3D4E5F6000000000005;
-			remoteInfo = LifeFootprints;
-		};
-		B10000000000000000000041 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = A1B2C3D4E5F6000000000006 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = A1B2C3D4E5F6000000000005;
-			remoteInfo = LifeFootprints;
-		};
-/* End PBXContainerItemProxy section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		A1B2C3D4E5F6000000000008 /* Frameworks */ = {
@@ -171,7 +171,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1600;
-				LastUpgradeCheck = 1600;
+				LastUpgradeCheck = 2660;
 				TargetAttributes = {
 					A1B2C3D4E5F6000000000005 = {
 						CreatedOnToolsVersion = 16.0;
@@ -277,6 +277,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -307,6 +308,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 3L8FG4A3Z4;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -330,6 +332,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -340,6 +343,7 @@
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
 				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_LOCALIZABILITY_NONLOCALIZED = YES;
 				CLANG_ANALYZER_NONNULL = YES;
 				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
 				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
@@ -370,6 +374,7 @@
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 3L8FG4A3Z4;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -386,6 +391,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				SWIFT_OPTIMIZATION_LEVEL = "-O";
 				VALIDATE_PRODUCT = YES;
@@ -402,13 +408,14 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 3L8FG4A3Z4;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "LifeFootprints-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Tracé";
 				INFOPLIST_KEY_MapTilerAPIKey = "$(MAPTILER_API_KEY)";
 				INFOPLIST_KEY_MapTilerMapID = "$(MAPTILER_MAP_ID)";
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "用于读取你的锻炼路线（Apple Watch / iPhone 记录的运动），把运动轨迹融入足迹地图。";
-				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "用于在你路过常去地点时以低功耗方式自动记录足迹，持续构建个人足迹地图。";
-				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "用于获取当前位置并将地图居中到你所处的位置；仅在 App 使用期间定位，不做后台记录。";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "允许 Trace 在你没有打开 App 时继续记录重要的位置变化，让个人足迹保持连续。";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Trace 使用你的位置在地图上显示当前位置，并记录你的个人足迹。";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "用于读取照片生成足迹地图，并在你确认后从系统照片库删除所选照片。";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -441,13 +448,14 @@
 				CURRENT_PROJECT_VERSION = 1;
 				DEVELOPMENT_TEAM = 3L8FG4A3Z4;
 				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = "LifeFootprints-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Tracé";
 				INFOPLIST_KEY_MapTilerAPIKey = "$(MAPTILER_API_KEY)";
 				INFOPLIST_KEY_MapTilerMapID = "$(MAPTILER_MAP_ID)";
 				INFOPLIST_KEY_NSHealthShareUsageDescription = "用于读取你的锻炼路线（Apple Watch / iPhone 记录的运动），把运动轨迹融入足迹地图。";
-				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "用于在你路过常去地点时以低功耗方式自动记录足迹，持续构建个人足迹地图。";
-				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "用于获取当前位置并将地图居中到你所处的位置；仅在 App 使用期间定位，不做后台记录。";
+				INFOPLIST_KEY_NSLocationAlwaysAndWhenInUseUsageDescription = "允许 Trace 在你没有打开 App 时继续记录重要的位置变化，让个人足迹保持连续。";
+				INFOPLIST_KEY_NSLocationWhenInUseUsageDescription = "Trace 使用你的位置在地图上显示当前位置，并记录你的个人足迹。";
 				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "用于读取照片生成足迹地图，并在你确认后从系统照片库删除所选照片。";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -475,7 +483,6 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 3L8FG4A3Z4;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.footprints.LifeFootprintsTests;
@@ -491,7 +498,6 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 3L8FG4A3Z4;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.footprints.LifeFootprintsTests;
@@ -506,7 +512,6 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 3L8FG4A3Z4;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.footprints.LifeFootprintsUITests;
@@ -521,7 +526,6 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 3L8FG4A3Z4;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 17.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.footprints.LifeFootprintsUITests;

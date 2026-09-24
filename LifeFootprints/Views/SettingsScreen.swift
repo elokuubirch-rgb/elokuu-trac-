@@ -1,280 +1,82 @@
 import SwiftUI
 import SwiftData
 import UniformTypeIdentifiers
+import UIKit
 
-/// 设置页：数据来源 / 操作 / 外观 / 隐私
+/// 设置只负责配置与维护入口；数据规模和来源统计留给 Statistics。
 struct SettingsScreen: View {
     @Environment(\.modelContext) private var context
     @AppStorage("theme") private var themeRaw = AppTheme.crimson.rawValue
     @AppStorage("appLanguage") private var appLanguageRaw = AppLanguage.simplifiedChinese.rawValue
-
-    @State private var busyText: String?
-    @State private var scanResult: Int?
-    @State private var showImporter = false
-    @State private var showCSVSheet = false
-    @State private var csvResult: CSVParseResult?
-    @State private var showClearConfirm = false
-    @State private var exportURL: URL?
-    @State private var customMapSources: [CustomMapSource] = []
-
-    private var theme: AppTheme { AppTheme(rawValue: themeRaw) ?? .crimson }
-    @State private var sourceCounts = (photo: 0, csv: 0, manual: 0, gps: 0, health: 0)
-    @AppStorage("bgFootprints") private var bgFootprints = false
     @AppStorage("reviewRecentDedupEnabled") private var reviewRecentDedupEnabled = true
-    @AppStorage("reviewGroupSize") private var reviewGroupSize = 20
     @AppStorage(HealthKitSyncCoordinator.automaticSyncEnabledKey)
     private var healthAutomaticSync = false
-    @State private var healthStatus = HealthKitSyncSnapshot.empty
+
+    @State private var busyText: String?
+    @State private var scanProgress: Double?
+    @State private var resultAlert: SettingsResultAlert?
+    @State private var showImporter = false
+    @State private var csvImport: CSVImportPresentation?
+    @State private var showClearConfirm = false
+    @State private var showClearTrajectoryCacheConfirm = false
+    @State private var exportDocument: ExportDocument?
+    @State private var customMapSources: [CustomMapSource] = []
+    @State private var locationService = LocationService.shared
+    @State private var trajectoryCacheSnapshot =
+        PersistentTrajectoryCache.shared.diskSnapshot()
+
+    private var theme: AppTheme { AppTheme(rawValue: themeRaw) ?? .crimson }
+    private var language: AppLanguage {
+        AppLanguage(rawValue: appLanguageRaw) ?? .simplifiedChinese
+    }
 
     var body: some View {
         #if DEBUG
         let _ = PerformanceDiagnostics.event("SettingsScreen.body")
         #endif
         NavigationStack {
-            List {
-                Section("数据来源") {
-                    sourceRow("photo", "照片位置", "自动提取 GPS 拍摄地", "\(sourceCounts.photo) 条", .blue)
-                    sourceRow("doc.text", "CSV 文件", "一生足迹备份 / 手动导入", "\(sourceCounts.csv) 条", .cyan)
-                    sourceRow("heart.circle.fill", "苹果健康", "Apple Watch 锻炼路线", "\(sourceCounts.health) 条", .pink)
-                    sourceRow("location.fill", "轨迹记录", "主动录制 + 后台低功耗留痕", "\(sourceCounts.gps) 条", .red)
-                    sourceRow("plus", "手动添加", "长按地图补充（待实现）", "\(sourceCounts.manual) 条", .green)
-                }
-
-                Section {
-                    Toggle(isOn: $bgFootprints) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("后台足迹（低功耗）")
-                            Text("路过常去地点自动留痕，持续生长足迹地图")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .onChange(of: bgFootprints) { _, on in
-                        LocationService.shared.setBackgroundFootprints(on)
-                    }
-                } header: {
-                    Text("定位")
-                } footer: {
-                    Text("基于系统「访问监测」和「重大位置变化」。日常停留自动留点；高铁、飞机按距离稀疏记录关键点，不持续开启 GPS。开启需允许「始终」访问位置。")
-                }
-
-                Section {
-                    Toggle(isOn: Binding(
-                        get: { healthAutomaticSync },
-                        set: { updateHealthAutomaticSync($0) }
-                    )) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("自动同步苹果健康")
-                            Text("新增或更新锻炼路线时自动增量同步")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    .disabled(!HealthKitService.isAvailable || healthStatus.isSyncing)
-                    .accessibilityIdentifier("health-auto-sync-toggle")
-
-                    LabeledContent("同步状态") {
-                        Text(healthStatus.isSyncing ? "同步中" : (healthStatus.enabled ? "已开启" : "已关闭"))
-                            .foregroundStyle(healthStatus.isSyncing ? .orange : .secondary)
-                    }
-                    if let date = healthStatus.lastSuccessAt {
-                        LabeledContent("上次成功") {
-                            Text(date.formatted(date: .abbreviated, time: .shortened))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    LabeledContent("路线队列") {
-                        Text("待重试 \(healthStatus.pendingCount) · 失败 \(healthStatus.failedCount) · 无路线 \(healthStatus.noRouteCount)")
-                            .font(.system(size: 11))
-                            .foregroundStyle(.secondary)
-                    }
-                    if let error = healthStatus.lastError, !error.isEmpty {
-                        Text(error)
-                            .font(.system(size: 11))
-                            .foregroundStyle(.red)
-                    }
-                } header: {
-                    Text("苹果健康同步")
-                } footer: {
-                    Text("无路线的锻炼会指数退避重试；连续确认且结束超过 7 天后标记为“无路线”。手动同步仍会重新检查。")
-                }
-
-                Section {
-                    Toggle(isOn: $reviewRecentDedupEnabled) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("近期不重复回顾")
-                            Text("30 天内真正看过的照片，优先让位给没看过的")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                    Stepper(value: $reviewGroupSize, in: 1...100) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text("每组照片数量")
-                            Text("下一轮回顾生效，当前三组不受影响")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Text("\(reviewGroupSize) 张")
-                            .font(.system(size: 13, weight: .semibold))
-                            .foregroundStyle(.secondary)
-                    }
-                } header: {
-                    Text("回顾")
-                } footer: {
-                    Text("只有真正在浏览中看过的照片才算“回顾过”。生成新一轮回顾时，按「没看过 → 很久没看 → 刚看过」排序；照片不足时用最久没看的自动补足，不会出现“没有更多”。")
-                }
-
-                Section {
-                    sourceRow("map", "标准地图", "Apple MapKit", "内置", .blue)
-                    sourceRow("globe.asia.australia", "卫星地图", "Apple 卫星影像", "内置", .indigo)
-                    NavigationLink {
-                        MapSourceManagementView()
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: "folder.fill")
-                                .font(.system(size: 15))
-                                .foregroundStyle(.green)
-                                .frame(width: 30, height: 30)
-                                .background(Color.green.opacity(0.14),
-                                            in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-                            Text("自定义地图源")
-                                .font(.system(size: 14, weight: .semibold))
-                            Spacer()
-                            Text("\(customMapSources.count)")
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                } header: {
-                    Text("地图源")
-                } footer: {
-                    Text("自定义地图源必须使用 HTTPS 并保留版权署名。Google 地图需通过官方 Maps Platform 接入。")
-                }
-
-                Section("操作") {
-                    Button { rescan() } label: {
-                        actionRow("arrow.clockwise", "重新扫描相册", "同步新增照片的位置")
-                    }
-                    Button { showImporter = true } label: {
-                        actionRow("doc.badge.plus", "导入 CSV 文件", "自动识别列 · 一生足迹备份直接导入")
-                    }
-                    Button { importHealth() } label: {
-                        actionRow("figure.run", "立即同步苹果健康", "Apple Watch / iPhone 锻炼路线")
-                    }
-                    .accessibilityIdentifier("health-sync-now")
-                    Button { exportCSV() } label: {
-                        actionRow("square.and.arrow.up", "导出备份", "生成 CSV 文件")
-                    }
-                    if let url = exportURL {
-                        ShareLink(item: url, preview: SharePreview("足迹备份.csv")) {
-                            actionRow("checkmark.circle.fill", "分享导出的备份", url.lastPathComponent)
-                        }
-                    }
-                }
-
-                Section("外观") {
-                    HStack(spacing: 14) {
-                        ForEach(AppTheme.allCases) { t in
-                            Button { themeRaw = t.rawValue } label: {
-                                Circle().fill(t.color)
-                                    .frame(width: 26, height: 26)
-                                    .overlay(Circle().strokeBorder(
-                                        t == theme ? Color.white : Color.white.opacity(0.2),
-                                        lineWidth: t == theme ? 2.5 : 1))
-                            }
-                            .buttonStyle(.plain)
-                        }
-                        Spacer()
-                        Text(theme.name)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 4)
-                }
-
-                Section("语言") {
-                    Picker("应用语言", selection: $appLanguageRaw) {
-                        ForEach(AppLanguage.allCases) { language in
-                            Text(language.nativeName).tag(language.rawValue)
-                        }
-                    }
-                    .pickerStyle(.menu)
-                    .onChange(of: appLanguageRaw) { _, newValue in
-                        // 立即同步系统级回退，避免语言切换后旧值仍被回退路径使用。
-                        AppLanguage.syncAppleLanguages(newValue)
-                    }
-                }
-
-                Section {
-                    HStack {
-                        Image(systemName: "lock.shield")
-                            .foregroundStyle(.green)
-                        Text("数据仅保存在本机")
-                        Spacer()
-                        Text("无账号 · 无上传 · 无广告")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-
-                Section {
-                    Button(role: .destructive) { showClearConfirm = true } label: {
-                        HStack {
-                            Spacer()
-                            Text("清空所有数据")
-                            Spacer()
-                        }
-                    }
-                }
-
-                Section {
-                    Text("版本 1.0.0 · Tracé")
-                        .font(.footnote)
-                        .foregroundStyle(.tertiary)
-                        .frame(maxWidth: .infinity)
-                        .listRowBackground(Color.clear)
-                }
+            Form {
+                automaticRecordingSection
+                reviewSection
+                mapSection
+                dataBackupSection
+                cacheSection
+                generalSection
+                dataManagementSection
             }
             .navigationTitle("设置")
-            .overlay {
-                if let busy = busyText {
-                    ZStack {
-                        Color.black.opacity(0.5).ignoresSafeArea()
-                        VStack(spacing: 12) {
-                            ProgressView()
-                            Text(busy)
-                                .font(.system(size: 13))
-                                .foregroundStyle(.secondary)
-                        }
-                        .padding(24)
-                        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                    }
-                }
+            .listSectionSpacing(.custom(26))
+            .overlay { operationOverlay }
+            .alert(item: $resultAlert) { result in
+                Alert(title: Text(result.title), message: Text(result.message),
+                      dismissButton: .default(Text("好")))
             }
-            .alert("扫描完成", isPresented: scanResultAlertBinding) {
-                Button("好", role: .cancel) {}
-            } message: {
-                Text(scanResult.map { "新增 \($0) 个足迹点" } ?? "")
-            }
-            .confirmationDialog("确定要清空所有数据吗？此操作不可恢复",
-                                isPresented: $showClearConfirm,
-                                titleVisibility: .visible) {
-                Button("清空", role: .destructive) { FootprintStore.deleteAll(in: context) }
+            .alert("清除所有本地数据？", isPresented: $showClearConfirm) {
                 Button("取消", role: .cancel) {}
+                Button("清除所有数据", role: .destructive) { resetAllLocalData() }
+            } message: {
+                Text("这会删除 Trace 保存在本机的照片索引、足迹、运动路线、回顾记录、导入数据以及相关缓存。\n\n不会删除系统相册中的原始照片，也不会删除 Apple 健康中的原始数据。")
+            }
+            .alert("清理轨迹缓存？", isPresented: $showClearTrajectoryCacheConfirm) {
+                Button("取消", role: .cancel) {}
+                Button("清理", role: .destructive) { clearTrajectoryCache() }
+            } message: {
+                Text("不会删除足迹、照片或运动记录。下次打开地图时可能需要重新生成轨迹缓存。")
             }
             .fileImporter(isPresented: $showImporter,
                           allowedContentTypes: [.commaSeparatedText, .plainText, .data],
-                          allowsMultipleSelection: false) { result in
-                handleImport(result)
-            }
-            .sheet(isPresented: $showCSVSheet) {
-                if let result = csvResult {
-                    CSVImportView(result: result) { added, _ in
-                        scanResult = added
-                        csvResult = nil
-                    }
+                          allowsMultipleSelection: false,
+                          onCompletion: handleImport)
+            .sheet(item: $csvImport) { presentation in
+                CSVImportView(result: presentation.result, importToken: presentation.token) { saved, skipped in
+                    resultAlert = SettingsResultAlert(
+                        title: ImportFeedback.title(saved),
+                        message: ImportFeedback.summary(saved, skipped: skipped))
+                    csvImport = nil
                 }
+            }
+            .sheet(item: $exportDocument) { document in
+                ActivityShareSheet(items: [document.url])
             }
         }
         .preferredColorScheme(.dark)
@@ -283,28 +85,14 @@ struct SettingsScreen: View {
             PerformanceDiagnostics.event("SettingsScreen.onAppear")
             PerformanceDiagnostics.endTransition("Stats->Settings")
             #endif
-            refreshSourceCounts()
-        }
-        .onAppear(perform: refreshHealthStatus)
-        .onAppear { customMapSources = MapSourceStore.load() }
-        .onReceive(NotificationCenter.default.publisher(for: .mapSnapshotReady)) { _ in
-            refreshSourceCounts()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .dataRevisionChanged)) { _ in
-            #if DEBUG
-            PerformanceDiagnostics.event("dataRevision.receive.SettingsScreen")
-            #endif
-            refreshSourceCounts()
-            refreshHealthStatus()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .healthKitSyncStatusChanged)) { _ in
-            #if DEBUG
-            PerformanceDiagnostics.event("HealthKit.status.receive.SettingsScreen")
-            #endif
-            refreshHealthStatus()
+            customMapSources = MapSourceStore.load()
+            refreshTrajectoryCacheSnapshot()
         }
         .onReceive(NotificationCenter.default.publisher(for: .mapSourcesChanged)) { _ in
             customMapSources = MapSourceStore.load()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .localDataReset)) { _ in
+            csvImport = nil
         }
         .onDisappear {
             #if DEBUG
@@ -314,189 +102,498 @@ struct SettingsScreen: View {
         }
     }
 
-    private var scanResultAlertBinding: Binding<Bool> {
-        Binding(get: { scanResult != nil },
-                set: { if !$0 { scanResult = nil } })
-    }
+    // MARK: - Sections
 
-    // MARK: - 行样式
-
-    private func sourceRow(_ icon: String, _ title: String, _ subtitle: String,
-                           _ value: String, _ color: Color) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 15))
-                .foregroundStyle(color)
-                .frame(width: 30, height: 30)
-                .background(color.opacity(0.14), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(LocalizedStringKey(title)).font(.system(size: 14, weight: .semibold))
-                if !subtitle.isEmpty {
-                    Text(LocalizedStringKey(subtitle)).font(.system(size: 11)).foregroundStyle(.secondary)
-                }
+    @ViewBuilder
+    private var automaticRecordingSection: some View {
+        Section("自动记录") {
+            Toggle(isOn: Binding(
+                get: { locationService.isBackgroundLocationEnabled },
+                set: { locationService.setBackgroundFootprints($0) }
+            )) {
+                SettingsLabel(
+                    "后台位置",
+                    subtitle: locationService.isBackgroundLocationEnabled
+                        ? "已开启，持续记录；移动时自动提高精度" : "关闭")
             }
-            Spacer()
-            Text(LocalizedStringKey(value))
-                .font(.system(size: 13))
-                .foregroundStyle(.secondary)
+            .accessibilityIdentifier("background-location-toggle")
+
+            SettingsLabel(
+                "定位精度", subtitle: "系统位置授权状态",
+                value: LocationService.shared.hasFullAccuracy ? "精确" : "大致")
+
+            SettingsLabel("运行状态", value: backgroundRuntimeText)
+
+            SettingsLabel("后台刷新", value: backgroundRefreshText)
+
+            SettingsLabel("最近位置回调", value: lastLocationCallbackText)
+
+            Toggle(isOn: Binding(
+                get: { healthAutomaticSync },
+                set: { updateHealthAutomaticSync($0) }
+            )) {
+                SettingsLabel("自动同步 Apple 健康", subtitle: "自动同步运动路线")
+            }
+            .disabled(!HealthKitService.isAvailable || busyText != nil)
+            .accessibilityIdentifier("health-auto-sync-toggle")
         }
     }
 
-    private func actionRow(_ icon: String, _ title: String, _ subtitle: String) -> some View {
-        HStack(spacing: 12) {
-            Image(systemName: icon)
-                .font(.system(size: 15))
-                .foregroundStyle(.secondary)
-                .frame(width: 30, height: 30)
-                .background(Color.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-            VStack(alignment: .leading, spacing: 1) {
-                Text(LocalizedStringKey(title)).font(.system(size: 14, weight: .semibold))
-                if !subtitle.isEmpty {
-                    Text(LocalizedStringKey(subtitle)).font(.system(size: 11)).foregroundStyle(.secondary)
-                }
+    private var backgroundRuntimeText: String {
+        switch locationService.backgroundRuntimeState {
+        case .disabled:
+            return String(localized: "已关闭")
+        case .permissionRequired:
+            return String(localized: "需要“始终”位置权限")
+        case .foreground:
+            return String(localized: "前台定位")
+        case .backgroundHighAccuracy:
+            return String(localized: "后台高精度")
+        case .backgroundLowPower:
+            return String(localized: "后台低功耗")
+        case .recovering:
+            return String(localized: "正在恢复")
+        }
+    }
+
+    private var backgroundRefreshText: String {
+        switch UIApplication.shared.backgroundRefreshStatus {
+        case .available:
+            return String(localized: "允许")
+        case .denied:
+            return String(localized: "关闭")
+        case .restricted:
+            return String(localized: "受限")
+        @unknown default:
+            return String(localized: "受限")
+        }
+    }
+
+    private var lastLocationCallbackText: String {
+        guard let date = locationService.lastLocationCallbackAt else {
+            return String(localized: "尚未收到")
+        }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: Date())
+    }
+
+    @ViewBuilder
+    private var reviewSection: some View {
+        Section("回顾") {
+            Toggle(isOn: $reviewRecentDedupEnabled) {
+                SettingsLabel("近期不重复回顾", subtitle: "减少近期已经看过的照片再次出现")
             }
         }
     }
 
-    // MARK: - 动作
+    @ViewBuilder
+    private var mapSection: some View {
+        Section("地图") {
+            NavigationLink {
+                MapSourceManagementView()
+            } label: {
+                SettingsLabel("自定义地图源", subtitle: "添加或管理自定义地图样式",
+                              value: "\(customMapSources.count) 个")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var dataBackupSection: some View {
+        Section("数据与备份") {
+            Button { rescan() } label: {
+                SettingsLabel("重新扫描相册", subtitle: "更新 Trace 中的照片索引",
+                              showsChevron: true)
+            }
+            .disabled(busyText != nil)
+            .accessibilityIdentifier("rescan-photos")
+
+            Button { chooseImportFile() } label: {
+                SettingsLabel("导入 CSV 文件", subtitle: "从其他服务导入足迹数据",
+                              showsChevron: true)
+            }
+            .disabled(busyText != nil)
+            .accessibilityIdentifier("import-csv")
+
+            Button { exportCSV() } label: {
+                SettingsLabel("导出备份", subtitle: "导出 Trace 保存的数据",
+                              showsChevron: true)
+            }
+            .disabled(busyText != nil)
+            .accessibilityIdentifier("export-backup")
+        }
+    }
+
+    @ViewBuilder
+    private var cacheSection: some View {
+        Section("缓存") {
+            SettingsLabel(
+                "轨迹缓存",
+                subtitle: trajectoryCacheSubtitle,
+                value: ByteCountFormatter.string(
+                    fromByteCount: trajectoryCacheSnapshot.bytes,
+                    countStyle: .file))
+
+            Button {
+                showClearTrajectoryCacheConfirm = true
+            } label: {
+                SettingsLabel(
+                    "清理轨迹缓存",
+                    subtitle: "只清理可重新生成的地图轨迹数据",
+                    showsChevron: true)
+            }
+            .disabled(trajectoryCacheSnapshot.bytes == 0)
+            .accessibilityIdentifier("clear-trajectory-cache")
+        }
+    }
+
+    private var trajectoryCacheSubtitle: LocalizedStringKey {
+        switch trajectoryCacheSnapshot.budgetState {
+        case .normal:
+            return "用于加快地图和轨迹加载"
+        case .aboveSoftBudget:
+            return "已超过 96 MB 软预算，可安全清理"
+        case .aboveHardBudget:
+            return "已超过 128 MB 硬预算，可安全清理"
+        }
+    }
+
+    @ViewBuilder
+    private var generalSection: some View {
+        Section("通用") {
+            NavigationLink {
+                AppearanceSettingsView(themeRaw: $themeRaw)
+            } label: {
+                SettingsLabel("外观", value: theme.name)
+            }
+            NavigationLink {
+                LanguageSettingsView(appLanguageRaw: $appLanguageRaw)
+            } label: {
+                SettingsLabel("语言", value: language.nativeName)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var dataManagementSection: some View {
+        Section("数据管理") {
+            Button("清除所有本地数据", role: .destructive) {
+                showClearConfirm = true
+            }
+            .accessibilityIdentifier("reset-all-local-data")
+        }
+    }
+
+    // MARK: - Operation UI
+
+    @ViewBuilder
+    private var operationOverlay: some View {
+        if let busyText {
+            ZStack {
+                Color.black.opacity(0.5).ignoresSafeArea()
+                VStack(spacing: 12) {
+                    if let scanProgress {
+                        ProgressView(value: scanProgress)
+                            .frame(width: 150)
+                        Text("\(Int(scanProgress * 100))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ProgressView()
+                    }
+                    Text(busyText)
+                        .font(.system(size: 13))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(24)
+                .background(.ultraThinMaterial,
+                            in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            }
+        }
+    }
+
+    // MARK: - Actions
 
     private func rescan() {
+        guard busyText == nil, let token = LocalImportCoordinator.shared.capture() else { return }
         busyText = "正在扫描相册…"
+        scanProgress = 0
         let container = context.container
         Task.detached(priority: .userInitiated) {
             let status = await PhotoScanner.requestAccess()
             guard status == .authorized || status == .limited else {
-                await MainActor.run { busyText = nil }
+                await MainActor.run {
+                    guard LocalImportCoordinator.shared.isCurrent(token) else { return }
+                    busyText = nil
+                    scanProgress = nil
+                    resultAlert = SettingsResultAlert(
+                        title: "无法扫描相册", message: "请在系统设置中允许 Trace 访问照片。")
+                }
                 return
             }
-            let result = PhotoScanner.scanWithPhotos(progress: { _, _ in })
-            let added = await PhotoStore.upsertInBackground(result.photoInfos, container: container)
+            let result = PhotoScanner.scanWithPhotos(shouldContinue: {
+                LocalImportCoordinator.shared.isCurrent(token)
+            }) { done, total in
+                guard total > 0 else { return }
+                Task { @MainActor in
+                    guard LocalImportCoordinator.shared.isCurrent(token) else { return }
+                    scanProgress = min(1, Double(done) / Double(total))
+                }
+            }
+            let saved = await PhotoStore.importPhotos(result.photoInfos, container: container, token: token)
             await MainActor.run {
+                guard LocalImportCoordinator.shared.isCurrent(token) else { return }
                 busyText = nil
-                scanResult = added
+                scanProgress = nil
+                resultAlert = SettingsResultAlert(
+                    title: ImportFeedback.title(saved), message: ImportFeedback.summary(saved))
             }
             Task { @MainActor in
-                await PhotoThumbnailGenerator.generateForPending(in: context, progress: { _, _ in })
+                guard LocalImportCoordinator.shared.isCurrent(token), saved.status == .completed else { return }
+                await PhotoThumbnailGenerator.generateForPending(
+                    in: context, progress: { _, _ in })
                 for _ in 0..<2 {
+                    guard LocalImportCoordinator.shared.isCurrent(token) else { break }
                     if await RegionService.geocodeNextBatch(in: context) == 0 { break }
                 }
             }
         }
     }
 
-    /// 苹果健康：授权 → 读取全部锻炼路线 → 后台融合入库
-    private func importHealth() {
+    /// 开启自动同步时沿用既有授权与首次同步流程；关闭时停掉 HealthKit observer。
+    private func updateHealthAutomaticSync(_ enabled: Bool) {
+        healthAutomaticSync = enabled
+        if enabled {
+            importHealthForAutomaticSync()
+        } else {
+            Task { await HealthKitSyncCoordinator.shared.disableAutomaticSync() }
+        }
+    }
+
+    private func importHealthForAutomaticSync() {
         guard HealthKitService.isAvailable else {
-            scanResult = 0
+            healthAutomaticSync = false
             return
         }
         busyText = "正在请求健康权限…"
         let container = context.container
-        let enableAutomaticSync = healthAutomaticSync
         Task.detached(priority: .userInitiated) {
-            let added = await HealthKitService.requestAndImport(
-                container: container, enableAutomaticSync: enableAutomaticSync) { text in
-                Task { @MainActor in busyText = text }
-            }
-            await MainActor.run {
-                busyText = nil
-                scanResult = added
-                refreshHealthStatus()
-            }
+            _ = await HealthKitService.requestAndImport(
+                container: container, enableAutomaticSync: true) { text in
+                    Task { @MainActor in busyText = text }
+                }
+            await MainActor.run { busyText = nil }
         }
-    }
-
-    private func updateHealthAutomaticSync(_ enabled: Bool) {
-        healthAutomaticSync = enabled
-        if enabled {
-            importHealth()
-        } else {
-            Task {
-                await HealthKitSyncCoordinator.shared.disableAutomaticSync()
-                refreshHealthStatus()
-            }
-        }
-    }
-
-    private func refreshHealthStatus() {
-        #if DEBUG
-        healthStatus = PerformanceDiagnostics.measure("Settings.healthStatus.refresh") {
-            HealthKitSyncStatusStore.snapshot(container: context.container)
-        }
-        #else
-        healthStatus = HealthKitSyncStatusStore.snapshot(container: context.container)
-        #endif
     }
 
     private func exportCSV() {
-        exportURL = try? FootprintStore.exportCSV(SnapshotCache.pointSnapshots)
+        do {
+            exportDocument = ExportDocument(
+                url: try FootprintStore.exportCSV(SnapshotCache.pointSnapshots))
+        } catch {
+            resultAlert = SettingsResultAlert(
+                title: "导出失败", message: error.localizedDescription)
+        }
     }
 
-    private func refreshSourceCounts() {
-        #if DEBUG
-        let result = PerformanceDiagnostics.measure(
-            "Settings.sourceCounts", metadata: "snapshots=\(SnapshotCache.pointSnapshots.count)") {
-                Self.sourceCounts(from: SnapshotCache.pointSnapshots)
-            }
-        #else
-        let result = Self.sourceCounts(from: SnapshotCache.pointSnapshots)
-        #endif
-        sourceCounts = result
+    private func refreshTrajectoryCacheSnapshot() {
+        trajectoryCacheSnapshot = PersistentTrajectoryCache.shared.diskSnapshot(
+            additionalDerivedBytes: PersistentRouteLODCache.shared.diskBytes())
     }
 
-    private static func sourceCounts(
-        from points: [FootprintSnapshot]
-    ) -> (photo: Int, csv: Int, manual: Int, gps: Int, health: Int) {
-        var result = (photo: 0, csv: 0, manual: 0, gps: 0, health: 0)
-        for point in points {
-            switch point.source {
-            case FootprintSource.photo.rawValue: result.photo += 1
-            case FootprintSource.csv.rawValue: result.csv += 1
-            case FootprintSource.manual.rawValue: result.manual += 1
-            case FootprintSource.gps.rawValue: result.gps += 1
-            case FootprintSource.health.rawValue: result.health += 1
-            default: break
+    private func clearTrajectoryCache() {
+        PersistentTrajectoryCache.shared.clear()
+        MapDisplaySnapshotStore.shared.clear()
+        StatsSnapshotStore.shared.clear()
+        PhotoTrajectoryAssociationStore.shared.clear()
+        PersistentRouteLODCache.shared.clear()
+        TrajectoryResolutionCache.shared.invalidate()
+        refreshTrajectoryCacheSnapshot()
+        resultAlert = SettingsResultAlert(
+            title: "轨迹缓存已清理",
+            message: "足迹、照片和运动记录均未删除。")
+    }
+
+    private func resetAllLocalData() {
+        busyText = "正在清除本地数据…"
+        scanProgress = nil
+        Task {
+            do {
+                try await DataManagementService.resetAllLocalData(in: context)
+                customMapSources = []
+                busyText = nil
+                resultAlert = SettingsResultAlert(
+                    title: "已清除", message: "Trace 保存在本机的数据已清除。")
+            } catch {
+                busyText = nil
+                resultAlert = SettingsResultAlert(
+                    title: "清除失败", message: error.localizedDescription)
             }
         }
-        return result
+    }
+
+    private func chooseImportFile() {
+        guard busyText == nil else { return }
+        #if DEBUG && targetEnvironment(simulator)
+        let env = ProcessInfo.processInfo.environment
+        if env["FP_UI_TEST"] == "1", env["FP_ISOLATED_REVIEW_STORE"] == "1",
+           let scenario = env["FP_CSV_MAPPING_TEST"],
+           let token = LocalImportCoordinator.shared.capture() {
+            let csv = scenario == "missing-time"
+                ? "latitude,longitude\n31,121\n31.001,121.001\n"
+                : "latitude,longitude,time\n31,121,2026-09-11 08:00:00\n31,121,2026-09-11 08:00:01\n31,121,bad-date\n31,121,2026-09-11 08:00:00\n"
+            csvImport = CSVImportPresentation(result: CSVParser.parse(csv), token: token)
+            return
+        }
+        #endif
+        showImporter = true
     }
 
     private func handleImport(_ result: Result<[URL], Error>) {
-        guard case .success(let urls) = result, let url = urls.first else { return }
+        guard busyText == nil, case .success(let urls) = result, let url = urls.first,
+              let token = LocalImportCoordinator.shared.capture() else { return }
         busyText = "正在解析文件…"
-        let container = context.container
         Task.detached(priority: .userInitiated) {
             let accessing = url.startAccessingSecurityScopedResource()
             defer { if accessing { url.stopAccessingSecurityScopedResource() } }
             guard let text = try? String(contentsOf: url, encoding: .utf8) else {
-                await MainActor.run { busyText = nil }
+                await MainActor.run {
+                    guard LocalImportCoordinator.shared.isCurrent(token) else { return }
+                    busyText = nil
+                    resultAlert = SettingsResultAlert(
+                        title: "导入失败", message: "无法读取所选文件。")
+                }
                 return
             }
             let parsed = CSVParser.parse(text)
-            guard parsed.error == nil, !parsed.rows.isEmpty else {
-                await MainActor.run { busyText = nil }
-                return
-            }
-            // 智能映射：表头关键词 + 数据嗅探
-            let mapping = CSVParser.smartMapping(parsed)
-            if mapping.latIndex != nil, mapping.lonIndex != nil {
-                // 自动识别成功 → 直接后台导入（选完文件即入库）
-                let rows = parsed.rows.count
-                await MainActor.run { busyText = "正在导入 \(rows) 行…" }
-                let mapped = parsed.mapPoints(mapping)
-                let added = await FootprintStore.importDraftsInBackground(mapped.points, container: container)
-                await MainActor.run {
-                    busyText = nil
-                    scanResult = added
+            await MainActor.run {
+                guard LocalImportCoordinator.shared.isCurrent(token) else { return }
+                busyText = nil
+                guard parsed.error == nil, !parsed.rows.isEmpty else {
+                    resultAlert = SettingsResultAlert(
+                        title: ImportFeedback.text("Import incomplete"),
+                        message: ImportFeedback.text("No valid CSV rows. Check the file and quoted fields."))
+                    return
                 }
-            } else {
-                // 无法识别 → 打开手动列映射页
-                await MainActor.run {
-                    busyText = nil
-                    csvResult = parsed
-                    showCSVSheet = true
-                }
+                // Always preview the time mapping before any persistent mutation.
+                csvImport = CSVImportPresentation(result: parsed, token: token)
             }
         }
     }
+}
+
+private struct SettingsLabel: View {
+    let title: LocalizedStringKey
+    let subtitle: LocalizedStringKey?
+    let value: String?
+    let showsChevron: Bool
+
+    init(_ title: LocalizedStringKey, subtitle: LocalizedStringKey? = nil,
+         value: String? = nil, showsChevron: Bool = false) {
+        self.title = title
+        self.subtitle = subtitle
+        self.value = value
+        self.showsChevron = showsChevron
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).foregroundStyle(.primary)
+                if let subtitle {
+                    Text(subtitle).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            Spacer(minLength: 8)
+            if let value {
+                Text(value).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+            }
+            if showsChevron {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+}
+
+private struct AppearanceSettingsView: View {
+    @Binding var themeRaw: String
+
+    var body: some View {
+        Form {
+            Section("足迹主题") {
+                ForEach(AppTheme.allCases) { theme in
+                    Button { themeRaw = theme.rawValue } label: {
+                        HStack(spacing: 12) {
+                            Circle().fill(theme.color).frame(width: 24, height: 24)
+                            Text(theme.name).foregroundStyle(.primary)
+                            Spacer()
+                            if theme.rawValue == themeRaw {
+                                Image(systemName: "checkmark").foregroundStyle(theme.color)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("外观")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct LanguageSettingsView: View {
+    @Binding var appLanguageRaw: String
+
+    var body: some View {
+        Form {
+            Section("语言") {
+                ForEach(AppLanguage.allCases) { language in
+                    Button {
+                        appLanguageRaw = language.rawValue
+                        AppLanguage.syncAppleLanguages(language.rawValue)
+                    } label: {
+                        HStack {
+                            Text(language.nativeName).foregroundStyle(.primary)
+                            Spacer()
+                            if language.rawValue == appLanguageRaw {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("语言")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct SettingsResultAlert: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+}
+
+private struct CSVImportPresentation: Identifiable {
+    let id = UUID()
+    let result: CSVParseResult
+    let token: LocalImportCoordinator.Token
+}
+
+private struct ExportDocument: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
+private struct ActivityShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }

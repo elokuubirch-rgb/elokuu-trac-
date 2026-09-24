@@ -7,7 +7,8 @@ private enum PhotoScreenMode: Equatable {
     case group(String)
 }
 
-/// 一组回顾（三卡之一）。id 用封面照片 id 保证稳定；completed 只表示“整组完整刷完”。
+/// 一组回顾（三卡之一）。id 保留最初封面照片 id，删除封面后也不改变组身份；
+/// 实际封面始终取剩余照片的第一张。completed 只表示“整组完整刷完”。
 struct ReviewOverviewGroup: Identifiable, Codable {
     var id: String { previewID }
     let title: String
@@ -59,8 +60,8 @@ struct ReviewTabView: View {
     /// 当前 Session 里正在/最后浏览的组索引（持久化，重启可恢复）
     @State private var currentGroupIndex: Int? = nil
 
-    private static let sessionKey = "reviewSessionGroupsV2"
-    private static let sessionIndexKey = "reviewSessionCurrentIndexV2"
+    private static let sessionKey = ReviewSessionPersistence.groupsKey
+    private static let sessionIndexKey = ReviewSessionPersistence.currentIndexKey
 
     private var theme: AppTheme { AppTheme(rawValue: themeRaw) ?? .crimson }
 
@@ -82,8 +83,12 @@ struct ReviewTabView: View {
                         onShowLocation: { onShowLocation($0, session) },
                         onExitReview: returnToOverview,
                         onDismissRequested: returnToOverview,
-                        onNextGroup: advanceToNextGroup
+                        onNextGroup: advanceToNextGroup,
+                        onConfirmedDeletion: advanceToNextGroup
                     )
+                    // Global Review 换组会创建新 session。显式切断旧 Viewer 的 @State，
+                    // 禁止旧组最后一张、背景、Live/手势瞬时状态跨 session 复用。
+                    .id(session.id)
                     // 只做透明度过渡。scale transition 会在 PhotoExploreView 的共同祖先
                     // 上改变 global frame，使 ROOT/HEADER/MEDIA/LOCATION 同时产生 X 位移。
                     .transition(.opacity)
@@ -136,6 +141,23 @@ struct ReviewTabView: View {
             guard case .overview = mode else { return }
             prepareSessionIfNeeded()
         }
+        .onReceive(NotificationCenter.default.publisher(for: .localDataReset)) { _ in
+            overviewLoadGeneration += 1
+            mode = .overview
+            openedGroupID = nil
+            currentGroupIndex = nil
+            session = nil
+            groups.removeAll(keepingCapacity: false)
+            previewImages.removeAll(keepingCapacity: false)
+            onImmersiveChanged(false)
+        }
+        .onChange(of: isActive) { _, active in
+            guard active else { return }
+            if case .group = mode, session == nil {
+                returnToOverview()
+            }
+            loadPreviewImages()
+        }
     }
 
     private var overview: some View {
@@ -176,7 +198,7 @@ struct ReviewTabView: View {
     }
 
     @ViewBuilder private var overviewBackground: some View {
-        let centerID = groups.indices.contains(1) ? groups[1].previewID : groups.first?.previewID
+        let centerID = groups.indices.contains(1) ? groups[1].photoIDs.first : groups.first?.photoIDs.first
         if let centerID, let image = previewImages[centerID] {
             Image(uiImage: image).resizable().scaledToFill().scaleEffect(1.18)
                 .blur(radius: 44, opaque: true).overlay(Color.black.opacity(0.58)).ignoresSafeArea()
@@ -242,6 +264,7 @@ struct ReviewTabView: View {
     /// 生成新一轮 Session：
     /// 候选池(当前筛选) → 排除当前 Session 已用 → 近期去重分层排序 → 按 reviewGroupSize 分三组。
     private func buildNewSession() {
+        guard LocalImportCoordinator.shared.capture() != nil else { return }
         let records = PhotoStore.all(in: context)
         let allowed = Set(PhotoThumbnailGenerator.matchingIDs(records.map(\.localIdentifier), filter: mediaFilter))
         let candidates = records.filter { allowed.contains($0.localIdentifier) }
@@ -276,6 +299,7 @@ struct ReviewTabView: View {
 
     /// 冷启动恢复上一轮 Session（过滤已不存在的照片；空组丢弃）。
     private func restoreSessionIfNeeded() {
+        guard LocalImportCoordinator.shared.capture() != nil else { return }
         guard groups.isEmpty else { return }
         guard let data = UserDefaults.standard.data(forKey: Self.sessionKey),
               let saved = try? JSONDecoder().decode([ReviewOverviewGroup].self, from: data),
@@ -296,14 +320,7 @@ struct ReviewTabView: View {
     }
 
     private func saveSession() {
-        if let data = try? JSONEncoder().encode(groups) {
-            UserDefaults.standard.set(data, forKey: Self.sessionKey)
-        }
-        if let index = currentGroupIndex {
-            UserDefaults.standard.set(index, forKey: Self.sessionIndexKey)
-        } else {
-            UserDefaults.standard.removeObject(forKey: Self.sessionIndexKey)
-        }
+        ReviewSessionPersistence.save(groups, currentIndex: currentGroupIndex)
     }
 
     // MARK: - 组内导航
@@ -319,7 +336,7 @@ struct ReviewTabView: View {
             saveSession()
         }
         let next = ExploreSession(level: RegionLevel.country, regionName: group.title,
-                                  context: context, source: .global)
+                                  context: context, source: .globalReview)
         // 概览封面就是组内第一张；这里不能再次洗牌，否则用户点击后会“封面变图”。
         next.loadPhotos(ids: group.photoIDs, preservingOrder: true)
         session = next
@@ -363,7 +380,7 @@ struct ReviewTabView: View {
                 currentGroupIndex = 0
                 saveSession()
                 let next = ExploreSession(level: RegionLevel.country, regionName: firstGroup.title,
-                                          context: context, source: .global)
+                                          context: context, source: .globalReview)
                 next.loadPhotos(ids: firstGroup.photoIDs, preservingOrder: true)
                 session = next
                 openedGroupID = firstGroup.id
@@ -379,7 +396,7 @@ struct ReviewTabView: View {
         currentGroupIndex = idx + 1
         saveSession()
         let next = ExploreSession(level: RegionLevel.country, regionName: nextGroup.title,
-                                  context: context, source: .global)
+                                  context: context, source: .globalReview)
         next.loadPhotos(ids: nextGroup.photoIDs, preservingOrder: true)
         session = next
         openedGroupID = nextGroup.id
@@ -429,7 +446,7 @@ struct ReviewTabView: View {
         overviewLoadGeneration += 1
         let generation = overviewLoadGeneration
         let missing = groups.compactMap { group in
-            records.first(where: { $0.localIdentifier == group.previewID })
+            records.first(where: { $0.localIdentifier == group.photoIDs.first })
         }.filter { previewImages[$0.localIdentifier] == nil }
         Task {
             await withTaskGroup(of: (String, UIImage?).self) { group in
@@ -514,7 +531,7 @@ private struct ReviewGroupStack: View {
     private func card(_ group: ReviewOverviewGroup) -> some View {
         ZStack(alignment: .bottomLeading) {
             Group {
-                if let image = images[group.previewID] {
+                if let image = group.photoIDs.first.flatMap({ images[$0] }) {
                     Image(uiImage: image).resizable().scaledToFill()
                 } else {
                     Color.white.opacity(0.08).overlay(ProgressView().tint(.white.opacity(0.7)))
@@ -522,19 +539,12 @@ private struct ReviewGroupStack: View {
             }
             .frame(width: OverviewMotion.cardSize.width, height: OverviewMotion.cardSize.height)
             .clipped()
-            LinearGradient(colors: [.clear, .black.opacity(0.58)], startPoint: .center, endPoint: .bottom)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(group.title).font(.system(size: 15, weight: .bold))
-                    if group.completed {
-                        Image(systemName: "checkmark.circle.fill")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.green)
-                    }
-                }
-                Text("\(group.photoIDs.count) 张").font(.system(size: 11, weight: .medium)).opacity(0.72)
+            if group.completed {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundStyle(.green)
+                    .padding(14)
             }
-            .padding(14).foregroundStyle(.white)
         }
         .background(Color(white: 0.94))
         .clipShape(RoundedRectangle(cornerRadius: OverviewMotion.radius, style: .continuous))

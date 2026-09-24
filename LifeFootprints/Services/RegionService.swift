@@ -49,6 +49,7 @@ enum RegionService {
     /// 返回本次处理的照片条数；0 = 全部完成或连续失败（限速/断网，未处理项保持 0，下次续跑）。
     /// 成功 400ms 限速；失败退避 3s，连续 5 次失败即停本轮。
     static func geocodeNextBatch(in context: ModelContext) async -> Int {
+        guard let token = LocalImportCoordinator.shared.capture() else { return 0 }
         let allPending = (try? context.fetch(FetchDescriptor<PhotoRecord>())) ?? []
         let pending = allPending.filter { $0.regionState == 0 }
         guard !pending.isEmpty else { return 0 }
@@ -64,6 +65,7 @@ enum RegionService {
             guard let first = records.first else { continue }
             let outcome = await geocodeOutcome(CLLocationCoordinate2D(latitude: first.latitude,
                                                                       longitude: first.longitude))
+            guard LocalImportCoordinator.shared.isCurrent(token) else { return processed }
             switch outcome {
             case .success(let region):
                 for r in records {

@@ -22,12 +22,19 @@ struct MainLiquidTabBar: View {
     /// 点击切换时的短暂拉伸（沿用原交互）
     @State private var stretching = false
     @State private var morphTask: Task<Void, Never>?
+    /// 最近一次提交选中 Tab 的时间；用于忽略“从其他 Tab 双击地图 Tab”时
+    /// 第二击误触发的纯净模式切换。
+    @State private var lastSelectionChangeAt = Date.distantPast
 
     private let items: [(AppTab, String, LocalizedStringKey)] = [
         (.map, "location.north.circle", "地图"),
         (.review, "photo.on.rectangle.angled", "回顾"),
         (.statistics, "chart.line.uptrend.xyaxis", "统计")
     ]
+
+    // 字号跟随 Dynamic Type；Tab 栏高度固定 62pt，放大到 xLarge 为止。
+    @ScaledMetric(relativeTo: .body) private var iconSize: CGFloat = 20
+    @ScaledMetric(relativeTo: .caption2) private var labelSize: CGFloat = 11
 
     private var displayProgress: Double {
         dragProgress ?? Double(selectedTab.rawValue)
@@ -60,21 +67,30 @@ struct MainLiquidTabBar: View {
                     ForEach(items, id: \.0) { tab, icon, label in
                         MainTabItem(tab: tab, icon: icon, label: label,
                                     weight: weight(for: tab),
-                                    accent: accent) {
+                                    accent: accent,
+                                    iconSize: iconSize,
+                                    labelSize: labelSize) {
                             select(tab)
                         }
                         .frame(width: itemWidth, height: proxy.size.height)
                         .onTapGesture(count: 2) {
-                            if tab == .map { onMapDoubleTap() }
+                            // 只有已停留在地图 Tab 上的双击才切换纯净模式；
+                            // 从其他 Tab 双击时第一击刚完成切换，此处不重复触发。
+                            if tab == .map, selectedTab == .map,
+                               Date().timeIntervalSince(lastSelectionChangeAt) > 0.4 {
+                                onMapDoubleTap()
+                            }
                         }
                     }
                 }
             }
             .contentShape(Rectangle())
             .highPriorityGesture(reduceMotion ? nil : dragGesture(itemWidth: itemWidth))
+            .dynamicTypeSize(...DynamicTypeSize.xLarge)
         }
         .frame(width: min(UIScreen.main.bounds.width * 0.69, 306), height: 62)
         .padding(.bottom, 8)
+        .accessibilityIdentifier("main-tab-bar")
         .onDisappear { morphTask?.cancel() }
     }
 
@@ -126,6 +142,7 @@ struct MainLiquidTabBar: View {
         guard selectedTab != tab else { return }
         morphTask?.cancel()
         UISelectionFeedbackGenerator().selectionChanged()
+        lastSelectionChangeAt = Date()
         if reduceMotion {
             withAnimation(.easeOut(duration: 0.14)) { selectedTab = tab }
             return
@@ -147,6 +164,9 @@ private struct MainTabItem: View {
     /// 0...1 连续选中权重：拖动时按 |progress - index| 连续插值
     let weight: Double
     let accent: Color
+    /// Dynamic Type 缩放后的图标/文字尺寸
+    let iconSize: CGFloat
+    let labelSize: CGFloat
     let action: () -> Void
 
     var body: some View {
@@ -154,19 +174,19 @@ private struct MainTabItem: View {
             VStack(spacing: 3) {
                 ZStack {
                     Image(systemName: icon)
-                        .font(.system(size: 20, weight: .semibold))
+                        .font(.system(size: iconSize, weight: .semibold))
                         .foregroundStyle(Color.primary.opacity(0.50))
                     Image(systemName: icon)
-                        .font(.system(size: 20, weight: .semibold))
+                        .font(.system(size: iconSize, weight: .semibold))
                         .foregroundStyle(accent)
                         .opacity(weight)
                 }
                 ZStack {
                     Text(label)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: labelSize, weight: .medium))
                         .foregroundStyle(Color.primary.opacity(0.50))
                     Text(label)
-                        .font(.system(size: 10, weight: .medium))
+                        .font(.system(size: labelSize, weight: .medium))
                         .foregroundStyle(accent)
                         .opacity(weight)
                 }
@@ -184,10 +204,13 @@ private struct MainTabItem: View {
 
 /// 按压反馈：纯视觉，不与容器拖动手势抢触控。
 private struct TabItemPressStyle: ButtonStyle {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
-            .scaleEffect(configuration.isPressed ? 0.97 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+            .scaleEffect(!reduceMotion && configuration.isPressed ? 0.97 : 1)
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.12),
+                       value: configuration.isPressed)
     }
 }
 
